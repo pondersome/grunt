@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<dds>
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>UDP</transport_id>
+      <type>UDPv4</type>
+      <interfaceWhiteList>
+        <address>barney.robodojo.net</address>
+        <address>wilma.robodojo.net</address>
+        <address>betty.robodojo.net</address>
+        <address>hal.robodojo.net</address>
+        <address>kvlapblack.robodojo.net</address>
+      </interfaceWhiteList>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant>
+    <rtps>
+      <builtin>
+        <initialPeersList>
+            <address>barney.robodojo.net</address>
+            <address>wilma.robodojo.net</address>
+            <address>betty.robodojo.net</address>
+            <address>hal.robodojo.net</address>
+            <address>kvlapblack.robodojo.net</address>
+        </initialPeersList>
+      </builtin>
+    </rtps>
+  </participant>
+</dds>
