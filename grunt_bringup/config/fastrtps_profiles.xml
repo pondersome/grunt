@@ -1,29 +1,47 @@
 <?xml version="1.0" encoding="UTF-8" ?>
-<dds>
+<profiles xmlns="http://www.eprosima.com">
   <transport_descriptors>
     <transport_descriptor>
-      <transport_id>UDP</transport_id>
+      <transport_id>udp_transport</transport_id>
       <type>UDPv4</type>
       <interfaceWhiteList>
+        <address>localhost</address>
         <address>barney.robodojo.net</address>
         <address>wilma.robodojo.net</address>
         <address>betty.robodojo.net</address>
         <address>hal.robodojo.net</address>
         <address>kvlapblack.robodojo.net</address>
       </interfaceWhiteList>
+      <maxInitialPeersRange>100</maxInitialPeersRange>
     </transport_descriptor>
   </transport_descriptors>
-  <participant>
+  <participant profile_name="default_part_profile" is_default_profile="true">
     <rtps>
       <builtin>
         <initialPeersList>
-            <address>barney.robodojo.net</address>
-            <address>wilma.robodojo.net</address>
-            <address>betty.robodojo.net</address>
-            <address>hal.robodojo.net</address>
-            <address>kvlapblack.robodojo.net</address>
+          <locator>
+            <udpv4>
+                <address>localhost</address>
+                <address>barney.robodojo.net</address>
+                <address>wilma.robodojo.net</address>
+                <address>betty.robodojo.net</address>
+                <address>hal.robodojo.net</address>
+                <address>kvlapblack.robodojo.net</address>
+            </udpv4>
+          </locator>
         </initialPeersList>
+        <metatrafficUnicastLocatorList>
+            <!--
+                NOTE
+                This will disable multicast spdp, while still enabling unicast.
+            -->
+            <locator/>
+        </metatrafficUnicastLocatorList>
       </builtin>
+      <useBuiltinTransports>false</useBuiltinTransports>
+      <userTransports>
+          <transport_id>udp_transport</transport_id>
+      </userTransports>
     </rtps>
   </participant>
-</dds>
+</profiles>
