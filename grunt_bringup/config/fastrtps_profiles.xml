@@ -5,7 +5,8 @@
       <transport_id>udp_transport</transport_id>
       <type>UDPv4</type>
       <interfaceWhiteList>
-        <address>localhost</address>
+        <address>10.147.20.30</address>
+        <address>10.147.20.33</address>
         <address>barney.robodojo.net</address>
         <address>wilma.robodojo.net</address>
         <address>betty.robodojo.net</address>
@@ -21,6 +22,8 @@
         <initialPeersList>
           <locator>
             <udpv4>
+                <address>10.147.20.30</address>
+                <address>10.147.20.33</address>
                 <address>localhost</address>
                 <address>barney.robodojo.net</address>
                 <address>wilma.robodojo.net</address>
