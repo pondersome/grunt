@@ -11,7 +11,10 @@ def generate_launch_description():
             name='scripted_mover',
             output='screen',
             arguments=[
-                'drive_waypoints', '3', '0', '3', '3', '0', '3', '0', '0'
+                'moveo', '1', 'roto', '-90d', '2', '25d', \
+                'moveo', '1', 'roto', '-90d', '2', '25d', \
+                'moveo', '1', 'roto', '-90d', '2', '25d', \
+                'moveo', '1', 'roto', '-90d', '2', '25d'
             ]
         ),
 
