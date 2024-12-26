@@ -40,7 +40,7 @@ def generate_robot_description(prefix, subsystem, base_link_name):
     try:
         # Process the arm Xacro file
         arm_description_content = subprocess.check_output(
-            ['xacro', arm_xacro_file, f'prefix:={prefix}{subsystem}/', f'base_link_name:={base_link_name}']
+            ['xacro', arm_xacro_file, f'prefix:={prefix}{subsystem}/', f'base_link_name:={base_link_name}', 'end_rot:=90']
         ).decode('utf-8')
 
         # Process the chassis Xacro file
@@ -127,10 +127,10 @@ def launch_setup(context, *args, **kwargs):
     # Create robot_description parameter
     robot_description = {'robot_description': robot_description_content}
 
-    # Define parent_frame_id for static transform
+    # Define parent_frame_id if using static transform
     parent_frame_id = f"{prefix}{subsystem}/top_plate"
 
-    # Define child_frame_ids for static transforms
+    # Define child_frame_ids if using static transforms
     child_frame_id = f"{prefix}/chassis/base_link"
     arm_frame_id = f"{prefix}{subsystem}/{base_link_name}"
 

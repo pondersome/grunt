@@ -26,13 +26,19 @@ def generate_launch_description():
     base_link_name_arg = DeclareLaunchArgument(
         'base_link_name',
         default_value='base_link',
-        #default_value='base_link',
         description="Name of the arm's base link"
+    )
+
+    end_rot_arg = DeclareLaunchArgument(
+        'end_rot',
+        default_value='0',
+        description="CCW rotation of the arm's tool (look at it), can be 0, 90, 180, 270"
     )
 
     # Get the launch configuration variables
     prefix = LaunchConfiguration('prefix')
     base_link_name = LaunchConfiguration('base_link_name')
+    end_rot = LaunchConfiguration('end_rot')
 
     # Define the path to the builder Xacro file
     xacro_file = os.path.join(
@@ -45,7 +51,8 @@ def generate_launch_description():
     robot_description_content = Command([
         'xacro ', xacro_file,
         ' prefix:=', prefix,
-        ' base_link_name:=', base_link_name
+        ' base_link_name:=', base_link_name,
+        ' end_rot:=', end_rot,
     ])
 
     # Wrap robot_description_content with ParameterValue
@@ -117,6 +124,7 @@ def generate_launch_description():
         serial_port_arg,
         prefix_arg,
         base_link_name_arg,
+        end_rot_arg,
         robot_state_publisher_node,
         static_tf_node,
         arm_joint_state_publisher_node,
