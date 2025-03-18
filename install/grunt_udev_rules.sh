@@ -23,6 +23,8 @@ SUBSYSTEM==\"tty\", ATTRS{idVendor}==\"1546\", ATTRS{idProduct}==\"0503\", ATTRS
 # Device 5: WaveShare RoArm running from their Genereral Driver for Robots board
 SUBSYSTEM==\"tty\", ATTRS{idVendor}==\"10c4\", ATTRS{idProduct}==\"ea60\", ATTRS{serial}==\"3a96bedc64e4ee11820c777d4c11a646\", SYMLINK+=\"grunt_arm\"
 
+# Device 6: IMU - Silicon Labs USB to UART adapter connected to BNO055 
+SUBSYSTEM==\"tty\", ATTRS{idVendor}==\"10c4\", ATTRS{idProduct}==\"ea60\", ATTRS{serial}==\"0001\", SYMLINK+=\"grunt_imu\"
 
 # **NOT WORKING ** Device 6: Joystick: Gamesir Neo Lite gamepad - activate with home button + X
 #SUBSYSTEM=="input", ATTRS{idVendor}=="3537", ATTRS{idProduct}=="1041", SYMLINK+="input/grunt_joystick"

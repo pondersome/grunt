@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- 
+  footprint_link - set true if we want a dummy link lower than base_link
+
+  this was modded from the leorover_sim project. 
+  not using this directly.
+  replaced wheel naming with p3at names in the gazebo section which may be a good
+  reference for the skid steer config. still has the rocker links in, cause, not sure what to do with those.
+
+  there are some good examples of mast mounting and defining cameras here
+  -->
+  <xacro:macro name="grunt" 
+               params="default_antenna:=true
+                       footprint_link:=true
+                       link_prefix:=''
+                       joint_prefix:=''
+                       imu_translation:='0.0628 -0.0314 -0.0393'">
+
+    <!-- LINKS -->
+    <xacro:if value="${footprint_link}">
+      <link name="${link_prefix}base_footprint"/>
+    </xacro:if>
+
+    <xacro:if value="${default_antenna}">
+      <link name="${link_prefix}antenna_link">
+        <inertial>
+          <mass value="0.001237"/>
+          <origin xyz="0 0 0.028828"/>
+          <inertia
+            ixx="2.5529e-7" ixy="0.0" ixz="0.0"
+            iyy="2.5529e-7" iyz="0.0"
+            izz="1.354e-8"/>
+        </inertial>
+        <visual>
+          <geometry>
+            <mesh filename="package://leorover_description/models/Antenna.dae"/>
+          </geometry>
+        </visual>
+        <collision>
+          <origin xyz="0 0 0.028"/>
+          <geometry>
+            <cylinder radius="0.0055" length="0.056"/>
+          </geometry>
+        </collision>
+      </link>
+    </xacro:if>
+
+    <link name="${link_prefix}camera_frame"/>
+    <link name="${link_prefix}camera_optical_frame"/>
+    <link name="${link_prefix}imu_frame"/>
+
+    <!-- JOINTS -->
+
+    <xacro:if value="${footprint_link}">
+      <joint name="${joint_prefix}base_joint" type="fixed">
+        <origin xyz="0 0 0.19783" rpy="0 0 0"/>
+        <parent link="${link_prefix}base_footprint"/>
+        <child link="${link_prefix}base_link"/>
+      </joint>
+    </xacro:if>
+
+    <xacro:if value="${default_antenna}">
+      <joint name="${joint_prefix}antenna_joint" type="fixed">
+        <origin xyz="-0.0052 0.056 -0.0065" rpy="0 0 0"/>
+        <parent link="${link_prefix}base_link"/>
+        <child link="${link_prefix}antenna_link"/>
+      </joint>
+    </xacro:if>
+
+    <joint name="${joint_prefix}camera_joint" type="fixed">
+      <origin xyz="0.0971 0 -0.0427" rpy="0 0.2094 0"/>
+      <parent link="${link_prefix}base_link"/>
+      <child link="${link_prefix}camera_frame"/>
+    </joint>
+
+    <joint name="${joint_prefix}camera_optical_joint" type="fixed">
+      <origin xyz="0 0 0" rpy="-${pi/2} 0.0 -${pi/2}"/>
+      <parent link="${link_prefix}camera_frame"/>
+      <child link="${link_prefix}camera_optical_frame"/>
+    </joint>
+
+    <joint name="${joint_prefix}imu_joint" type="fixed">
+      <origin xyz="${imu_translation}" rpy="0 0 0"/>
+      <parent link="${link_prefix}base_link"/>
+      <child link="${link_prefix}imu_frame"/>
+    </joint>
+
+  </xacro:macro>
+
+  <!-- Grunt GAZEBO -->
+
+  <xacro:macro name="grunt_gazebo"
+               params="robot_ns:=''">
+
+    <xacro:property name="link_prefix" value=""/>
+    <xacro:if value="${robot_ns != '' and robot_ns != '/'}">
+      <xacro:property name="link_prefix" value="${robot_ns}/"/>
+    </xacro:if>
+
+    <!-- base ODE properties -->
+    <gazebo reference="${link_prefix}base_footprint">
+      <kp>1e6</kp>
+      <kd>1.0</kd>
+      <mu1>0.3</mu1>
+      <mu2>0.3</mu2>
+      <minDepth>0.003</minDepth>
+    </gazebo>
+
+    <gazebo reference="${link_prefix}base_link">
+      <kp>1e6</kp>
+      <kd>1.0</kd>
+      <mu1>0.3</mu1>
+      <mu2>0.3</mu2>
+      <minDepth>0.003</minDepth>
+    </gazebo>
+
+    <!-- camera -->
+    <gazebo reference="${link_prefix}camera_frame">
+      <sensor type="camera" name="camera">
+        <always_on>true</always_on>
+        <update_rate>30.0</update_rate>
+        <visualize>false</visualize> 
+        <camera name="grunt_camera">
+          <horizontal_fov>1.9</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.02</near>
+            <far>300</far>
+          </clip>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.007</stddev>
+          </noise>
+          <distortion>
+            <k1>-0.279817</k1>
+            <k2>0.060321</k2>
+            <k3>0.000487</k3>
+            <p1>0.000310</p1>
+            <p2>0.000000</p2>
+            <center>0.5 0.5</center>
+          </distortion>
+        </camera>
+        <plugin name="camera_controller" filename="libgazebo_ros_camera.so">
+          <ros><namespace>${robot_ns}</namespace></ros>
+          <frame_name>camera_optical_frame</frame_name>
+        </plugin>
+      </sensor>
+    </gazebo>
+
+    <!-- skid steer differential - need to figure out the config for 4 wheels-->
+    <gazebo>
+      <plugin name="skid_steer" filename="libleo_gazebo_differential_plugin.so">
+        <jointA>rocker_L_joint</jointA>
+        <jointB>rocker_R_joint</jointB>
+        <forceConstant>100.0</forceConstant>
+      </plugin>
+    </gazebo>
+
+    <gazebo reference="${link_prefix}imu_frame">
+      <sensor type="imu" name="grunt_imu_sensor">
+        <update_rate>100</update_rate>
+        <plugin filename="libgazebo_ros_imu_sensor.so" name="imu_plugin">
+          <robotNamespace>${robot_ns}</robotNamespace>
+          <topicName>imu/data_raw</topicName>
+          <frameName>${link_prefix}imu_frame</frameName>
+          <updateRateHZ>100.0</updateRateHZ>
+          <gaussianNoise>0.01</gaussianNoise>
+          <initialOrientationAsReference>false</initialOrientationAsReference>
+        </plugin>
+      </sensor>
+    </gazebo>
+
+    <ros2_control name="GazeboSystem" type="system">
+      <hardware>
+        <plugin>gazebo_ros2_control/GazeboSystem</plugin>
+      </hardware>
+      <joint name="rocker_L_joint">
+        <state_interface name="position"/>
+      </joint>
+      <joint name="rocker_R_joint">
+        <state_interface name="position"/>
+      </joint>
+      <joint name="p3at_front_left_wheel_joint">
+        <command_interface name="velocity">
+          <param name="min">-6</param>
+          <param name="max">6</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+        <state_interface name="effort"/>
+      </joint>
+      <joint name="p3at_back_left_wheel_joint">
+        <command_interface name="velocity">
+          <param name="min">-6</param>
+          <param name="max">6</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+        <state_interface name="effort"/>
+      </joint>
+      <joint name="p3at_front_right_wheel_joint">
+        <command_interface name="velocity">
+          <param name="min">-6</param>
+          <param name="max">6</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+        <state_interface name="effort"/>
+      </joint>
+      <joint name="p3at_back_right_wheel_joint">
+        <command_interface name="velocity">
+          <param name="min">-6</param>
+          <param name="max">6</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+        <state_interface name="effort"/>
+      </joint>
+    </ros2_control>
+
+    <gazebo>
+      <plugin filename="libgazebo_ros2_control.so" name="gazebo_ros2_control">
+        <robot_param>robot_description</robot_param>
+        <robot_param_node>robot_state_publisher</robot_param_node>
+        <parameters>package://leorover_description/config/controllers.yaml</parameters>
+      </plugin>
+    </gazebo>
+
+  </xacro:macro>
+
+  <xacro:macro name="grunt_sim" 
+               params="default_antenna:=true 
+                       fixed:=false
+                       robot_ns:=''">
+
+    <xacro:property name="link_prefix" value=""/>
+    <xacro:if value="${robot_ns != '' and robot_ns != '/'}">
+      <xacro:property name="link_prefix" value="${robot_ns}/"/>
+    </xacro:if>
+
+    <xacro:leo default_antenna="${default_antenna}"
+               rockers_fixed="false"
+               link_prefix="${link_prefix}"/>
+
+    <xacro:leo_gazebo robot_ns="${robot_ns}"/>
+
+    <xacro:if value="${fixed}">
+      <link name="world"/>
+      <joint name="fixed" type="fixed">
+        <parent link="world"/>
+        <child link="${link_prefix}base_footprint"/>
+        <origin xyz="0.0 0.0 1.0"/>
+      </joint>
+    </xacro:if>
+  
+  </xacro:macro>
+
+</robot>

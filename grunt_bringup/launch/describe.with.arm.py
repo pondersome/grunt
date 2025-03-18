@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 
 def generate_robot_description(prefix, subsystem, base_link_name):
     """
-    Processes and merges two Xacro files into a single URDF string.
+    Processes and merges Xacro files into a single URDF string.
     
     Args:
         prefix (str): Namespace prefix for the robot's links and joints.
@@ -37,7 +37,20 @@ def generate_robot_description(prefix, subsystem, base_link_name):
         'roarm_urdf_builder.xacro'
     )
 
+    camera_xacro_file = os.path.join(  
+        get_package_share_directory('grunt_description'),
+        'urdf/realsense_d455',
+        'realsense_camera_on_gripper.xacro'
+    )
+
     try:
+         # Process the camera Xacro file
+        camera_description_content = subprocess.check_output(
+            ['xacro', camera_xacro_file, f'name:={prefix}{subsystem}/camera', f'parent:={prefix}{subsystem}/gripper_link']
+        ).decode('utf-8')
+
+        print(camera_description_content)
+
         # Process the arm Xacro file
         arm_description_content = subprocess.check_output(
             ['xacro', arm_xacro_file, f'prefix:={prefix}{subsystem}/', f'base_link_name:={base_link_name}', 'end_rot:=90']
@@ -51,8 +64,11 @@ def generate_robot_description(prefix, subsystem, base_link_name):
         # Parse the URDF contents into XML element trees
         chassis_root = ET.fromstring(chassis_description_content)
         arm_root = ET.fromstring(arm_description_content)
+        camera_root = ET.fromstring(camera_description_content)
 
         # Dummy root to hold and connect the merged descriptions
+        # Note that the camera xacro generates it's own joint to connect to the the parent link so
+        # that joint is not explicitly included here
         dummy_root_content = f"""
         <dummy>
         <link name="{prefix}/base_link"/>
@@ -82,9 +98,12 @@ def generate_robot_description(prefix, subsystem, base_link_name):
             merged_robot.append(elem)
 
         for child in chassis_root:
-            merged_robot.append(child)
+            merged_robot.append(child)               
 
         for child in arm_root:
+            merged_robot.append(child)
+
+        for child in camera_root:
             merged_robot.append(child)
 
         # Convert the merged URDF back to string
@@ -122,7 +141,8 @@ def launch_setup(context, *args, **kwargs):
     # Generate the merged robot_description
     robot_description_content = generate_robot_description(prefix, subsystem, base_link_name)
     
-    #print(robot_description_content)
+    print(robot_description_content)
+
     
     # Create robot_description parameter
     robot_description = {'robot_description': robot_description_content}
