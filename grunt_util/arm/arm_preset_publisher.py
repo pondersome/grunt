@@ -28,14 +28,17 @@ class ArmPresetPublisher(Node):
         # Define preset configurations.
         # Joint order: pan, shoulder, elbow, wrist.
         # Using nav_forward values for all presets initially.
-        default_values = [-0.085, 1.027, 2.761, 0.081] #nav_fowward - tucked and looking slightly down to detect ground obstacles
-        tenhut_values = [-0.085, 0.059, 0.0, 1.5] #stand at attention, eyes forward
-        lookup_values = [-0.085, 0.959, 0.925, 0.989] #look up toward human
-
+        default_values = [-0.0, 1.027, 2.761, 0.081] # nav_fowward - tucked and looking slightly down to detect ground obstacles
+        tenhut_values = [-0.0, 0.059, 0.0, 1.5] # stand at attention, eyes forward
+        lookup_values = [-0.0, 0.959, 0.925, 0.989] # look up toward human in front of bot for face detection
+        lookout_values = [-0.0, 0.959, 0.925, 1.5] # same as look up but camera looking forward 
+        reach_values = [-0.0, -1.0, 0.65, 0.081] # reach forward but with a bit of reserve to reach more
         self.presets = {
-            'nav_forward': default_values,
+            'bumper': default_values,
             'tenhut': tenhut_values,
             'lookup': lookup_values,
+            'lookout': lookout_values,
+            'reach': reach_values,
         }
 
         self.get_logger().info("ArmPresetPublisher initialized and waiting for preset commands...")

@@ -17,9 +17,13 @@ apt install ros-${ROS_DISTRO}-robot-localization
 #imu tools if  installed from  source
 #git clone -b humble https://github.com/CCNYRoboticsLab/imu_tools.git
 
-#Vizanti visualizer and mission planner
+
 cd ~/ros2_ws/src
+#Vizanti visualizer and mission planner
 git clone -b ros2 https://github.com/MoffKalast/vizanti.git
+#BNO55 imu support
+git clone https://github.com/flynneva/bno055.git
+
 
 cd ..
 rosdep install -i --from-path src/vizanti -y
