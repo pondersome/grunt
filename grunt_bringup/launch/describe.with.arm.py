@@ -46,7 +46,7 @@ def generate_robot_description(prefix, subsystem, base_link_name):
     try:
          # Process the camera Xacro file
         camera_description_content = subprocess.check_output(
-            ['xacro', camera_xacro_file, f'name:={prefix}{subsystem}/camera', f'parent:={prefix}{subsystem}/gripper_link']
+            ['xacro', camera_xacro_file, f'name:={prefix}{subsystem}/cam_sim', f'parent:={prefix}{subsystem}/gripper_link']
         ).decode('utf-8')
 
         print(camera_description_content)
