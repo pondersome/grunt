@@ -65,7 +65,7 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'gyro_fps',                     'default': '0', 'description': "''"},
                            {'name': 'enable_motion',                'default': 'false', 'description': "'enable motion stream (IMU) for DDS devices'"},
                            {'name': 'accel_fps',                    'default': '0', 'description': "''"},
-                           {'name': 'unite_imu_method',             'default': "0", 'description': '[0-None, 1-copy, 2-linear_interpolation]'},
+                           {'name': 'unite_imu_method',             'default': "1", 'description': '[0-None, 1-copy, 2-linear_interpolation]'},
                            {'name': 'clip_distance',                'default': '-2.', 'description': "''"},
                            {'name': 'angular_velocity_cov',         'default': '0.01', 'description': "''"},
                            {'name': 'linear_accel_cov',             'default': '0.01', 'description': "''"},
@@ -77,8 +77,8 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'pointcloud.stream_index_filter','default': '0', 'description': 'texture stream index for pointcloud'},
                            {'name': 'pointcloud.ordered_pc',        'default': 'false', 'description': ''},
                            {'name': 'pointcloud.allow_no_texture_points', 'default': 'false', 'description': "''"},
-                           {'name': 'align_depth.enable',           'default': 'false', 'description': 'enable align depth filter'},
-                           {'name': 'colorizer.enable',             'default': 'false', 'description': 'enable colorizer filter'},
+                           {'name': 'align_depth.enable',           'default': 'true', 'description': 'enable align depth filter'},
+                           {'name': 'colorizer.enable',             'default': 'true', 'description': 'enable colorizer filter'},
                            {'name': 'decimation_filter.enable',     'default': 'true', 'description': 'enable_decimation_filter'},
                            {'name': 'rotation_filter.enable',       'default': 'false', 'description': 'enable rotation_filter'},
                            {'name': 'rotation_filter.rotation',     'default': '0.0',   'description': 'rotation value: 0.0, 90.0, -90.0, 180.0'},
@@ -91,7 +91,6 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'reconnect_timeout',            'default': '6.', 'description': 'Timeout(seconds) between consequtive reconnection attempts'},
                            {'name': 'base_frame_id',                'default': 'base', 'description': 'Root frame of the sensors transform tree'},
                            {'name': 'tf_prefix',                    'default': 'grunt1/arm1/', 'description': 'prefix to be prepended to all frame IDs'},
-                           {'name': 'decimation_filter.filter_magnitude', 'default': '4', 'description': 'decimation filter magnitude'},
                           ]
 
 def declare_configurable_parameters(parameters):
@@ -112,7 +111,7 @@ def launch_setup(context, params, param_name_suffix=''):
     supported_params = set(param['name'] for param in configurable_parameters)
     
     # Check for unsupported parameters in command line arguments
-    for param_name in context.launch_configurations.keys():
+    for param_name in params.keys():
         if param_name not in supported_params:
             print(f"\033[33mWarning: Parameter '{param_name}' is not supported. Supported parameters are:\n{sorted(supported_params)}\033[0m")
     
