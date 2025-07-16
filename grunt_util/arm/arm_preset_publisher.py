@@ -3,6 +3,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 from sensor_msgs.msg import JointState
+from math import pi
 
 class ArmPresetPublisher(Node):
     def __init__(self):
@@ -40,6 +41,19 @@ class ArmPresetPublisher(Node):
             'lookout': lookout_values,
             'reach': reach_values,
         }
+        self.bearing_presets = {
+            "back-left": -2.094395102,   # -120°
+            "full-left": -1.570796327,   # -90°
+            "left": -0.7853981634,       # -45° same as military eyes left
+            "leftish": -0.436332313,     # -25°
+            "forward": 0,                # 0°
+            "rightish": 0.436332313,     # 25°
+            "right": 0.7853981634,       # 45° same as military eyes right
+            "full-right": 1.570796327,   # 90°
+            "back-right": 2.094395102,   # 120°
+            "back": 3.141592654,         # 180°
+        }
+
 
         self.get_logger().info("ArmPresetPublisher initialized and waiting for preset commands...")
 
@@ -54,23 +68,50 @@ class ArmPresetPublisher(Node):
         return names
 
     def preset_callback(self, msg: String):
-        preset_name = msg.data.strip()
-        self.get_logger().info(f"Received preset command: '{preset_name}'")
+        preset_spec = msg.data.strip()
+        self.get_logger().info(f"Received preset command: '{preset_spec}'")
+
+        # Split preset and optional bearing/yaw
+        if '@' in preset_spec:
+            preset_name, bearing_spec = preset_spec.split('@', 1)
+            preset_name = preset_name.strip()
+            bearing_spec = bearing_spec.strip()
+        else:
+            preset_name = preset_spec
+            bearing_spec = None
+
         if preset_name not in self.presets:
             self.get_logger().warn(f"Preset '{preset_name}' is not defined.")
             return
 
-        joint_positions = self.presets[preset_name]
+        joint_positions = self.presets[preset_name].copy()  # copy to avoid mutating original
 
-        # Create and populate the JointState message
+        # Adjust pan angle if bearing_spec provided
+        if bearing_spec:
+            try:
+                yaw = float(bearing_spec)
+                # Wrap to [-pi, pi]
+                yaw = (yaw + pi) % (2 * pi) - pi
+                joint_positions[0] = yaw
+                self.get_logger().info(f"Applied direct yaw {yaw:.3f} rad to pan joint.")
+            except ValueError:
+                if bearing_spec in self.bearing_presets:
+                    yaw = self.bearing_presets[bearing_spec]
+                    # Wrap to [-pi, pi]
+                    yaw = (yaw + pi) % (2 * pi) - pi
+                    joint_positions[0] = yaw
+                    self.get_logger().info(f"Applied bearing preset '{bearing_spec}' with yaw {yaw:.3f} rad.")
+                else:
+                    self.get_logger().warn(f"Bearing spec '{bearing_spec}' unrecognized, leaving pan joint unchanged.")
+
+        # Publish the joint state
         joint_state = JointState()
         joint_state.header.stamp = self.get_clock().now().to_msg()
         joint_state.name = self.get_joint_names()
         joint_state.position = joint_positions
 
-        # Publish the joint state message once
         self.joint_state_pub.publish(joint_state)
-        self.get_logger().info(f"Published joint states for preset '{preset_name}'.")
+        self.get_logger().info(f"Published joint states for preset '{preset_name}' with final yaw {joint_positions[0]:.3f} rad.")
 
 def main(args=None):
     rclpy.init(args=args)
