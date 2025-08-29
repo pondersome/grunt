@@ -66,6 +66,28 @@ class ArmPresetPublisher(Node):
             else:
                 names.append(suffix)
         return names
+    
+    def parse_bearing_spec(self, bearing_spec):
+        """
+        Parse a bearing specification into a yaw value in radians.
+        
+        Args:
+            bearing_spec: String that's either a float value or a bearing preset name
+            
+        Returns:
+            Tuple (success: bool, yaw: float or None)
+        """
+        try:
+            yaw = float(bearing_spec)
+        except ValueError:
+            if bearing_spec in self.bearing_presets:
+                yaw = self.bearing_presets[bearing_spec]
+            else:
+                return False, None
+        
+        # Wrap to [-pi, pi]
+        yaw = (yaw + pi) % (2 * pi) - pi
+        return True, yaw
 
     def preset_callback(self, msg: String):
         preset_spec = msg.data.strip()
@@ -80,6 +102,30 @@ class ArmPresetPublisher(Node):
             preset_name = preset_spec
             bearing_spec = None
 
+        # Special handling for pan-only commands
+        if preset_name == 'pan':
+            if not bearing_spec:
+                self.get_logger().warn("Pan command requires a bearing specification (e.g., pan@left)")
+                return
+            
+            success, yaw = self.parse_bearing_spec(bearing_spec)
+            if not success:
+                self.get_logger().warn(f"Bearing spec '{bearing_spec}' unrecognized for pan command.")
+                return
+            
+            # Publish only the pan joint
+            joint_state = JointState()
+            joint_state.header.stamp = self.get_clock().now().to_msg()
+            # Only include the pan joint name
+            pan_suffix = self.joint_suffixes['pan']
+            joint_state.name = [f"{self.prefix}{pan_suffix}" if self.prefix else pan_suffix]
+            joint_state.position = [yaw]
+            
+            self.joint_state_pub.publish(joint_state)
+            self.get_logger().info(f"Published pan-only command with yaw {yaw:.3f} rad.")
+            return
+
+        # Regular preset handling
         if preset_name not in self.presets:
             self.get_logger().warn(f"Preset '{preset_name}' is not defined.")
             return
@@ -88,21 +134,12 @@ class ArmPresetPublisher(Node):
 
         # Adjust pan angle if bearing_spec provided
         if bearing_spec:
-            try:
-                yaw = float(bearing_spec)
-                # Wrap to [-pi, pi]
-                yaw = (yaw + pi) % (2 * pi) - pi
+            success, yaw = self.parse_bearing_spec(bearing_spec)
+            if success:
                 joint_positions[0] = yaw
-                self.get_logger().info(f"Applied direct yaw {yaw:.3f} rad to pan joint.")
-            except ValueError:
-                if bearing_spec in self.bearing_presets:
-                    yaw = self.bearing_presets[bearing_spec]
-                    # Wrap to [-pi, pi]
-                    yaw = (yaw + pi) % (2 * pi) - pi
-                    joint_positions[0] = yaw
-                    self.get_logger().info(f"Applied bearing preset '{bearing_spec}' with yaw {yaw:.3f} rad.")
-                else:
-                    self.get_logger().warn(f"Bearing spec '{bearing_spec}' unrecognized, leaving pan joint unchanged.")
+                self.get_logger().info(f"Applied bearing '{bearing_spec}' with yaw {yaw:.3f} rad to pan joint.")
+            else:
+                self.get_logger().warn(f"Bearing spec '{bearing_spec}' unrecognized, leaving pan joint unchanged.")
 
         # Publish the joint state
         joint_state = JointState()

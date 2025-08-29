@@ -2,8 +2,10 @@
 import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, TimerAction, ExecuteProcess
-from launch.substitutions import LaunchConfiguration
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+
 
 def generate_launch_description():
     # Declare a launch argument to pass in a prefix value
@@ -21,36 +23,45 @@ def generate_launch_description():
         description='Prefix for joint names and sub-namespace'
     )
 
+    # Optional: if provided, publish this preset once after startup
+    initial_preset_arg = DeclareLaunchArgument(
+        'initial_arm_preset',
+        default_value='',
+        description='If non-empty, publish this arm preset once on startup (e.g., "lookout@forward")'
+    )
+
     # Launch the arm preset node with the provided namespace and prefix - these combine into a single prefix for the node
     arm_node = Node(
         package='grunt_util',  # Replace with your actual package name
         executable='arm_preset_publisher.py',  # Ensure this matches your node executable
         name='arm_preset_publisher',
         namespace=LaunchConfiguration('namespace'),
-        parameters=[{'prefix': [LaunchConfiguration('namespace'),LaunchConfiguration('prefix')]}],
+        parameters=[{'prefix': [LaunchConfiguration('namespace'), LaunchConfiguration('prefix')]}],
         output='screen',
         #remappings=[('joint_states', 'mybot/joint_states')]
     )
 
-    # Use a TimerAction to delay publishing the initial preset command to ensure the node is running
+    # Optionally publish an initial preset once after startup if provided
     publish_initial_preset = TimerAction(
-        period=2.0,  # Delay in seconds
+        period=2.0,  # Delay in seconds to ensure subscriber is ready
         actions=[
             ExecuteProcess(
                 cmd=[
                     'ros2', 'topic', 'pub', '--once',
-                    '/arm_preset',
+                    [LaunchConfiguration('namespace'), '/arm_preset'],
                     'std_msgs/msg/String',
-                    "{data: 'nav_forward'}"
+                    ["{data: '", LaunchConfiguration('initial_arm_preset'), "'}"]
                 ],
                 output='screen'
             )
-        ]
+        ],
+        condition=IfCondition(PythonExpression(["'", LaunchConfiguration('initial_arm_preset'), "' != ''"]))
     )
 
     return LaunchDescription([
         namespace_arg,
         prefix_arg,
+        initial_preset_arg,
         arm_node,
         publish_initial_preset,
     ])
