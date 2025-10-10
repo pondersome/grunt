@@ -6,8 +6,12 @@
       <type>UDPv4</type>
       <interfaceWhiteList>
         <address>127.0.0.1</address>
-        <address>10.147.20.30</address>
-        <address>10.147.20.33</address>
+        <address>10.147.20.20</address>  <!-- hal -->
+        <address>10.147.20.21</address>  <!-- kvlapblack -->
+        <address>10.147.20.30</address>  <!-- barney -->
+        <address>10.147.20.31</address>  <!-- betty -->
+        <address>10.147.20.33</address>  <!-- wilma -->
+        <address>10.147.20.35</address>  <!-- bambam -->
       </interfaceWhiteList>
       <maxInitialPeersRange>100</maxInitialPeersRange>
     </transport_descriptor>
