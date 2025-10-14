@@ -18,19 +18,54 @@
   </transport_descriptors>
   <participant profile_name="default_part_profile" is_default_profile="true">
     <rtps>
-    <!--
       <builtin>
         <initialPeersList>
+          <!-- localhost -->
           <locator>
             <udpv4>
-                <address>127.0.0.1</address>
-                <address>10.147.20.30</address>
-                <address>10.147.20.33</address>
+              <address>127.0.0.1</address>
             </udpv4>
           </locator>
+          <!-- kvlapblack -->
+          <locator>
+            <udpv4>
+              <address>10.147.20.21</address>
+            </udpv4>
+          </locator>
+          <!-- barney -->
+          <locator>
+            <udpv4>
+              <address>10.147.20.30</address>
+            </udpv4>
+          </locator>
+          <!-- betty
+          <locator>
+            <udpv4>
+              <address>10.147.20.31</address>
+            </udpv4>  
+          </locator> -->
+          <!-- hal 
+          <locator>
+            <udpv4>
+              <address>10.147.20.20</address>
+            </udpv4>
+          </locator> -->
+          <!-- wilma 
+          <locator>
+            <udpv4>
+              <address>10.147.20.33</address>
+            </udpv4>
+          </locator> -->
+          <!-- bambam
+          <locator>
+            <udpv4>
+              <address>10.147.20.35</address>
+            </udpv4>
+          </locator>
+          -->
         </initialPeersList>
       </builtin>
-    -->
+    
       <useBuiltinTransports>false</useBuiltinTransports>
       <userTransports>
           <transport_id>udp_transport</transport_id>
