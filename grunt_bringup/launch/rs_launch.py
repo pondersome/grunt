@@ -89,7 +89,7 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'hdr_merge.enable',             'default': 'false', 'description': 'hdr_merge filter enablement flag'},
                            {'name': 'wait_for_device_timeout',      'default': '-1.', 'description': 'Timeout for waiting for device to connect (Seconds)'},
                            {'name': 'reconnect_timeout',            'default': '6.', 'description': 'Timeout(seconds) between consequtive reconnection attempts'},
-                           {'name': 'base_frame_id',                'default': 'base', 'description': 'Root frame of the sensors transform tree'},
+                           {'name': 'base_frame_id',                'default': 'base', 'description': 'Root frame of the realsense transform tree - is appended to camera name'},
                            {'name': 'tf_prefix',                    'default': 'grunt1/arm1/', 'description': 'prefix to be prepended to all frame IDs'},
                            {'name': 'decimation_filter.filter_magnitude', 'default': '4', 'description': 'decimation filter magnitude'},
                           ]

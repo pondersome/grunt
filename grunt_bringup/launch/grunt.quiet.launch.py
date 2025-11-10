@@ -1,6 +1,6 @@
 import launch
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, GroupAction
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, GroupAction, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -8,6 +8,33 @@ from launch_ros.actions import Node, PushRosNamespace
 from launch_ros.substitutions import FindPackageShare
 import os
 from ament_index_python.packages import get_package_share_directory
+
+def create_p2os_node(context, *args, **kwargs):
+    """
+    Creates the p2os_driver node with dynamically resolved frame IDs.
+    """
+    prefix = LaunchConfiguration('prefix').perform(context)
+    use_sonar = LaunchConfiguration('use_sonar').perform(context)
+    p3at_port = LaunchConfiguration('P3AT_port').perform(context)
+
+    # Construct frame IDs with namespace prefix
+    base_link_frame_id = f"{prefix}/base_link"
+    odom_frame_id = f"{prefix}/odom"
+
+    return [
+        Node(
+            package='p2os_driver',
+            executable='p2os_driver',
+            name='p2os_driver',
+            parameters=[{
+                'use_sonar': use_sonar == 'True' or use_sonar == 'true',
+                'port': p3at_port,
+                'base_link_frame_id': base_link_frame_id,
+                'odom_frame_id': odom_frame_id
+            }],
+            remappings=[('pose','odom')]
+        )
+    ]
 
 def generate_launch_description():
 
@@ -37,16 +64,10 @@ def generate_launch_description():
     ]
 
     # Define the included launch descriptions with conditions
+    # P2OS driver node with dynamic frame ID configuration
     gp_p2os = GroupAction(
         actions=[
-            Node(
-                package='p2os_driver',
-                executable='p2os_driver',
-                name='p2os_driver',
-                parameters=[{'use_sonar': LaunchConfiguration('use_sonar')},
-                            {'port': LaunchConfiguration('P3AT_port')}],
-                remappings=[('pose','odom')]
-            )
+            OpaqueFunction(function=create_p2os_node)
         ],
         condition=IfCondition(LaunchConfiguration('P2OS_Driver'))
     )

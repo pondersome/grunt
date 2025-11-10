@@ -44,16 +44,17 @@ def generate_robot_description(prefix, subsystem, base_link_name):
     )
 
     try:
+        print (prefix)
          # Process the camera Xacro file
         camera_description_content = subprocess.check_output(
-            ['xacro', camera_xacro_file, f'name:={prefix}{subsystem}/cam_sim', f'parent:={prefix}{subsystem}/gripper_link']
+            ['xacro', camera_xacro_file, f'name:={prefix}/{subsystem}/cam_live', f'parent:={prefix}/{subsystem}/gripper_link']
         ).decode('utf-8')
 
         print(camera_description_content)
 
         # Process the arm Xacro file
         arm_description_content = subprocess.check_output(
-            ['xacro', arm_xacro_file, f'prefix:={prefix}{subsystem}/', f'base_link_name:={base_link_name}', 'end_rot:=90']
+            ['xacro', arm_xacro_file, f'prefix:={prefix}/{subsystem}/', f'base_link_name:={base_link_name}', 'end_rot:=90']
         ).decode('utf-8')
 
         # Process the chassis Xacro file
@@ -67,7 +68,7 @@ def generate_robot_description(prefix, subsystem, base_link_name):
         camera_root = ET.fromstring(camera_description_content)
 
         # Dummy root to hold and connect the merged descriptions
-        # Note that the camera xacro generates it's own joint to connect to the the parent link so
+        # Note that the camera xacro generates its own joint to connect to the the parent link so
         # that joint is not explicitly included here
         dummy_root_content = f"""
         <dummy>
@@ -79,7 +80,7 @@ def generate_robot_description(prefix, subsystem, base_link_name):
         <joint name="chassis_to_arm" type="fixed">
             <origin rpy="0 0 0" xyz="0.205 0 0.0"/>
             <parent link="{prefix}/chassis/top_plate"/>
-            <child link="{prefix}{subsystem}/base_link"/>
+            <child link="{prefix}/{subsystem}/base_link"/>
         </joint>
         </dummy>
         """
@@ -125,12 +126,12 @@ def launch_setup(context, *args, **kwargs):
     # Resolve launch arguments
     # If we have inherited a namespace from a calling context, we'll use that as our prefix for descriptions and not apply further namespaces on nodes or parameters
     inherited_namespace = LaunchConfiguration('namespace').perform(context)
-    
+
     if  inherited_namespace:
         print(f'inherited namespace:{inherited_namespace}')
-        prefix = f'/{inherited_namespace}'
-        apply_namespace=prefix
-        
+        prefix = f'{inherited_namespace}' # was hardcoding / in front of namespace with prefix = f'/{inherited_namespace}'
+        apply_namespace = None  # Don't apply namespace - nodes will inherit from parent context
+
     else: #prefix and namespace come from prefix launch argument
         print(f'NO inherited namespace:{inherited_namespace}')
         apply_namespace = LaunchConfiguration('prefix').perform(context)
@@ -138,28 +139,29 @@ def launch_setup(context, *args, **kwargs):
     subsystem = LaunchConfiguration('subsystem_name').perform(context)
     base_link_name = LaunchConfiguration('base_link_name').perform(context)
 
+    print(apply_namespace)
+
     # Generate the merged robot_description
     robot_description_content = generate_robot_description(prefix, subsystem, base_link_name)
     
     print(robot_description_content)
-
     
     # Create robot_description parameter
     robot_description = {'robot_description': robot_description_content}
 
     # Define parent_frame_id if using static transform
-    parent_frame_id = f"{prefix}{subsystem}/top_plate"
+    parent_frame_id = f"{prefix}/{subsystem}/top_plate"
 
     # Define child_frame_ids if using static transforms
     child_frame_id = f"{prefix}/chassis/base_link"
-    arm_frame_id = f"{prefix}{subsystem}/{base_link_name}"
+    arm_frame_id = f"{prefix}/{subsystem}/{base_link_name}"
 
     # Create robot_state_publisher node
     robot_state_publisher_node = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
         name='robot_state_publisher',
-        namespace=apply_namespace,
+        namespace=apply_namespace,  # None if inherited, otherwise explicit namespace
         output='screen',
         parameters=[robot_description],
     )
@@ -169,25 +171,24 @@ def launch_setup(context, *args, **kwargs):
         package='joint_state_publisher_gui',
         executable='joint_state_publisher_gui',
         name='joint_state_publisher_gui',
-        namespace=f"{apply_namespace}",
+        namespace=apply_namespace,  # None if inherited, otherwise explicit namespace
         output='screen',
         parameters=[robot_description],
     )
 
-    # Create roarm_driver node
+    # Create roarm_driver node - needs subsystem appended to namespace
+    arm_namespace = f"{apply_namespace}/{subsystem}" if apply_namespace else subsystem
     roarm_driver_node = Node(
         package='roarm_driver',
         executable='roarm_driver',
         name='arm_driver',
-        #namespace='/arm1',
-        namespace=f"{apply_namespace}{subsystem}",
+        namespace=arm_namespace,
         output='screen',
         parameters=[{
             'serial_port': LaunchConfiguration('serial_port').perform(context),
             'baud_rate': 115200,
         }],
-        #remappings=[(f'/mybot1/arm1/joint_states', f'/mybot1/joint_states')]
-        remappings=[(f'{apply_namespace}{subsystem}/joint_states', f'{apply_namespace}/joint_states')]
+        remappings=[(f'/{prefix}/{subsystem}/joint_states', f'/{prefix}/joint_states')]
     )
 
     return [
@@ -200,7 +201,7 @@ def launch_setup(context, *args, **kwargs):
 def generate_launch_description():
     """
     Generates the launch description with declared arguments and actions.
-    
+
     Returns:
         LaunchDescription: The complete launch description.
     """
@@ -213,13 +214,19 @@ def generate_launch_description():
 
     prefix_arg = DeclareLaunchArgument(
         'prefix',
-        default_value='/mybot1',
+        default_value='mybot1',
         description='Prefix for the arm links and joints'
     )
-    
+
+    namespace_arg = DeclareLaunchArgument(
+        'namespace',
+        default_value='',
+        description='Inherited namespace from parent launch context (if any)'
+    )
+
     subsystem_name_arg = DeclareLaunchArgument(
         'subsystem_name',
-        default_value='/arm1',
+        default_value='arm1',
         description="Name of the subsystem"
     )
 
@@ -235,6 +242,7 @@ def generate_launch_description():
     return LaunchDescription([
         serial_port_arg,
         prefix_arg,
+        namespace_arg,
         subsystem_name_arg,
         base_link_name_arg,
         setup_nodes
