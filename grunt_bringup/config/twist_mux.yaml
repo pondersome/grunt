@@ -1,0 +1,28 @@
+/**:
+  ros__parameters:
+    topics:
+      joystick:
+        topic: cmd_vel_joy
+        timeout: 0.5
+        priority: 100
+      navigation:
+        topic: cmd_vel_nav
+        timeout: 0.5
+        priority: 50
+    locks:
+      voice_estop:
+        topic: estop/voice
+        timeout: 0.0
+        priority: 255
+      joystick_estop:
+        topic: estop/joystick
+        timeout: 0.0
+        priority: 255
+      remote_estop:
+        topic: estop/remote
+        timeout: 0.0
+        priority: 255
+      observer_estop:
+        topic: estop/observer
+        timeout: 0.0
+        priority: 255

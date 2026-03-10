@@ -35,7 +35,7 @@ def generate_launch_description():
     launch_arguments = [
         namespace_arg,
         group_arg,
-        DeclareLaunchArgument('host', default_value='rtk2go.com', description='Use an NTRIP server with base stations near you'),
+        DeclareLaunchArgument('host', default_value='hal.robodojo.net', description='Use an NTRIP server with base stations near you'),
         DeclareLaunchArgument('port', default_value='2101', description='Port number for the NTRIP server'),
         DeclareLaunchArgument('mountpoint', default_value='KubotaCentral', description='Use a mount point near you'),
         DeclareLaunchArgument('ntrip_version', default_value='None', description='NTRIP version to use in the initial HTTP request'),

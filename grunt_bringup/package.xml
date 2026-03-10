@@ -13,6 +13,7 @@
   <exec_depend>p2os_msgs</exec_depend>
   <exec_depend>p2os_urdf</exec_depend>
   <exec_depend>p2os_teleop</exec_depend>
+  <exec_depend>twist_mux</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

@@ -32,8 +32,25 @@ def generate_launch_description():
         DeclareLaunchArgument('Arm', default_value='0', description='Start the RoArm'),
         DeclareLaunchArgument('RTK', default_value='1', description='Enable GNSS RTK'),
         DeclareLaunchArgument('KeyboardTeleop', default_value='0', description='Start keyboard driven teleop'),
-        DeclareLaunchArgument('JoystickTeleop', default_value='1', description='Start joystick driven teleop')
-        
+        DeclareLaunchArgument('JoystickTeleop', default_value='1', description='Start joystick driven teleop'),
+        # P2OS velocity and acceleration limits
+        # Firmware ceilings (values above these are silently clamped by ARCOS):
+        #   transveltop=1.5 m/s, rotveltop=6.28 rad/s (360 deg/s)
+        #   transacctop=2.0 m/s² (applies to both accel and decel)
+        #   rotacctop=5.24 rad/s² / 300 deg/s² (applies to both accel and decel)
+        DeclareLaunchArgument('max_xspeed', default_value='0.5', description='Max translational velocity (m/s). Firmware ceiling: 1.5 m/s'),
+        DeclareLaunchArgument('max_yawspeed', default_value='1.7453', description='Max rotational velocity (rad/s). Firmware default: ~1.75 rad/s (100 deg/s). Ceiling: 6.28 rad/s (360 deg/s)'),
+        DeclareLaunchArgument('max_xaccel', default_value='0.0', description='Translational acceleration (m/s²). 0.0 = firmware default. Ceiling: 2.0 m/s²'),
+        DeclareLaunchArgument('max_xdecel', default_value='0.0', description='Translational deceleration (m/s²). 0.0 = firmware default. Ceiling: 2.0 m/s²'),
+        DeclareLaunchArgument('max_yawaccel', default_value='0.0', description='Rotational acceleration (rad/s²). 0.0 = firmware default (~1.75 rad/s²). Ceiling: 5.24 rad/s²'),
+        DeclareLaunchArgument('max_yawdecel', default_value='0.0', description='Rotational deceleration (rad/s²). 0.0 = firmware default (~1.75 rad/s²). Ceiling: 5.24 rad/s²'),
+        DeclareLaunchArgument('p2os_baud_rate', default_value='0', description='Serial baud rate (9600/19200/38400/57600/115200). 0 = use robot model default'),
+        # Teleop velocity limits (what joystick sends before driver clamp)
+        DeclareLaunchArgument('max_vx', default_value='0.6', description='Teleop max linear velocity (m/s)'),
+        DeclareLaunchArgument('max_vx_turbo', default_value='0.6', description='Teleop max linear velocity with turbo button (m/s)'),
+        DeclareLaunchArgument('max_vw', default_value='0.8', description='Teleop max angular velocity (rad/s)'),
+        DeclareLaunchArgument('max_vw_turbo', default_value='0.8', description='Teleop max angular velocity with turbo button (rad/s)'),
+        DeclareLaunchArgument('teleop_rate', default_value='10', description='Teleop publish loop rate (Hz)'),
     ]
 
     # Define the included launch descriptions with conditions
@@ -44,7 +61,14 @@ def generate_launch_description():
                 executable='p2os_driver',
                 name='p2os_driver',
                 parameters=[{'use_sonar': LaunchConfiguration('use_sonar')},
-                            {'port': LaunchConfiguration('P3AT_port')}],
+                            {'port': LaunchConfiguration('P3AT_port')},
+                            {'max_xspeed': LaunchConfiguration('max_xspeed')},
+                            {'max_yawspeed': LaunchConfiguration('max_yawspeed')},
+                            {'max_xaccel': LaunchConfiguration('max_xaccel')},
+                            {'max_xdecel': LaunchConfiguration('max_xdecel')},
+                            {'max_yawaccel': LaunchConfiguration('max_yawaccel')},
+                            {'max_yawdecel': LaunchConfiguration('max_yawdecel')},
+                            {'baud_rate': LaunchConfiguration('p2os_baud_rate')}],
                 remappings=[('pose','odom')]
             )
         ],
@@ -64,11 +88,28 @@ def generate_launch_description():
         actions=[
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource([
-                    FindPackageShare('p2os_bringup'), '/launch', '/teleop_joy_launch.py'
-                ])
+                    FindPackageShare('grunt_bringup'), '/launch', '/teleop_joy_launch.py'
+                ]),
+                launch_arguments={
+                    'max_vx': LaunchConfiguration('max_vx'),
+                    'max_vx_turbo': LaunchConfiguration('max_vx_turbo'),
+                    'max_vw': LaunchConfiguration('max_vw'),
+                    'max_vw_turbo': LaunchConfiguration('max_vw_turbo'),
+                    'teleop_rate': LaunchConfiguration('teleop_rate'),
+                }.items()
             )
         ],
         condition=IfCondition(LaunchConfiguration('JoystickTeleop'))
+    )
+
+    # twist_mux: multiplexes velocity sources with priority and e-stop locks
+    twist_mux_config = os.path.join(get_package_share_directory('grunt_bringup'), 'config', 'twist_mux.yaml')
+    gp_twist_mux = Node(
+        package='twist_mux',
+        executable='twist_mux',
+        name='twist_mux',
+        parameters=[twist_mux_config],
+        remappings=[('cmd_vel_out', 'cmd_vel')],
     )
     gp_lidar = GroupAction(
         actions=[
@@ -146,6 +187,7 @@ def generate_launch_description():
         PushRosNamespace(LaunchConfiguration('prefix')),
         PushRosNamespace(LaunchConfiguration('group')),
         gp_p2os,
+        gp_twist_mux,
         gp_description,
         gp_description_arm,
         gp_description_rtk,
