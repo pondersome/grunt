@@ -116,12 +116,12 @@ def generate_launch_description():
                     # Use this parameter to change the type of RTCM message published by the node. Defaults to "mavros_msgs", but we also support "rtcm_msgs"
                     'rtcm_message_package': LaunchConfiguration('rtcm_message_package'),
 
-                    # Will affect how many times the node will attempt to reconnect before exiting, and how long it will wait in between attempts when a reconnect occurs
-                    'reconnect_attempt_max': 10,
-                    'reconnect_attempt_wait_seconds': 10, #was 5, changed per rtk2go reqs
+                    # Reconnect uses exponential backoff: initial wait doubles each attempt up to max
+                    'reconnect_attempt_wait_seconds': 5,
+                    'reconnect_attempt_wait_max_seconds': 120,
 
                     # How many seconds is acceptable in between receiving RTCM. If RTCM is not received for this duration, the node will attempt to reconnect
-                    'rtcm_timeout_seconds': 10 #was 4 changed for rtk2go reqs
+                    'rtcm_timeout_seconds': 10
                 }
             ],
             remappings=[
