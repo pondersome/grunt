@@ -6,7 +6,7 @@
         debug: 1                    # Range 0-4 (0 means no debug statements will print)
         device: /dev/grunt_f9p
         
-        frame_id: gps
+        frame_id: grunt1/mast/gps_link
         rate: 5.0                   # These rates correspond to UBX-CFG-RATE message. rate is the measurement rate in Hz. Triggers a measurement and raw data output.
         nav_rate: 1                 # every (nav_rate)th measurement produces a navigation (hopefully rtk) solution. rate divided by nav_rate is the rate in hz of rtk solutions. 
                                     

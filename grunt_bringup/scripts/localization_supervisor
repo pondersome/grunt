@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+"""
+Localization Supervisor Node
+
+Monitors sensor readiness (GPS fix quality, IMU calibration) and gates
+the global EKF initialization by calling navsat_transform's /datum service
+only when conditions are met.
+
+Supports two heading strategies:
+  - NDOF: uses BNO055 magnetometer-fused heading (fast, needs calibration)
+  - IMUPlus: computes heading offset from GPS course-over-ground (needs driving)
+"""
+
+import json
+import math
+
+import rclpy
+from rclpy.node import Node
+from rclpy.duration import Duration
+
+from sensor_msgs.msg import NavSatFix, Imu
+from nav_msgs.msg import Odometry
+from std_msgs.msg import String
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+from geographic_msgs.msg import GeoPose, GeoPoint
+from geometry_msgs.msg import Quaternion, PoseWithCovarianceStamped
+
+from tf_transformations import euler_from_quaternion, quaternion_from_euler
+
+# NavPVT imported with try/except in case ublox_msgs isn't sourced
+try:
+    from ublox_msgs.msg import NavPVT
+    HAS_NAVPVT = True
+except ImportError:
+    HAS_NAVPVT = False
+
+# robot_localization SetDatum service
+from robot_localization.srv import SetDatum
+
+# NavPVT flags masks
+CARRIER_PHASE_MASK = 0xC0
+CARRIER_PHASE_NONE = 0x00
+CARRIER_PHASE_FLOAT = 0x40
+CARRIER_PHASE_FIXED = 0x80
+FLAGS_GNSS_FIX_OK = 0x01
+FLAGS_DIFF_SOLN = 0x02
+
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Distance in meters between two GPS coordinates."""
+    R = 6371000.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def geodetic_bearing(lat1, lon1, lat2, lon2):
+    """Bearing in radians from point 1 to point 2 (from north, clockwise)."""
+    lat1, lon1 = math.radians(lat1), math.radians(lon1)
+    lat2, lon2 = math.radians(lat2), math.radians(lon2)
+    dlon = lon2 - lon1
+    x = math.sin(dlon) * math.cos(lat2)
+    y = (math.cos(lat1) * math.sin(lat2) -
+         math.sin(lat1) * math.cos(lat2) * math.cos(dlon))
+    return math.atan2(x, y)
+
+
+def geodetic_to_enu_heading(bearing):
+    """Convert geodetic bearing (from north CW) to ENU heading (from east CCW)."""
+    return math.pi / 2.0 - bearing
+
+
+def get_yaw_from_quaternion(q):
+    """Extract yaw from a geometry_msgs Quaternion."""
+    _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+    return yaw
+
+
+class LocalizationSupervisor(Node):
+    def __init__(self):
+        super().__init__('localization_supervisor')
+
+        # Parameters
+        # Quality ordering: none=0, gps=1, sbas=2, dgps=3, rtk_float=4, rtk_fixed=5
+        self.declare_parameter('gps_quality_threshold', 4)  # default: rtk_float
+        self.declare_parameter('heading_calibration_distance', 3.0)
+        self.declare_parameter('mag_calibration_threshold', 2)
+        self.declare_parameter('auto_datum', True)
+        self.declare_parameter('allow_re_datum', True)
+        self.declare_parameter('re_datum_cooldown', 30.0)
+
+        self.declare_parameter('gps_h_acc_threshold_m', 20.0)
+        self.declare_parameter('gps_h_acc_cal_threshold_m', 0.5)  # max h_acc for drive cal start/end
+        self.declare_parameter('map_frame', 'map')
+
+        self.gps_quality_threshold = self.get_parameter('gps_quality_threshold').value
+        self.heading_cal_distance = self.get_parameter('heading_calibration_distance').value
+        self.mag_cal_threshold = self.get_parameter('mag_calibration_threshold').value
+        self.auto_datum = self.get_parameter('auto_datum').value
+        self.allow_re_datum = self.get_parameter('allow_re_datum').value
+        self.re_datum_cooldown = self.get_parameter('re_datum_cooldown').value
+        self.gps_h_acc_threshold = self.get_parameter('gps_h_acc_threshold_m').value
+        self.gps_h_acc_cal_threshold = self.get_parameter('gps_h_acc_cal_threshold_m').value
+        self.map_frame = self.get_parameter('map_frame').value
+
+        # GPS state
+        self.fix_status = -1  # NavSatStatus
+        self.carrier_phase = CARRIER_PHASE_NONE
+        self.h_acc_mm = 0
+        self.gnss_fix_ok = False
+        self.last_fix_time = None
+        self.current_lat = None
+        self.current_lon = None
+        self.current_alt = 0.0
+
+        # IMU state
+        self.imu_mode = 'unknown'  # 'unknown', 'ndof', 'imuplus'
+        self.sys_cal = 0
+        self.gyro_cal = 0
+        self.accel_cal = 0
+        self.mag_cal = 0
+        self.calib_msg_count = 0
+        self.last_imu_msg = None
+
+        # Heading state
+        self.heading_source = 'none'  # 'none', 'magnetometer', 'drive_calibration'
+        self.heading_established = False
+        self.heading_enu_rad = None
+
+        # Motion detection
+        self.robot_speed = 0.0
+        self.min_drive_speed = 0.05  # m/s — must be moving to count toward calibration
+
+        # Drive calibration state (IMUPlus path)
+        self.drive_cal_start_lat = None
+        self.drive_cal_start_lon = None
+        self.drive_cal_start_imu_yaw = None
+        self.drive_cal_distance = 0.0
+        self.drive_cal_bad_gps_count = 0
+        self.drive_cal_bad_gps_limit = 5  # consecutive bad readings before reset
+
+        # Datum state
+        self.datum_set = False
+        self.datum_set_time = None
+        self.datum_gps_quality = 'none'
+        self.datum_pending = False
+
+        # Environment
+        self.environment = 'unknown'
+        self.gps_timeout_sec = 30.0
+
+        # Subscribers
+        self.create_subscription(NavSatFix, 'rtk/fix', self._fix_cb, 10)
+        if HAS_NAVPVT:
+            self.create_subscription(NavPVT, 'rtk/navpvt', self._navpvt_cb, 10)
+        self.create_subscription(Imu, 'bno055/imu', self._imu_cb, 10)
+        self.create_subscription(String, 'bno055/calib_status', self._calib_cb, 10)
+        self.create_subscription(Odometry, 'odometry/local', self._odom_cb, 10)
+
+        # Publishers
+        self.status_pub = self.create_publisher(String, 'localization/status', 10)
+        self.diag_pub = self.create_publisher(DiagnosticArray, 'diagnostics', 10)
+
+        # Service client
+        self.datum_client = self.create_client(SetDatum, 'datum')
+
+        # 1 Hz evaluation timer
+        self.create_timer(1.0, self._periodic_evaluate)
+
+        self.get_logger().info('Localization supervisor started')
+
+    # ── Callbacks ──
+
+    def _fix_cb(self, msg: NavSatFix):
+        self.fix_status = msg.status.status
+        self.current_lat = msg.latitude
+        self.current_lon = msg.longitude
+        self.current_alt = msg.altitude
+        self.last_fix_time = self.get_clock().now()
+
+    def _navpvt_cb(self, msg):
+        self.gnss_fix_ok = bool(msg.flags & FLAGS_GNSS_FIX_OK)
+        self.carrier_phase = msg.flags & CARRIER_PHASE_MASK
+        self.h_acc_mm = msg.h_acc
+
+    def _imu_cb(self, msg: Imu):
+        self.last_imu_msg = msg
+
+    def _calib_cb(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            self.sys_cal = data.get('sys', 0)
+            self.gyro_cal = data.get('gyro', 0)
+            self.accel_cal = data.get('accel', 0)
+            self.mag_cal = data.get('mag', 0)
+            self.calib_msg_count += 1
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+        self._detect_imu_mode()
+
+    def _odom_cb(self, msg: Odometry):
+        speed = math.sqrt(msg.twist.twist.linear.x ** 2 +
+                          msg.twist.twist.linear.y ** 2)
+        self.robot_speed = speed
+
+    # ── IMU Mode Detection ──
+
+    def _detect_imu_mode(self):
+        if self.imu_mode != 'unknown':
+            return
+
+        if self.mag_cal > 0:
+            self.imu_mode = 'ndof'
+            self.get_logger().info('IMU mode detected: NDOF (magnetometer active)')
+        elif self.calib_msg_count >= 3 and self.mag_cal == 0:
+            self.imu_mode = 'imuplus'
+            self.get_logger().info(
+                'IMU mode detected: IMUPlus (no magnetometer). '
+                f'Drive {self.heading_cal_distance:.1f}m with good GPS to establish heading.')
+
+    # ── Heading Evaluation ──
+
+    def _check_ndof_heading(self):
+        """Check if NDOF heading is ready."""
+        if self.mag_cal >= self.mag_cal_threshold and self.sys_cal >= 1:
+            if self.last_imu_msg is not None:
+                yaw = get_yaw_from_quaternion(self.last_imu_msg.orientation)
+                self.heading_enu_rad = yaw
+                self.heading_source = 'magnetometer'
+                self.heading_established = True
+                return True
+        return False
+
+    def _update_drive_calibration(self):
+        """Accumulate GPS displacement for IMUPlus heading calibration.
+
+        Requires the same GPS quality threshold as datum setting to ensure
+        the bearing calculation is based on accurate positions.
+        """
+        # Skip if heading established and re-calibration not allowed or cooldown active
+        if self.heading_established:
+            if not self.allow_re_datum or not self._cooldown_elapsed():
+                return
+
+        # During accumulation: only need usable GPS (sane accuracy), not full quality
+        # Full quality is required at completion for accurate bearing calculation
+        if not self._gps_usable() or self.current_lat is None:
+            self.drive_cal_bad_gps_count += 1
+            if self.drive_cal_bad_gps_count >= self.drive_cal_bad_gps_limit:
+                if self.drive_cal_start_lat is not None:
+                    self.get_logger().warn(
+                        f'Drive cal: RESET after {self.drive_cal_bad_gps_count} bad readings '
+                        f'(fix_status={self.fix_status}, h_acc_mm={self.h_acc_mm}, '
+                        f'had {self.drive_cal_distance:.2f}m accumulated)')
+                    self.drive_cal_start_lat = None
+                    self.drive_cal_distance = 0.0
+            return
+        self.drive_cal_bad_gps_count = 0  # reset counter on good reading
+
+        # Need IMU data
+        if self.last_imu_msg is None:
+            return
+
+        current_imu_yaw = get_yaw_from_quaternion(self.last_imu_msg.orientation)
+
+        # Robot must be actually moving (wheel odometry confirms motion)
+        # This prevents GPS convergence from being mistaken for driving
+        if self.robot_speed < self.min_drive_speed:
+            return
+
+        if self.drive_cal_start_lat is None:
+            # Only record start at full GPS quality AND tight horizontal accuracy
+            h_acc_m = self.h_acc_mm / 1000.0
+            if not self._gps_quality_met() or h_acc_m > self.gps_h_acc_cal_threshold:
+                return
+            self.drive_cal_start_lat = self.current_lat
+            self.drive_cal_start_lon = self.current_lon
+            self.drive_cal_start_imu_yaw = current_imu_yaw
+            self.drive_cal_distance = 0.0
+            self.get_logger().info(
+                f'Drive cal: start recorded at ({self.current_lat:.6f}, {self.current_lon:.6f}) '
+                f'GPS={self._gps_fix_level()}')
+            return
+
+        # Compute distance from start
+        dist = haversine_distance(
+            self.drive_cal_start_lat, self.drive_cal_start_lon,
+            self.current_lat, self.current_lon)
+        self.drive_cal_distance = dist
+        self.get_logger().debug(
+            f'Drive cal: dist={dist:.2f}m from ({self.drive_cal_start_lat:.6f},{self.drive_cal_start_lon:.6f}) '
+            f'to ({self.current_lat:.6f},{self.current_lon:.6f})')
+
+        if dist >= self.heading_cal_distance:
+            # Require full GPS quality AND tight accuracy for final bearing
+            h_acc_m = self.h_acc_mm / 1000.0
+            if not self._gps_quality_met() or h_acc_m > self.gps_h_acc_cal_threshold:
+                return
+
+            # Compute GPS bearing from start to current position
+            bearing = geodetic_bearing(
+                self.drive_cal_start_lat, self.drive_cal_start_lon,
+                self.current_lat, self.current_lon)
+            gps_enu_heading = geodetic_to_enu_heading(bearing)
+
+            # Compute offset: GPS heading - IMU yaw
+            offset = gps_enu_heading - current_imu_yaw
+
+            recal = self.heading_established
+            self.heading_enu_rad = current_imu_yaw + offset
+            self.heading_source = 'drive_calibration'
+            self.heading_established = True
+
+            # Reset accumulator for potential future re-calibration
+            self.drive_cal_start_lat = None
+            self.drive_cal_distance = 0.0
+
+            self.get_logger().info(
+                f'{"Re-calibrated" if recal else "Drive calibration complete"}: '
+                f'GPS bearing={math.degrees(gps_enu_heading):.1f}°, '
+                f'IMU yaw={math.degrees(current_imu_yaw):.1f}°, '
+                f'offset={math.degrees(offset):.1f}°, '
+                f'distance={dist:.2f}m, GPS={self._gps_fix_level()}')
+
+    # ── GPS Quality ──
+
+    def _gps_usable(self) -> bool:
+        """Check if GPS has a real fix with sane accuracy (not indoor garbage)."""
+        if self.fix_status < 0:
+            return False
+        h_acc_m = self.h_acc_mm / 1000.0
+        return h_acc_m < self.gps_h_acc_threshold
+
+    def _gps_fix_level(self) -> str:
+        if self.fix_status < 0 or not self._gps_usable():
+            return 'none'
+        if self.carrier_phase == CARRIER_PHASE_FIXED:
+            return 'rtk_fixed'
+        if self.carrier_phase == CARRIER_PHASE_FLOAT:
+            return 'rtk_float'
+        if self.fix_status >= 2:
+            return 'dgps'
+        if self.fix_status >= 1:
+            return 'sbas'
+        if self.fix_status >= 0:
+            return 'gps'
+        return 'none'
+
+    def _gps_quality_met(self) -> bool:
+        """Check if GPS quality meets the threshold using the unified fix level.
+
+        The quality ordering unifies NavSatFix status and NavPVT carrier phase:
+          none=0, gps=1, sbas=2, dgps=3, rtk_float=4, rtk_fixed=5
+        The threshold parameter maps to this ordering.
+        """
+        quality_order = {'none': 0, 'gps': 1, 'sbas': 2, 'dgps': 3, 'rtk_float': 4, 'rtk_fixed': 5}
+        current = quality_order.get(self._gps_fix_level(), 0)
+        return current >= self.gps_quality_threshold
+
+    def _gps_quality_improved(self) -> bool:
+        """Check if GPS quality improved since last datum."""
+        quality_order = {'none': 0, 'gps': 1, 'sbas': 2, 'dgps': 3, 'rtk_float': 4, 'rtk_fixed': 5}
+        current = quality_order.get(self._gps_fix_level(), 0)
+        previous = quality_order.get(self.datum_gps_quality, 0)
+        return current > previous
+
+    # ── Datum Management ──
+
+    def _try_set_datum(self):
+        if self.datum_pending:
+            return
+        if self.current_lat is None or self.heading_enu_rad is None:
+            return
+        if not self.datum_client.service_is_ready():
+            self.get_logger().warn('Datum service not available, waiting...')
+            return
+
+        # Build GeoPose
+        request = SetDatum.Request()
+        request.geo_pose.position.latitude = self.current_lat
+        request.geo_pose.position.longitude = self.current_lon
+        request.geo_pose.position.altitude = self.current_alt
+
+        quat = quaternion_from_euler(0.0, 0.0, self.heading_enu_rad)
+        request.geo_pose.orientation.x = quat[0]
+        request.geo_pose.orientation.y = quat[1]
+        request.geo_pose.orientation.z = quat[2]
+        request.geo_pose.orientation.w = quat[3]
+
+        fix_level = self._gps_fix_level()
+        imu_yaw_now = get_yaw_from_quaternion(self.last_imu_msg.orientation) if self.last_imu_msg else None
+        self.get_logger().info(
+            f'Setting datum: lat={self.current_lat:.6f}, lon={self.current_lon:.6f}, alt={self.current_alt:.2f}, '
+            f'heading={math.degrees(self.heading_enu_rad):.1f}° ENU ({self.heading_enu_rad:.4f} rad), '
+            f'quat=[{quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f}], '
+            f'GPS={fix_level}, h_acc={self.h_acc_mm/1000:.3f}m, '
+            f'heading_source={self.heading_source}, '
+            f'imu_yaw_now={math.degrees(imu_yaw_now):.1f}° ({imu_yaw_now:.4f} rad)' if imu_yaw_now is not None else '')
+        self.get_logger().info(
+            f'NOTE: navsat_transform will ADD magnetic_declination ({math.degrees(0.0436):.1f}°) + '
+            f'meridian_convergence (~1.1°) to this heading. '
+            f'If heading is already true ENU, this is double-correction.')
+
+        self.datum_pending = True
+        future = self.datum_client.call_async(request)
+        future.add_done_callback(
+            lambda f: self._datum_response(f, fix_level))
+
+    def _datum_response(self, future, fix_level):
+        self.datum_pending = False
+        try:
+            future.result()
+            self.datum_set = True
+            self.datum_set_time = self.get_clock().now()
+            self.datum_gps_quality = fix_level
+            self.get_logger().info(f'Datum set successfully (GPS: {fix_level})')
+        except Exception as e:
+            self.get_logger().error(f'Datum service call failed: {e}')
+
+    def _reset_global_ekf(self):
+        """Reset the global EKF to the current GPS position via set_pose.
+
+        The EKF may have drifted while running with only IMU before GPS
+        was available. set_pose resets the filter state immediately.
+        """
+        if self.current_lat is None or self.heading_enu_rad is None:
+            return
+
+        msg = PoseWithCovarianceStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.map_frame
+
+        # Position at origin of the map frame (datum was just set here)
+        msg.pose.pose.position.x = 0.0
+        msg.pose.pose.position.y = 0.0
+        msg.pose.pose.position.z = 0.0
+
+        # Orientation from heading calibration
+        quat = quaternion_from_euler(0.0, 0.0, self.heading_enu_rad)
+        msg.pose.pose.orientation.x = quat[0]
+        msg.pose.pose.orientation.y = quat[1]
+        msg.pose.pose.orientation.z = quat[2]
+        msg.pose.pose.orientation.w = quat[3]
+
+        # Covariance — reasonably confident in GPS position, less in heading
+        cov = [0.0] * 36
+        cov[0] = 1.0    # x
+        cov[7] = 1.0    # y
+        cov[14] = 1.0   # z
+        cov[21] = 0.1   # roll
+        cov[28] = 0.1   # pitch
+        cov[35] = 1.0   # yaw
+        msg.pose.covariance = cov
+
+        self.set_pose_pub.publish(msg)
+        self.get_logger().info('Global EKF state reset to datum position')
+
+    def _cooldown_elapsed(self) -> bool:
+        if self.datum_set_time is None:
+            return True
+        elapsed = (self.get_clock().now() - self.datum_set_time).nanoseconds / 1e9
+        return elapsed >= self.re_datum_cooldown
+
+    # ── Periodic Evaluation ──
+
+    def _periodic_evaluate(self):
+        # Update environment estimate based on GPS usability, not just message receipt
+        if self.last_fix_time is not None:
+            age = (self.get_clock().now() - self.last_fix_time).nanoseconds / 1e9
+            if age >= self.gps_timeout_sec:
+                self.environment = 'indoor'
+            elif self._gps_usable():
+                self.environment = 'outdoor'
+            else:
+                # Receiving GPS messages but accuracy is garbage (e.g., indoors)
+                self.environment = 'indoor'
+        elif self.environment == 'unknown' and self.calib_msg_count > 0:
+            self.environment = 'indoor'  # IMU active but no GPS ever received
+
+        # Evaluate heading
+        if not self.heading_established:
+            if self.imu_mode == 'ndof':
+                self._check_ndof_heading()
+            elif self.imu_mode == 'imuplus':
+                self._update_drive_calibration()
+        elif self.imu_mode == 'ndof' and self.last_imu_msg is not None:
+            # Continuously update NDOF heading (it tracks magnetic north)
+            self.heading_enu_rad = get_yaw_from_quaternion(self.last_imu_msg.orientation)
+
+        # Evaluate datum
+        if self.auto_datum and self.heading_established and self._gps_quality_met():
+            if not self.datum_set:
+                self._try_set_datum()
+            elif (self.allow_re_datum and self._gps_quality_improved()
+                  and self._cooldown_elapsed()):
+                self.get_logger().info(
+                    f'GPS quality improved ({self.datum_gps_quality} → {self._gps_fix_level()}), '
+                    'setting new datum')
+                self._try_set_datum()
+
+        # Publish status
+        self._publish_status()
+
+    # ── Status Publishing ──
+
+    def _publish_status(self):
+        fix_level = self._gps_fix_level()
+        h_acc_m = self.h_acc_mm / 1000.0 if self.h_acc_mm > 0 else None
+        heading_deg = math.degrees(self.heading_enu_rad) if self.heading_enu_rad is not None else None
+
+        nav_ready = self.datum_set and self._gps_quality_met()
+
+        # Drive cal info for status
+        drive_cal_info = None
+        if self.imu_mode == 'imuplus' and not self.heading_established:
+            remaining = max(0.0, self.heading_cal_distance - self.drive_cal_distance)
+            drive_cal_info = f'drive {remaining:.1f}m to calibrate heading'
+
+        # JSON status
+        status = {
+            'gps_fix': fix_level,
+            'gps_h_acc_m': round(h_acc_m, 3) if h_acc_m else None,
+            'imu_mode': self.imu_mode,
+            'imu_cal': {
+                'sys': self.sys_cal,
+                'gyro': self.gyro_cal,
+                'accel': self.accel_cal,
+                'mag': self.mag_cal,
+            },
+            'heading_source': self.heading_source,
+            'heading_established': self.heading_established,
+            'heading_deg': round(heading_deg, 1) if heading_deg is not None else None,
+            'datum_set': self.datum_set,
+            'datum_gps_quality': self.datum_gps_quality,
+            'environment': self.environment,
+            'nav_ready': nav_ready,
+        }
+        if drive_cal_info:
+            status['drive_cal'] = drive_cal_info
+
+        msg = String()
+        msg.data = json.dumps(status)
+        self.status_pub.publish(msg)
+
+        # Diagnostics
+        diag = DiagnosticArray()
+        diag.header.stamp = self.get_clock().now().to_msg()
+
+        ds = DiagnosticStatus()
+        ds.name = 'localization_supervisor'
+        ds.hardware_id = 'grunt_localization'
+
+        if nav_ready:
+            ds.level = DiagnosticStatus.OK
+            ds.message = f'Navigation ready (GPS: {fix_level})'
+        elif self.datum_set:
+            ds.level = DiagnosticStatus.WARN
+            ds.message = f'Datum set but GPS degraded ({fix_level})'
+        elif self.heading_established:
+            ds.level = DiagnosticStatus.WARN
+            ds.message = f'Heading ready, waiting for GPS ({fix_level})'
+        else:
+            ds.level = DiagnosticStatus.ERROR
+            ds.message = f'Not ready: {drive_cal_info or "waiting for heading"}'
+
+        for key, val in status.items():
+            if key == 'imu_cal':
+                ds.values.append(KeyValue(key='imu_cal', value=json.dumps(val)))
+            else:
+                ds.values.append(KeyValue(key=key, value=str(val)))
+
+        diag.status.append(ds)
+        self.diag_pub.publish(diag)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LocalizationSupervisor()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

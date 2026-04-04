@@ -13,9 +13,15 @@ install(DIRECTORY
  
 )
 
-install(DIRECTORY 
+install(DIRECTORY
    config
    DESTINATION share/${PROJECT_NAME}
- 
+
 )
+
+install(PROGRAMS
+  scripts/localization_supervisor
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()

@@ -1,0 +1,41 @@
+# navsat_transform_node: converts GPS (NavSatFix) to Cartesian odometry
+# Based on the canonical dual_ekf_navsat_example.yaml from robot_localization
+# Topic names are overridden at launch time to match robot namespace
+/**:
+  navsat_transform:
+    ros__parameters:
+      frequency: 30.0
+      delay: 3.0
+
+      # Magnetic declination and yaw_offset are set to 0.0 because the
+      # supervisor's datum service provides the TRUE ENU heading directly.
+      # navsat_transform would otherwise double-correct by adding these on top.
+      # If switching to NDOF mode without the supervisor, restore:
+      #   magnetic_declination_radians: 0.0436  (Dallas area, ~2.5° east)
+      #   yaw_offset: 1.5708  (π/2, BNO055 NDOF reads 0 at north)
+      magnetic_declination_radians: 0.0
+      yaw_offset: 0.0
+
+      # Wait for supervisor to call /datum service with accurate position + heading.
+      # Do NOT add a 'datum' parameter — on Humble it causes auto-initialization.
+      # Without GPS odom, the global EKF runs on wheel+IMU only (stable at origin).
+      # When supervisor sets datum, GPS odom starts at (0,0) — no large corrections.
+      wait_for_datum: true
+
+      # Use odometry yaw instead of raw IMU yaw
+      # Safer for BNO055 since the local EKF's heading is smoother
+      use_odometry_yaw: false
+
+      # Do not broadcast TF — the global EKF handles map->odom
+      broadcast_cartesian_transform: false
+      broadcast_cartesian_transform_as_parent_frame: false
+
+      # Zero altitude (2D navigation)
+      zero_altitude: true
+
+      # TF lookup tolerance — needed for bag replay and sim time
+      # Without this, the odom->base_link TF lookup fails on timing mismatches
+      transform_timeout: 0.5
+
+      # Do not back-convert to GPS (caused crash earlier)
+      publish_filtered_gps: false

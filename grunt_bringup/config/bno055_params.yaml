@@ -27,7 +27,7 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 # Example parameters for a UART connection to the BNO055 motion sensor.
-bno055:
+/**:
   ros__parameters:
     ros_topic_prefix: "bno055/"
     connection_type: "uart"
@@ -38,7 +38,7 @@ bno055:
     calib_status_frequency: 0.1
     frame_id: "bno055"
     operation_mode: 0x08
-    placement_axis_remap: "P4"
+    placement_axis_remap: "P5"
     acc_factor: 100.0
     mag_factor: 16000000.0
     gyr_factor: 900.0
