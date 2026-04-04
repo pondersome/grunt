@@ -5,6 +5,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch.conditions import IfCondition
 from launch_ros.parameter_descriptions import ParameterValue
 import xml.etree.ElementTree as ET
 
@@ -37,10 +38,16 @@ def generate_robot_description(prefix, subsystem, base_link_name):
         'roarm_urdf_builder.xacro'
     )
 
-    camera_xacro_file = os.path.join(  
+    camera_xacro_file = os.path.join(
         get_package_share_directory('grunt_description'),
         'urdf/realsense_d455',
         'realsense_camera_on_gripper.xacro'
+    )
+
+    mast_xacro_file = os.path.join(
+        get_package_share_directory('grunt_description'),
+        'urdf',
+        'mast.xacro'
     )
 
     try:
@@ -57,6 +64,11 @@ def generate_robot_description(prefix, subsystem, base_link_name):
             ['xacro', arm_xacro_file, f'prefix:={prefix}/{subsystem}/', f'base_link_name:={base_link_name}', 'end_rot:=90']
         ).decode('utf-8')
 
+        # Process the mast Xacro file
+        mast_description_content = subprocess.check_output(
+            ['xacro', mast_xacro_file, f'prefix:={prefix}/mast/']
+        ).decode('utf-8')
+
         # Process the chassis Xacro file
         chassis_description_content = subprocess.check_output(
             ['xacro', chassis_xacro_file, f'prefix:={prefix}/chassis/']
@@ -66,6 +78,7 @@ def generate_robot_description(prefix, subsystem, base_link_name):
         chassis_root = ET.fromstring(chassis_description_content)
         arm_root = ET.fromstring(arm_description_content)
         camera_root = ET.fromstring(camera_description_content)
+        mast_root = ET.fromstring(mast_description_content)
 
         # Dummy root to hold and connect the merged descriptions
         # Note that the camera xacro generates its own joint to connect to the the parent link so
@@ -81,6 +94,11 @@ def generate_robot_description(prefix, subsystem, base_link_name):
             <origin rpy="0 0 0" xyz="0.205 0 0.0"/>
             <parent link="{prefix}/chassis/top_plate"/>
             <child link="{prefix}/{subsystem}/base_link"/>
+        </joint>
+        <joint name="chassis_to_mast" type="fixed">
+            <origin rpy="0 0 0" xyz="-0.10 0 0.0"/>
+            <parent link="{prefix}/chassis/top_plate"/>
+            <child link="{prefix}/mast/base_link"/>
         </joint>
         </dummy>
         """
@@ -105,6 +123,9 @@ def generate_robot_description(prefix, subsystem, base_link_name):
             merged_robot.append(child)
 
         for child in camera_root:
+            merged_robot.append(child)
+
+        for child in mast_root:
             merged_robot.append(child)
 
         # Convert the merged URDF back to string
@@ -166,7 +187,8 @@ def launch_setup(context, *args, **kwargs):
         parameters=[robot_description],
     )
 
-    # Create joint_state_publisher_gui node
+    # Create joint_state_publisher_gui node (optional, controlled by use_gui arg)
+    use_gui = LaunchConfiguration('use_gui').perform(context)
     arm_joint_state_publisher_node = Node(
         package='joint_state_publisher_gui',
         executable='joint_state_publisher_gui',
@@ -174,6 +196,7 @@ def launch_setup(context, *args, **kwargs):
         namespace=apply_namespace,  # None if inherited, otherwise explicit namespace
         output='screen',
         parameters=[robot_description],
+        condition=IfCondition(use_gui),
     )
 
     # Create roarm_driver node - needs subsystem appended to namespace
@@ -236,6 +259,12 @@ def generate_launch_description():
         description="Name of the arm's base link"
     )
 
+    use_gui_arg = DeclareLaunchArgument(
+        'use_gui',
+        default_value='1',
+        description='Launch joint_state_publisher_gui (0=no, 1=yes)'
+    )
+
     # Use OpaqueFunction to dynamically create nodes with resolved parameters
     setup_nodes = OpaqueFunction(function=launch_setup)
 
@@ -245,5 +274,6 @@ def generate_launch_description():
         namespace_arg,
         subsystem_name_arg,
         base_link_name_arg,
+        use_gui_arg,
         setup_nodes
     ])
