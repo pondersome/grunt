@@ -187,6 +187,17 @@ def launch_setup(context, *args, **kwargs):
         parameters=[robot_description],
     )
 
+    # Headless joint_state_publisher merges wheel joints (default zeros) with arm joints
+    # (from arm_preset_publisher via source_list). Publishes combined joint_states.
+    joint_state_publisher_node = Node(
+        package='joint_state_publisher',
+        executable='joint_state_publisher',
+        name='joint_state_publisher',
+        namespace=apply_namespace,
+        output='screen',
+        parameters=[robot_description, {'source_list': ['arm_joint_states']}],
+    )
+
     # Create joint_state_publisher_gui node (optional, controlled by use_gui arg)
     use_gui = LaunchConfiguration('use_gui').perform(context)
     arm_joint_state_publisher_node = Node(
@@ -211,11 +222,12 @@ def launch_setup(context, *args, **kwargs):
             'serial_port': LaunchConfiguration('serial_port').perform(context),
             'baud_rate': 115200,
         }],
-        remappings=[(f'/{prefix}/{subsystem}/joint_states', f'/{prefix}/joint_states')]
+        remappings=[(f'/{prefix}/{subsystem}/joint_states', f'/{prefix}/arm_joint_states')]
     )
 
     return [
         robot_state_publisher_node,
+        joint_state_publisher_node,
         arm_joint_state_publisher_node,
         roarm_driver_node
     ]

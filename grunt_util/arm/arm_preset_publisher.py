@@ -9,9 +9,12 @@ class ArmPresetPublisher(Node):
     def __init__(self):
         super().__init__('arm_preset_publisher')
         # Publisher for joint states
-        self.joint_state_pub = self.create_publisher(JointState, 'joint_states', 10)
+        self.joint_state_pub = self.create_publisher(JointState, 'arm_joint_states', 10)
         # Subscriber for preset commands
         self.create_subscription(String, 'arm_preset', self.preset_callback, 10)
+        # Republish last joint state at 1Hz so late-joining subscribers (rviz, robot_state_publisher) stay in sync
+        self._last_joint_positions = None
+        self.create_timer(1.0, self._republish_joint_state)
 
         # Get a prefix parameter for joint name aliasing (default is empty)
         self.declare_parameter('prefix', '')
@@ -113,15 +116,18 @@ class ArmPresetPublisher(Node):
                 self.get_logger().warn(f"Bearing spec '{bearing_spec}' unrecognized for pan command.")
                 return
             
-            # Publish only the pan joint
-            joint_state = JointState()
-            joint_state.header.stamp = self.get_clock().now().to_msg()
-            # Only include the pan joint name
-            pan_suffix = self.joint_suffixes['pan']
-            joint_state.name = [f"{self.prefix}{pan_suffix}" if self.prefix else pan_suffix]
-            joint_state.position = [yaw]
-            
-            self.joint_state_pub.publish(joint_state)
+            # Update pan in last known positions and republish all joints
+            if self._last_joint_positions is not None:
+                self._last_joint_positions[0] = yaw
+                self._publish_joint_state(self._last_joint_positions)
+            else:
+                # No prior preset — publish pan-only
+                pan_suffix = self.joint_suffixes['pan']
+                joint_state = JointState()
+                joint_state.header.stamp = self.get_clock().now().to_msg()
+                joint_state.name = [f"{self.prefix}{pan_suffix}" if self.prefix else pan_suffix]
+                joint_state.position = [yaw]
+                self.joint_state_pub.publish(joint_state)
             self.get_logger().info(f"Published pan-only command with yaw {yaw:.3f} rad.")
             return
 
@@ -142,13 +148,20 @@ class ArmPresetPublisher(Node):
                 self.get_logger().warn(f"Bearing spec '{bearing_spec}' unrecognized, leaving pan joint unchanged.")
 
         # Publish the joint state
+        self._last_joint_positions = joint_positions
+        self._publish_joint_state(joint_positions)
+        self.get_logger().info(f"Published joint states for preset '{preset_name}' with final yaw {joint_positions[0]:.3f} rad.")
+
+    def _publish_joint_state(self, positions):
         joint_state = JointState()
         joint_state.header.stamp = self.get_clock().now().to_msg()
         joint_state.name = self.get_joint_names()
-        joint_state.position = joint_positions
-
+        joint_state.position = positions
         self.joint_state_pub.publish(joint_state)
-        self.get_logger().info(f"Published joint states for preset '{preset_name}' with final yaw {joint_positions[0]:.3f} rad.")
+
+    def _republish_joint_state(self):
+        if self._last_joint_positions is not None:
+            self._publish_joint_state(self._last_joint_positions)
 
 def main(args=None):
     rclpy.init(args=args)
