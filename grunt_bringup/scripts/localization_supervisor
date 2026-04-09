@@ -85,7 +85,7 @@ class LocalizationSupervisor(Node):
 
         # Parameters
         # Quality ordering: none=0, gps=1, sbas=2, dgps=3, rtk_float=4, rtk_fixed=5
-        self.declare_parameter('gps_quality_threshold', 4)  # default: rtk_float
+        self.declare_parameter('gps_quality_threshold', 4)  # rtk_float
         self.declare_parameter('heading_calibration_distance', 3.0)
         self.declare_parameter('mag_calibration_threshold', 2)
         self.declare_parameter('auto_datum', True)
@@ -105,6 +105,9 @@ class LocalizationSupervisor(Node):
         self.gps_h_acc_threshold = self.get_parameter('gps_h_acc_threshold_m').value
         self.gps_h_acc_cal_threshold = self.get_parameter('gps_h_acc_cal_threshold_m').value
         self.map_frame = self.get_parameter('map_frame').value
+
+        # Allow runtime parameter changes via ros2 param set
+        self.add_on_set_parameters_callback(self._on_param_change)
 
         # GPS state
         self.fix_status = -1  # NavSatStatus
@@ -180,6 +183,30 @@ class LocalizationSupervisor(Node):
         self.current_lon = msg.longitude
         self.current_alt = msg.altitude
         self.last_fix_time = self.get_clock().now()
+
+    # ── Parameter Callback ──
+
+    def _on_param_change(self, params):
+        from rcl_interfaces.msg import SetParametersResult
+        param_map = {
+            'gps_quality_threshold': 'gps_quality_threshold',
+            'heading_calibration_distance': 'heading_cal_distance',
+            'mag_calibration_threshold': 'mag_cal_threshold',
+            'auto_datum': 'auto_datum',
+            'allow_re_datum': 'allow_re_datum',
+            're_datum_cooldown': 're_datum_cooldown',
+            'gps_h_acc_threshold_m': 'gps_h_acc_threshold',
+            'gps_h_acc_cal_threshold_m': 'gps_h_acc_cal_threshold',
+        }
+        for param in params:
+            if param.name in param_map:
+                attr = param_map[param.name]
+                old_val = getattr(self, attr)
+                setattr(self, attr, param.value)
+                self.get_logger().info(f'Parameter {param.name} changed: {old_val} → {param.value}')
+        return SetParametersResult(successful=True)
+
+    # ── Sensor Callbacks ──
 
     def _navpvt_cb(self, msg):
         self.gnss_fix_ok = bool(msg.flags & FLAGS_GNSS_FIX_OK)

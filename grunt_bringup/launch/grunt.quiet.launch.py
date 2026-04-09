@@ -153,6 +153,8 @@ def generate_launch_description():
         DeclareLaunchArgument('RTK', default_value='1', description='Enable GNSS RTK'),
         DeclareLaunchArgument('IMU', default_value='1', description='Enable BNO055 IMU'),
         DeclareLaunchArgument('Localization', default_value='0', description='Enable robot_localization EKF stack (requires IMU and RTK)'),
+        DeclareLaunchArgument('gps_quality_threshold', default_value='4', description='Min GPS quality for heading cal (0=none..5=rtk_fixed)'),
+        DeclareLaunchArgument('gps_h_acc_cal_threshold_m', default_value='0.5', description='Max h_acc (m) for heading calibration'),
         DeclareLaunchArgument('KeyboardTeleop', default_value='0', description='Start keyboard driven teleop'),
         DeclareLaunchArgument('JoystickTeleop', default_value='1', description='Start joystick driven teleop'),
         # P2OS velocity and acceleration limits
@@ -290,6 +292,8 @@ def generate_launch_description():
                 ]),
                 launch_arguments={
                     'prefix': LaunchConfiguration('prefix'),
+                    'gps_quality_threshold': LaunchConfiguration('gps_quality_threshold'),
+                    'gps_h_acc_cal_threshold_m': LaunchConfiguration('gps_h_acc_cal_threshold_m'),
                 }.items()
             )
         ],

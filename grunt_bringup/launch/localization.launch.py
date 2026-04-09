@@ -90,7 +90,8 @@ def create_localization_nodes(context, *args, **kwargs):
         name='localization_supervisor',
         parameters=[{
             # Quality ordering: none=0, gps=1, sbas=2, dgps=3, rtk_float=4, rtk_fixed=5
-            'gps_quality_threshold': 4,  # rtk_float
+            'gps_quality_threshold': int(LaunchConfiguration('gps_quality_threshold').perform(context)),
+            'gps_h_acc_cal_threshold_m': float(LaunchConfiguration('gps_h_acc_cal_threshold_m').perform(context)),
             'heading_calibration_distance': 3.0,
             'mag_calibration_threshold': 2,
             'auto_datum': True,
@@ -115,6 +116,16 @@ def generate_launch_description():
             'prefix',
             default_value='mybot1',
             description='Namespace prefix for frame IDs (e.g., grunt1)'
+        ),
+        DeclareLaunchArgument(
+            'gps_quality_threshold',
+            default_value='4',
+            description='Min GPS quality for heading cal: none=0, gps=1, sbas=2, dgps=3, rtk_float=4, rtk_fixed=5'
+        ),
+        DeclareLaunchArgument(
+            'gps_h_acc_cal_threshold_m',
+            default_value='0.5',
+            description='Max horizontal accuracy (m) for heading calibration start/end'
         ),
         OpaqueFunction(function=create_localization_nodes),
     ])
