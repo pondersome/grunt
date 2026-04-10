@@ -129,6 +129,7 @@ class LocalizationSupervisor(Node):
         self.mag_cal = 0
         self.calib_msg_count = 0
         self.last_imu_msg = None
+        self.last_odom_msg = None
 
         # Heading state
         self.heading_source = 'none'  # 'none', 'magnetometer', 'drive_calibration'
@@ -177,6 +178,15 @@ class LocalizationSupervisor(Node):
         # datum has been set. Uses default RELIABLE QoS to match
         # navsat_transform's subscription QoS.
         self.gated_fix_pub = self.create_publisher(NavSatFix, 'rtk/fix_gated', 10)
+
+        # GPS odometry relay: subscribes to navsat_transform's /odometry/gps
+        # (published in odom frame) and republishes with frame_id changed to
+        # map frame. This breaks a positive feedback loop in the global EKF
+        # where it uses its OWN map→odom TF to transform GPS measurements,
+        # causing a constant innovation that compounds linearly.
+        # By relaying in the map frame, no TF lookup is needed.
+        self.create_subscription(Odometry, 'odometry/gps', self._gps_odom_relay_cb, 10)
+        self.gps_odom_map_pub = self.create_publisher(Odometry, 'odometry/gps_map', 10)
         # Used to reset the global EKF state during a calibration reset.
         # Remapped from the EKF's default 'set_pose' to keep it isolated from
         # the local EKF (which has its own remap to 'set_pose_local').
@@ -280,11 +290,32 @@ class LocalizationSupervisor(Node):
 
         self._detect_imu_mode()
 
+    def _gps_odom_relay_cb(self, msg: Odometry):
+        """Relay GPS odometry with frame_id changed to map frame.
+
+        navsat_transform publishes /odometry/gps with frame_id=odom. The
+        global EKF (world_frame=map) must transform this via its own
+        map→odom TF, creating a self-referential feedback loop that
+        causes linear divergence. By republishing with frame_id=map,
+        the EKF accepts the measurement directly — no TF lookup needed.
+
+        This is valid because navsat_transform's datum defines the map
+        origin: GPS positions relative to the datum ARE map positions.
+        """
+        relay = Odometry()
+        relay.header = msg.header
+        relay.header.frame_id = self.map_frame  # grunt1/map instead of grunt1/odom
+        relay.child_frame_id = msg.child_frame_id
+        relay.pose = msg.pose
+        relay.twist = msg.twist
+        self.gps_odom_map_pub.publish(relay)
+
     def _odom_cb(self, msg: Odometry):
         speed = math.sqrt(msg.twist.twist.linear.x ** 2 +
                           msg.twist.twist.linear.y ** 2)
         self.robot_speed = speed
         self.robot_vx = msg.twist.twist.linear.x  # signed forward velocity
+        self.last_odom_msg = msg  # stored for _sync_global_to_local
 
     # ── IMU Mode Detection ──
 
@@ -577,12 +608,58 @@ class LocalizationSupervisor(Node):
         self.datum_pending = False
         try:
             future.result()
+
+            # CRITICAL: Before opening the GPS gate (datum_set=True), sync
+            # the global EKF state to match the local EKF state. This ensures
+            # map→odom ≈ identity, so the first GPS measurement (near 0 in
+            # odom frame, since the datum IS the current GPS position) maps
+            # to near the state (also near 0 in map ≈ odom). Without this,
+            # the 3m dead-reckoning drift from the calibration drive creates
+            # a constant innovation that feeds a positive feedback loop in
+            # the EKF's self-referential odom→map transformation.
+            self._sync_global_to_local()
+
             self.datum_set = True
             self.datum_set_time = self.get_clock().now()
             self.datum_gps_quality = fix_level
             self.get_logger().info(f'Datum set successfully (GPS: {fix_level})')
         except Exception as e:
             self.get_logger().error(f'Datum service call failed: {e}')
+
+    def _sync_global_to_local(self):
+        """Set the global EKF state to match the local EKF's current pose.
+
+        After the datum is set, the GPS-to-odom transformation defines
+        map≈odom at the datum point. The global EKF should believe the
+        robot is at the same position in map as the local EKF believes
+        it is in odom. This makes map→odom ≈ identity, preventing the
+        feedback loop where each GPS measurement adds a constant offset.
+        """
+        if self.last_odom_msg is None:
+            self.get_logger().warn('No local odom available for global EKF sync')
+            return
+
+        msg = PoseWithCovarianceStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.map_frame
+
+        # Copy position and orientation from local EKF
+        msg.pose.pose = self.last_odom_msg.pose.pose
+
+        # Loose covariance so subsequent GPS measurements can pull the state
+        cov = [0.0] * 36
+        cov[0] = 1.0    # x
+        cov[7] = 1.0    # y
+        cov[14] = 1.0   # z
+        cov[21] = 0.1   # roll
+        cov[28] = 0.1   # pitch
+        cov[35] = 1.0   # yaw
+        msg.pose.covariance = cov
+
+        self.global_set_pose_pub.publish(msg)
+        lp = self.last_odom_msg.pose.pose.position
+        self.get_logger().info(
+            f'Global EKF synced to local state: ({lp.x:.3f}, {lp.y:.3f})')
 
     def _reset_global_ekf(self):
         """Reset the global EKF to a clean state via set_pose.
