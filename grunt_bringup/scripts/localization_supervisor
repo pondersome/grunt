@@ -21,6 +21,8 @@ from rclpy.duration import Duration
 from sensor_msgs.msg import NavSatFix, Imu
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geographic_msgs.msg import GeoPose, GeoPoint
 from geometry_msgs.msg import Quaternion, PoseWithCovarianceStamped
@@ -34,7 +36,7 @@ try:
 except ImportError:
     HAS_NAVPVT = False
 
-# robot_localization SetDatum service
+# robot_localization services
 from robot_localization.srv import SetDatum
 
 # NavPVT flags masks
@@ -127,6 +129,7 @@ class LocalizationSupervisor(Node):
         self.mag_cal = 0
         self.calib_msg_count = 0
         self.last_imu_msg = None
+        self.last_odom_msg = None
 
         # Heading state
         self.heading_source = 'none'  # 'none', 'magnetometer', 'drive_calibration'
@@ -135,6 +138,7 @@ class LocalizationSupervisor(Node):
 
         # Motion detection
         self.robot_speed = 0.0
+        self.robot_vx = 0.0  # signed forward velocity from wheel odometry
         self.min_drive_speed = 0.05  # m/s — must be moving to count toward calibration
 
         # Drive calibration state (IMUPlus path)
@@ -144,6 +148,10 @@ class LocalizationSupervisor(Node):
         self.drive_cal_distance = 0.0
         self.drive_cal_bad_gps_count = 0
         self.drive_cal_bad_gps_limit = 5  # consecutive bad readings before reset
+        # Track direction during accumulation to detect/handle backward driving
+        # (e.g. backing down a ramp on launch). All non-trivial samples must
+        # have the same sign or accumulation resets.
+        self.drive_cal_direction = 0  # 0 = unknown, +1 = forward, -1 = backward
 
         # Datum state
         self.datum_set = False
@@ -166,9 +174,34 @@ class LocalizationSupervisor(Node):
         # Publishers
         self.status_pub = self.create_publisher(String, 'localization/status', 10)
         self.diag_pub = self.create_publisher(DiagnosticArray, 'diagnostics', 10)
+        # Gated GPS fix: forwards rtk/fix to navsat_transform only after the
+        # datum has been set. Uses default RELIABLE QoS to match
+        # navsat_transform's subscription QoS.
+        self.gated_fix_pub = self.create_publisher(NavSatFix, 'rtk/fix_gated', 10)
+
+        # GPS odometry relay: subscribes to navsat_transform's /odometry/gps
+        # (published in odom frame) and republishes with frame_id changed to
+        # map frame. This breaks a positive feedback loop in the global EKF
+        # where it uses its OWN map→odom TF to transform GPS measurements,
+        # causing a constant innovation that compounds linearly.
+        # By relaying in the map frame, no TF lookup is needed.
+        self.create_subscription(Odometry, 'odometry/gps', self._gps_odom_relay_cb, 10)
+        self.gps_odom_map_pub = self.create_publisher(Odometry, 'odometry/gps_map', 10)
+        # Used to reset the global EKF state during a calibration reset.
+        # Remapped from the EKF's default 'set_pose' to keep it isolated from
+        # the local EKF (which has its own remap to 'set_pose_local').
+        self.global_set_pose_pub = self.create_publisher(
+            PoseWithCovarianceStamped, 'set_pose', 10)
 
         # Service client
         self.datum_client = self.create_client(SetDatum, 'datum')
+
+        # Service server: reset_calibration
+        # Clears all heading/datum state so the supervisor restarts the
+        # calibration sequence as if just launched. Used to recover from
+        # a bad calibration without restarting the entire stack.
+        self.reset_srv = self.create_service(
+            Trigger, '~/reset_calibration', self._reset_calibration_srv)
 
         # 1 Hz evaluation timer
         self.create_timer(1.0, self._periodic_evaluate)
@@ -183,6 +216,34 @@ class LocalizationSupervisor(Node):
         self.current_lon = msg.longitude
         self.current_alt = msg.altitude
         self.last_fix_time = self.get_clock().now()
+
+        # Forward to navsat_transform ONLY after the supervisor has called
+        # /datum with calibrated heading. Three reasons to gate this strictly:
+        #
+        # 1. navsat_transform's wait_for_datum mode does not gate input
+        #    processing — it tries to UTM-convert every fix on the input
+        #    side, fails for any fix not in its default zone (31), and
+        #    spams an error per fix at GPS rate.
+        #
+        # 2. setUTMZone (the obvious workaround for #1) has a side effect
+        #    of setting use_manual_datum_=false, which silently disables
+        #    wait_for_datum and triggers an auto-datum from the next fix.
+        #    The auto-datum uses garbage heading and corrupts the EKF.
+        #
+        # 3. By starving navsat_transform of fixes until /datum has been
+        #    called manually, we avoid both problems entirely. After /datum,
+        #    the zone is set correctly and use_manual_datum_ stays true.
+        #
+        # The supervisor uses its own current_lat/lon (set above) for the
+        # drive calibration logic, so this gating does not affect calibration.
+        if not self.datum_set:
+            return
+
+        # Filter out garbage fixes that may sneak through after datum is set.
+        if not self._gps_usable() or (msg.latitude == 0.0 and msg.longitude == 0.0):
+            return
+
+        self.gated_fix_pub.publish(msg)
 
     # ── Parameter Callback ──
 
@@ -229,10 +290,32 @@ class LocalizationSupervisor(Node):
 
         self._detect_imu_mode()
 
+    def _gps_odom_relay_cb(self, msg: Odometry):
+        """Relay GPS odometry with frame_id changed to map frame.
+
+        navsat_transform publishes /odometry/gps with frame_id=odom. The
+        global EKF (world_frame=map) must transform this via its own
+        map→odom TF, creating a self-referential feedback loop that
+        causes linear divergence. By republishing with frame_id=map,
+        the EKF accepts the measurement directly — no TF lookup needed.
+
+        This is valid because navsat_transform's datum defines the map
+        origin: GPS positions relative to the datum ARE map positions.
+        """
+        relay = Odometry()
+        relay.header = msg.header
+        relay.header.frame_id = self.map_frame  # grunt1/map instead of grunt1/odom
+        relay.child_frame_id = msg.child_frame_id
+        relay.pose = msg.pose
+        relay.twist = msg.twist
+        self.gps_odom_map_pub.publish(relay)
+
     def _odom_cb(self, msg: Odometry):
         speed = math.sqrt(msg.twist.twist.linear.x ** 2 +
                           msg.twist.twist.linear.y ** 2)
         self.robot_speed = speed
+        self.robot_vx = msg.twist.twist.linear.x  # signed forward velocity
+        self.last_odom_msg = msg  # stored for _sync_global_to_local
 
     # ── IMU Mode Detection ──
 
@@ -299,6 +382,9 @@ class LocalizationSupervisor(Node):
         if self.robot_speed < self.min_drive_speed:
             return
 
+        # Determine current direction from signed forward velocity
+        sample_direction = 1 if self.robot_vx > 0 else -1
+
         if self.drive_cal_start_lat is None:
             # Only record start at full GPS quality AND tight horizontal accuracy
             h_acc_m = self.h_acc_mm / 1000.0
@@ -308,9 +394,23 @@ class LocalizationSupervisor(Node):
             self.drive_cal_start_lon = self.current_lon
             self.drive_cal_start_imu_yaw = current_imu_yaw
             self.drive_cal_distance = 0.0
+            self.drive_cal_direction = sample_direction
+            dir_str = 'forward' if sample_direction > 0 else 'backward'
             self.get_logger().info(
                 f'Drive cal: start recorded at ({self.current_lat:.6f}, {self.current_lon:.6f}) '
-                f'GPS={self._gps_fix_level()}')
+                f'GPS={self._gps_fix_level()}, direction={dir_str}')
+            return
+
+        # Reject mid-drive direction changes — calibration must be consistent
+        if sample_direction != self.drive_cal_direction:
+            self.get_logger().warn(
+                f'Drive cal: direction reversed mid-calibration '
+                f'({"forward" if self.drive_cal_direction > 0 else "backward"} → '
+                f'{"forward" if sample_direction > 0 else "backward"}), '
+                f'resetting accumulator (had {self.drive_cal_distance:.2f}m)')
+            self.drive_cal_start_lat = None
+            self.drive_cal_distance = 0.0
+            self.drive_cal_direction = 0
             return
 
         # Compute distance from start
@@ -328,11 +428,17 @@ class LocalizationSupervisor(Node):
             if not self._gps_quality_met() or h_acc_m > self.gps_h_acc_cal_threshold:
                 return
 
-            # Compute GPS bearing from start to current position
+            # Compute GPS bearing from start to current position.
+            # If we drove backward, the bearing points 180° away from the
+            # robot's actual heading — flip it.
             bearing = geodetic_bearing(
                 self.drive_cal_start_lat, self.drive_cal_start_lon,
                 self.current_lat, self.current_lon)
             gps_enu_heading = geodetic_to_enu_heading(bearing)
+            if self.drive_cal_direction < 0:
+                gps_enu_heading = (gps_enu_heading + math.pi) % (2 * math.pi)
+                if gps_enu_heading > math.pi:
+                    gps_enu_heading -= 2 * math.pi
 
             # Compute offset: GPS heading - IMU yaw
             offset = gps_enu_heading - current_imu_yaw
@@ -342,16 +448,21 @@ class LocalizationSupervisor(Node):
             self.heading_source = 'drive_calibration'
             self.heading_established = True
 
+            # Capture direction for log message before resetting accumulator
+            dir_label = 'backward (flipped)' if self.drive_cal_direction < 0 else 'forward'
+
             # Reset accumulator for potential future re-calibration
             self.drive_cal_start_lat = None
             self.drive_cal_distance = 0.0
+            self.drive_cal_direction = 0
 
             self.get_logger().info(
                 f'{"Re-calibrated" if recal else "Drive calibration complete"}: '
                 f'GPS bearing={math.degrees(gps_enu_heading):.1f}°, '
                 f'IMU yaw={math.degrees(current_imu_yaw):.1f}°, '
                 f'offset={math.degrees(offset):.1f}°, '
-                f'distance={dist:.2f}m, GPS={self._gps_fix_level()}')
+                f'distance={dist:.2f}m, direction={dir_label}, '
+                f'GPS={self._gps_fix_level()}')
 
     # ── GPS Quality ──
 
@@ -394,6 +505,62 @@ class LocalizationSupervisor(Node):
         current = quality_order.get(self._gps_fix_level(), 0)
         previous = quality_order.get(self.datum_gps_quality, 0)
         return current > previous
+
+    # ── Calibration Reset ──
+
+    def _reset_calibration_srv(self, request, response):
+        """Service handler: clear all heading/datum state and restart sequence.
+
+        Use case: bad calibration (e.g. wrong direction during a backward
+        ramp descent) needs to be redone without losing GPS lock by
+        restarting the whole stack.
+
+        Side effects:
+          - Clears supervisor heading and drive_cal state
+          - Resets datum_set flag (next /datum call will re-establish it)
+          - Publishes a zero pose to the global EKF set_pose to clear its
+            accumulated state, so the new datum starts from a clean slate
+        """
+        had_heading = self.heading_established
+        had_datum = self.datum_set
+
+        # Clear heading state
+        self.heading_source = 'none'
+        self.heading_established = False
+        self.heading_enu_rad = None
+
+        # Clear drive cal accumulator
+        self.drive_cal_start_lat = None
+        self.drive_cal_start_lon = None
+        self.drive_cal_start_imu_yaw = None
+        self.drive_cal_distance = 0.0
+        self.drive_cal_bad_gps_count = 0
+        self.drive_cal_direction = 0
+
+        # Clear datum state. The next periodic_evaluate cycle will go
+        # through the normal sequence: wait for heading, then call /datum.
+        # navsat_transform handles repeated /datum calls correctly.
+        self.datum_set = False
+        self.datum_set_time = None
+        self.datum_gps_quality = 'none'
+        self.datum_pending = False
+
+        # Reset the global EKF's accumulated state. Without this, the EKF
+        # would still believe its last (x, y) position when the new datum
+        # arrives, causing a large initial discontinuity.
+        self._reset_global_ekf()
+
+        self.get_logger().warn(
+            f'Calibration RESET via service '
+            f'(had_heading={had_heading}, had_datum={had_datum}). '
+            f'Awaiting new heading calibration.')
+
+        response.success = True
+        response.message = (
+            f'Cleared heading and datum state. '
+            f'Will re-calibrate when GPS reaches quality threshold and '
+            f'robot drives {self.heading_cal_distance:.1f}m straight.')
+        return response
 
     # ── Datum Management ──
 
@@ -441,6 +608,17 @@ class LocalizationSupervisor(Node):
         self.datum_pending = False
         try:
             future.result()
+
+            # CRITICAL: Before opening the GPS gate (datum_set=True), sync
+            # the global EKF state to match the local EKF state. This ensures
+            # map→odom ≈ identity, so the first GPS measurement (near 0 in
+            # odom frame, since the datum IS the current GPS position) maps
+            # to near the state (also near 0 in map ≈ odom). Without this,
+            # the 3m dead-reckoning drift from the calibration drive creates
+            # a constant innovation that feeds a positive feedback loop in
+            # the EKF's self-referential odom→map transformation.
+            self._sync_global_to_local()
+
             self.datum_set = True
             self.datum_set_time = self.get_clock().now()
             self.datum_gps_quality = fix_level
@@ -448,32 +626,27 @@ class LocalizationSupervisor(Node):
         except Exception as e:
             self.get_logger().error(f'Datum service call failed: {e}')
 
-    def _reset_global_ekf(self):
-        """Reset the global EKF to the current GPS position via set_pose.
+    def _sync_global_to_local(self):
+        """Set the global EKF state to match the local EKF's current pose.
 
-        The EKF may have drifted while running with only IMU before GPS
-        was available. set_pose resets the filter state immediately.
+        After the datum is set, the GPS-to-odom transformation defines
+        map≈odom at the datum point. The global EKF should believe the
+        robot is at the same position in map as the local EKF believes
+        it is in odom. This makes map→odom ≈ identity, preventing the
+        feedback loop where each GPS measurement adds a constant offset.
         """
-        if self.current_lat is None or self.heading_enu_rad is None:
+        if self.last_odom_msg is None:
+            self.get_logger().warn('No local odom available for global EKF sync')
             return
 
         msg = PoseWithCovarianceStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.map_frame
 
-        # Position at origin of the map frame (datum was just set here)
-        msg.pose.pose.position.x = 0.0
-        msg.pose.pose.position.y = 0.0
-        msg.pose.pose.position.z = 0.0
+        # Copy position and orientation from local EKF
+        msg.pose.pose = self.last_odom_msg.pose.pose
 
-        # Orientation from heading calibration
-        quat = quaternion_from_euler(0.0, 0.0, self.heading_enu_rad)
-        msg.pose.pose.orientation.x = quat[0]
-        msg.pose.pose.orientation.y = quat[1]
-        msg.pose.pose.orientation.z = quat[2]
-        msg.pose.pose.orientation.w = quat[3]
-
-        # Covariance — reasonably confident in GPS position, less in heading
+        # Loose covariance so subsequent GPS measurements can pull the state
         cov = [0.0] * 36
         cov[0] = 1.0    # x
         cov[7] = 1.0    # y
@@ -483,8 +656,48 @@ class LocalizationSupervisor(Node):
         cov[35] = 1.0   # yaw
         msg.pose.covariance = cov
 
-        self.set_pose_pub.publish(msg)
-        self.get_logger().info('Global EKF state reset to datum position')
+        self.global_set_pose_pub.publish(msg)
+        lp = self.last_odom_msg.pose.pose.position
+        self.get_logger().info(
+            f'Global EKF synced to local state: ({lp.x:.3f}, {lp.y:.3f})')
+
+    def _reset_global_ekf(self):
+        """Reset the global EKF to a clean state via set_pose.
+
+        Used both:
+          - During calibration reset (no heading yet) — publishes a zero
+            pose with identity orientation and loose covariance, so the
+            EKF accepts the new datum cleanly when it arrives
+          - After a re-datum on heading change (future use) — would
+            publish the current heading
+
+        Currently this only handles the reset case. The post-datum repose
+        path is left as a placeholder for the planned automatic
+        recalibration feature.
+        """
+        msg = PoseWithCovarianceStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.map_frame
+
+        # Position at origin
+        msg.pose.pose.position.x = 0.0
+        msg.pose.pose.position.y = 0.0
+        msg.pose.pose.position.z = 0.0
+
+        # Identity orientation (no calibrated heading yet during reset)
+        msg.pose.pose.orientation.x = 0.0
+        msg.pose.pose.orientation.y = 0.0
+        msg.pose.pose.orientation.z = 0.0
+        msg.pose.pose.orientation.w = 1.0
+
+        # Loose covariance so the next datum/measurement can pull the state
+        cov = [0.0] * 36
+        for i in range(6):
+            cov[i * 6 + i] = 1.0
+        msg.pose.covariance = cov
+
+        self.global_set_pose_pub.publish(msg)
+        self.get_logger().info('Global EKF state reset (zero pose, loose covariance)')
 
     def _cooldown_elapsed(self) -> bool:
         if self.datum_set_time is None:
@@ -545,7 +758,11 @@ class LocalizationSupervisor(Node):
         drive_cal_info = None
         if self.imu_mode == 'imuplus' and not self.heading_established:
             remaining = max(0.0, self.heading_cal_distance - self.drive_cal_distance)
-            drive_cal_info = f'drive {remaining:.1f}m to calibrate heading'
+            if self.drive_cal_direction != 0:
+                dir_label = 'forward' if self.drive_cal_direction > 0 else 'backward'
+                drive_cal_info = f'drive {remaining:.1f}m {dir_label} to calibrate heading'
+            else:
+                drive_cal_info = f'drive {remaining:.1f}m to calibrate heading'
 
         # JSON status
         status = {

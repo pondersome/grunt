@@ -55,7 +55,10 @@ def create_localization_nodes(context, *args, **kwargs):
         parameters=[navsat_config],
         remappings=[
             ('imu', f'/{prefix}/bno055/imu'),
-            ('gps/fix', f'/{prefix}/rtk/fix'),
+            # Subscribe to the supervisor's gated fix topic, not raw rtk/fix.
+            # The supervisor only republishes fixes that pass quality checks,
+            # preventing UTM zone errors on garbage indoor fixes before datum.
+            ('gps/fix', f'/{prefix}/rtk/fix_gated'),
             ('odometry/filtered', 'odometry/local'),
             ('odometry/gps', 'odometry/gps'),
             ('gps/filtered', 'gps/filtered'),
@@ -80,6 +83,10 @@ def create_localization_nodes(context, *args, **kwargs):
             ('odom_raw', 'pose'),
             ('imu/data', f'/{prefix}/bno055/imu'),
             ('odometry/filtered', 'odometry/global'),
+            # Use the supervisor's map-frame relay instead of navsat's odom-frame
+            # output. This breaks a feedback loop where the EKF uses its own
+            # map→odom TF to transform measurements, causing linear divergence.
+            ('odometry/gps', 'odometry/gps_map'),
         ],
     )
 
