@@ -155,6 +155,7 @@ def generate_launch_description():
         DeclareLaunchArgument('Localization', default_value='0', description='Enable robot_localization EKF stack (requires IMU and RTK)'),
         DeclareLaunchArgument('gps_quality_threshold', default_value='4', description='Min GPS quality for heading cal (0=none..5=rtk_fixed)'),
         DeclareLaunchArgument('gps_h_acc_cal_threshold_m', default_value='0.5', description='Max h_acc (m) for heading calibration'),
+        DeclareLaunchArgument('Nav2', default_value='0', description='Enable Nav2 GPS waypoint following (requires Localization)'),
         DeclareLaunchArgument('KeyboardTeleop', default_value='0', description='Start keyboard driven teleop'),
         DeclareLaunchArgument('JoystickTeleop', default_value='1', description='Start joystick driven teleop'),
         # P2OS velocity and acceleration limits
@@ -300,6 +301,30 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('Localization'))
     )
 
+    gp_nav2 = GroupAction(
+        actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource([
+                    FindPackageShare('grunt_bringup'), '/launch', '/nav2.launch.py'
+                ]),
+                launch_arguments={
+                    'prefix': LaunchConfiguration('prefix'),
+                }.items()
+            ),
+            # Joystick e-stop: toggle button locks all velocity via twist_mux
+            # and cancels any active Nav2 mission
+            Node(
+                package='grunt_bringup',
+                executable='joy_estop',
+                name='joy_estop',
+                parameters=[{'estop_button': 1}],  # B button (red, GameSir Nova Lite)
+                # Crawl moved from B to dpad, so B is now free for e-stop.
+                output='screen',
+            ),
+        ],
+        condition=IfCondition(LaunchConfiguration('Nav2'))
+    )
+
     gp_arm_preset = GroupAction(
         actions=[
             OpaqueFunction(function=create_arm_preset_nodes)
@@ -336,6 +361,7 @@ def generate_launch_description():
         gp_description_rtk,
         gp_imu,
         gp_localization,
+        gp_nav2,
         gp_lidar,
         gp_joy_tele,
         gp_key_tele,
