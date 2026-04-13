@@ -62,6 +62,9 @@ def create_localization_nodes(context, *args, **kwargs):
             ('odometry/filtered', 'odometry/local'),
             ('odometry/gps', 'odometry/gps'),
             ('gps/filtered', 'gps/filtered'),
+            # Nav2's waypoint_follower hardcodes /fromLL as an absolute path.
+            # Remap so the service is also available at the root namespace.
+            ('fromLL', '/fromLL'),
         ],
     )
 
@@ -84,8 +87,8 @@ def create_localization_nodes(context, *args, **kwargs):
             ('imu/data', f'/{prefix}/bno055/imu'),
             ('odometry/filtered', 'odometry/global'),
             # Use the supervisor's map-frame relay instead of navsat's odom-frame
-            # output. This breaks a feedback loop where the EKF uses its own
-            # map→odom TF to transform measurements, causing linear divergence.
+            # output. This prevents a self-referential TF feedback loop that
+            # causes linear divergence on Jazzy (see followup article section 9).
             ('odometry/gps', 'odometry/gps_map'),
         ],
     )

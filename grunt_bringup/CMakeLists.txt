@@ -21,6 +21,7 @@ install(DIRECTORY
 
 install(PROGRAMS
   scripts/localization_supervisor
+  scripts/joy_estop
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -34,6 +34,7 @@ def create_p2os_node(context, *args, **kwargs):
     max_yawaccel = float(LaunchConfiguration('max_yawaccel').perform(context))
     max_yawdecel = float(LaunchConfiguration('max_yawdecel').perform(context))
     p2os_baud_rate = int(LaunchConfiguration('p2os_baud_rate').perform(context))
+    cmd_vel_timeout = float(LaunchConfiguration('cmd_vel_timeout').perform(context))
 
     # When localization is active: suppress p2os TF, don't remap pose to odom
     # When not active: p2os broadcasts TF and pose is remapped to odom (legacy behavior)
@@ -57,6 +58,7 @@ def create_p2os_node(context, *args, **kwargs):
                 'max_yawaccel': max_yawaccel,
                 'max_yawdecel': max_yawdecel,
                 'baud_rate': p2os_baud_rate,
+                'cmd_vel_timeout': cmd_vel_timeout,
             }],
             remappings=remappings
         )
@@ -170,6 +172,7 @@ def generate_launch_description():
         DeclareLaunchArgument('max_yawaccel', default_value='0.0', description='Rotational acceleration (rad/s²). 0.0 = firmware default (~1.75 rad/s²). Ceiling: 5.24 rad/s²'),
         DeclareLaunchArgument('max_yawdecel', default_value='0.0', description='Rotational deceleration (rad/s²). 0.0 = firmware default (~1.75 rad/s²). Ceiling: 5.24 rad/s²'),
         DeclareLaunchArgument('p2os_baud_rate', default_value='0', description='Serial baud rate (9600/19200/38400/57600/115200). 0 = use robot model default'),
+        DeclareLaunchArgument('cmd_vel_timeout', default_value='0.2', description='Driver-level cmd_vel silence watchdog (s). Zeroes wheels if no cmd_vel arrives within this interval. 0.0 disables.'),
         # Teleop velocity limits (what joystick sends before driver clamp)
         DeclareLaunchArgument('max_vx', default_value='0.6', description='Teleop max linear velocity (m/s)'),
         DeclareLaunchArgument('max_vx_turbo', default_value='0.6', description='Teleop max linear velocity with turbo button (m/s)'),
@@ -311,14 +314,16 @@ def generate_launch_description():
                     'prefix': LaunchConfiguration('prefix'),
                 }.items()
             ),
-            # Joystick e-stop: toggle button locks all velocity via twist_mux
-            # and cancels any active Nav2 mission
+            # Joystick commands: e-stop, macro execution, future utilities
             Node(
                 package='grunt_bringup',
                 executable='joy_estop',
-                name='joy_estop',
-                parameters=[{'estop_button': 1}],  # B button (red, GameSir Nova Lite)
-                # Crawl moved from B to dpad, so B is now free for e-stop.
+                name='joy_commands',
+                parameters=[{
+                    'estop_button': 1,    # B (red) — e-stop toggle
+                    'deadman_button': 6,  # left bumper — e-stop acknowledge/release
+                    'macro_button': 12,   # Home — execute stored macro
+                }],
                 output='screen',
             ),
         ],

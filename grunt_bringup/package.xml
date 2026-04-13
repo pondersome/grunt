@@ -20,6 +20,8 @@
   <exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>geographic_msgs</exec_depend>
   <exec_depend>ublox_msgs</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_waypoint_follower</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
