@@ -62,9 +62,9 @@ def create_localization_nodes(context, *args, **kwargs):
             ('odometry/filtered', 'odometry/local'),
             ('odometry/gps', 'odometry/gps'),
             ('gps/filtered', 'gps/filtered'),
-            # Nav2's waypoint_follower hardcodes /fromLL as an absolute path.
-            # Remap so the service is also available at the root namespace.
-            ('fromLL', '/fromLL'),
+            # fromLL stays at its natural namespaced path (/<prefix>/fromLL).
+            # Nav2's waypoint_follower remaps its hardcoded absolute /fromLL
+            # to this namespaced path — see nav2.launch.py.
         ],
     )
 

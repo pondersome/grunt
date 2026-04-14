@@ -323,6 +323,7 @@ def generate_launch_description():
                     'estop_button': 1,    # B (red) — e-stop toggle
                     'deadman_button': 6,  # left bumper — e-stop acknowledge/release
                     'macro_button': 12,   # Home — execute stored macro
+                    'prefix': LaunchConfiguration('prefix'),
                 }],
                 output='screen',
             ),

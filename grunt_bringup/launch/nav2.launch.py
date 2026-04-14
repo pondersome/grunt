@@ -16,7 +16,7 @@ from launch.actions import DeclareLaunchArgument, GroupAction, SetEnvironmentVar
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, SetParameter, PushRosNamespace
 from launch_ros.descriptions import ParameterFile
-from nav2_common.launch import RewrittenYaml
+from nav2_common.launch import RewrittenYaml, ReplaceString
 
 
 def generate_launch_description():
@@ -42,17 +42,25 @@ def generate_launch_description():
     # Use absolute paths for TF and cmd_vel so the /nav sub-namespace
     # doesn't redirect them away from the main robot topics
     remappings = [('/tf', '/tf'), ('/tf_static', '/tf_static')]
-    # cmd_vel remappings need absolute path to reach twist_mux at /grunt1/cmd_vel_nav
-    cmd_vel_remappings = remappings + [('cmd_vel', '/grunt1/cmd_vel_nav')]
+    # cmd_vel remappings need absolute path to reach twist_mux at /<prefix>/cmd_vel_nav
+    cmd_vel_remappings = remappings + [('cmd_vel', ['/', prefix, '/cmd_vel_nav'])]
     # Nodes that don't publish cmd_vel just get TF remappings
     base_remappings = remappings
 
-    # Rewrite params with full namespace (prefix + /nav) so node params
-    # resolve correctly for nodes under grunt1/nav/
+    # Two-stage param preparation:
+    #   1. ReplaceString substitutes the `grunt1` placeholder in the yaml
+    #      with the actual prefix (so frame IDs and topic paths are
+    #      correct for multi-robot networks).
+    #   2. RewrittenYaml wraps the result to inject `autostart: true`
+    #      and scope params under the full namespace (prefix/nav).
+    prefixed_params = ReplaceString(
+        source_file=params_file,
+        replacements={'grunt1': prefix},
+    )
     nav_namespace = [prefix, '/nav']
     configured_params = ParameterFile(
         RewrittenYaml(
-            source_file=params_file,
+            source_file=prefixed_params,
             root_key=nav_namespace,
             param_rewrites={'autostart': 'true'},
             convert_types=True,
@@ -76,7 +84,7 @@ def generate_launch_description():
                         output='screen',
                         parameters=[configured_params],
                         remappings=cmd_vel_remappings + [
-                            ('odom', '/grunt1/odometry/local'),
+                            ('odom', ['/', prefix, '/odometry/local']),
                         ],
                     ),
                     Node(
@@ -126,9 +134,14 @@ def generate_launch_description():
                         output='screen',
                         parameters=[configured_params],
                         remappings=base_remappings + [
-                            # fromLL is provided by navsat_transform under /grunt1,
-                            # not /grunt1/nav — remap to the correct path
-                            ('fromLL', '/grunt1/fromLL'),
+                            # Workaround for Nav2 bug: waypoint_follower.cpp:98
+                            # hardcodes the service name "/fromLL" with a leading
+                            # slash, which bypasses the node namespace and makes
+                            # it un-namespaceable in a normal way. We remap the
+                            # absolute path to our per-robot namespaced service.
+                            # Remove this once the upstream fix lands — track
+                            # via the ros-navigation/navigation2 issue.
+                            ('/fromLL', ['/', prefix, '/fromLL']),
                         ],
                     ),
                     # velocity_smoother excluded for Phase 1 — simplifies

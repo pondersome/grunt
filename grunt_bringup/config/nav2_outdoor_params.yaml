@@ -6,8 +6,13 @@
 # Phase 1: No obstacle detection — open-space navigation only.
 # Phase 2 (future): Add voxel_layer on local costmap for 3D LiDAR.
 #
-# Frame convention: all frame IDs use the grunt1/ namespace prefix.
-# The prefix is applied by the launch file, not hardcoded here.
+# Namespace templating: the literal `grunt1` in this file is a
+# placeholder. nav2.launch.py uses nav2_common.launch.ReplaceString to
+# substitute it with the actual `prefix` launch argument at runtime.
+# This lets the same config work for grunt1, grunt2, etc. without
+# editing the file. If you add new frame IDs or topic paths that
+# include the robot namespace, write them with `grunt1` and the
+# launch-time substitution will handle the rest.
 
 bt_navigator:
   ros__parameters:
