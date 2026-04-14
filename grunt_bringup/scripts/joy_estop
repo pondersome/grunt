@@ -17,10 +17,9 @@ import shlex
 
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionClient
 from sensor_msgs.msg import Joy
 from std_msgs.msg import Bool, String
-from nav2_msgs.action import FollowGPSWaypoints, FollowWaypoints
+from std_srvs.srv import Trigger
 
 
 class JoyCommands(Node):
@@ -58,9 +57,12 @@ class JoyCommands(Node):
         self.create_subscription(Joy, 'joy', self._joy_cb, 10)
         self.create_subscription(String, '~/set_macro', self._set_macro_cb, 10)
 
-        # Nav2 action clients for cancellation
-        self.gps_wp_client = ActionClient(self, FollowGPSWaypoints, 'nav/follow_gps_waypoints')
-        self.wp_client = ActionClient(self, FollowWaypoints, 'nav/follow_waypoints')
+        # Behaviors-layer resume service — the deadman-acknowledge release
+        # path calls this so the BT re-arms and returns to whatever branch
+        # was interrupted (or Idle if nothing). If the behaviors stack
+        # isn't running, the call will fail silently — that's fine: the
+        # twist_mux unlock still frees the wheels.
+        self.resume_client = self.create_client(Trigger, 'bt_runner/resume')
 
         self.get_logger().info(
             f'Joy commands ready (estop=button {self.estop_button}, '
@@ -114,7 +116,10 @@ class JoyCommands(Node):
         self.estop_pub.publish(lock_msg)
 
         self.get_logger().warn('E-STOP ACTIVATED — all velocity locked')
-        self._cancel_nav2_missions()
+        # Mission lifecycle is owned by the BT layer (grunt_behaviors).
+        # When the BT's HunkerDown branch engages, the mission branch is
+        # halted; on resume it re-enters from blackboard state. No
+        # imperative action-cancel needed from here.
 
     def _release_estop(self, source: str):
         self.estop_active = False
@@ -125,6 +130,29 @@ class JoyCommands(Node):
         self.estop_pub.publish(lock_msg)
 
         self.get_logger().info(f'E-stop released via {source} — velocity unlocked')
+
+        # Also kick the behaviors layer to re-arm so any interrupted
+        # branch (e.g., mission execution) can resume. Non-blocking:
+        # we don't wait for the response. If the behaviors stack isn't
+        # running, the call will be queued with no server to pick it
+        # up — eventually the client gives up, which is fine since
+        # velocity control is already unlocked at this point.
+        if self.resume_client.service_is_ready():
+            future = self.resume_client.call_async(Trigger.Request())
+            future.add_done_callback(self._on_resume_response)
+        else:
+            self.get_logger().debug(
+                'bt_runner/resume service not available — skipping BT re-arm')
+
+    def _on_resume_response(self, future):
+        try:
+            response = future.result()
+            if response.success:
+                self.get_logger().info(f'BT re-armed: {response.message}')
+            else:
+                self.get_logger().warn(f'BT resume refused: {response.message}')
+        except Exception as e:
+            self.get_logger().warn(f'BT resume call failed: {e}')
 
     def _set_macro_cb(self, msg: String):
         """Store a new macro command string."""
@@ -147,21 +175,6 @@ class JoyCommands(Node):
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             self.get_logger().error(f'Macro execution failed: {e}')
-
-    def _cancel_nav2_missions(self):
-        """Cancel all active Nav2 goals."""
-        try:
-            if self.gps_wp_client.server_is_ready():
-                self.gps_wp_client._cancel_all_goals_async()
-                self.get_logger().info('Cancelled GPS waypoint missions')
-        except Exception as e:
-            self.get_logger().warn(f'GPS waypoint cancel failed: {e}')
-        try:
-            if self.wp_client.server_is_ready():
-                self.wp_client._cancel_all_goals_async()
-                self.get_logger().info('Cancelled waypoint missions')
-        except Exception as e:
-            self.get_logger().warn(f'Waypoint cancel failed: {e}')
 
 
 def main(args=None):
