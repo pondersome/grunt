@@ -40,13 +40,17 @@ class JoyCommands(Node):
         self.deadman_prev = False
         self.deadman_released_since_estop = False
         self.macro_button_prev = False
-        # Default macro is parameterized by the robot prefix so the same
-        # code works for grunt1, grunt2, etc. without edits.
+        # Default macro publishes a mission name to the behaviors layer,
+        # which loads the YAML from grunt_missions/ and dispatches the
+        # Nav2 goal. Previously this shelled out to ros2 action
+        # send_goal with hardcoded coordinates; now missions are named
+        # data, not code. Parameterized by prefix so it works across
+        # multiple robots without edits.
+        self.declare_parameter('default_mission', 'example_mission')
+        default_mission = self.get_parameter('default_mission').value
         self.macro_cmd = (
-            f'ros2 action send_goal /{prefix}/nav/follow_gps_waypoints '
-            'nav2_msgs/action/FollowGPSWaypoints '
-            '"{gps_poses: [{position: {latitude: 32.678093, longitude: -96.922497, '
-            'altitude: 187.5}, orientation: {w: 1.0}}]}"'
+            f'ros2 topic pub --once /{prefix}/bt_runner/start_mission '
+            f'std_msgs/msg/String "{{data: {default_mission}}}"'
         )
         self.macro_process = None
 
