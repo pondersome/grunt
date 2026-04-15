@@ -22,6 +22,8 @@ install(DIRECTORY
 install(PROGRAMS
   scripts/localization_supervisor
   scripts/joy_estop
+  scripts/waypoint_recorder
+  scripts/play_latest_mission
   DESTINATION lib/${PROJECT_NAME}
 )
 

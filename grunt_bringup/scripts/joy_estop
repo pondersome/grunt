@@ -40,18 +40,25 @@ class JoyCommands(Node):
         self.deadman_prev = False
         self.deadman_released_since_estop = False
         self.macro_button_prev = False
-        # Default macro publishes a mission name to the behaviors layer,
-        # which loads the YAML from grunt_missions/ and dispatches the
-        # Nav2 goal. Previously this shelled out to ros2 action
-        # send_goal with hardcoded coordinates; now missions are named
-        # data, not code. Parameterized by prefix so it works across
-        # multiple robots without edits.
+        # Macro command. Two ways to configure:
+        #   1. macro_cmd parameter: explicit shell command. Wins if set.
+        #      Used by launch to wire play_latest_mission for the
+        #      record-then-play workflow.
+        #   2. default_mission parameter: bare mission name. Builds a
+        #      simple "publish this name to start_mission" command.
+        # Either way, the macro can be overridden at runtime via the
+        # ~/set_macro topic.
+        self.declare_parameter('macro_cmd', '')
         self.declare_parameter('default_mission', 'example_mission')
+        override = self.get_parameter('macro_cmd').value
         default_mission = self.get_parameter('default_mission').value
-        self.macro_cmd = (
-            f'ros2 topic pub --once /{prefix}/bt_runner/start_mission '
-            f'std_msgs/msg/String "{{data: {default_mission}}}"'
-        )
+        if override:
+            self.macro_cmd = override
+        else:
+            self.macro_cmd = (
+                f'ros2 topic pub --once /{prefix}/bt_runner/start_mission '
+                f'std_msgs/msg/String "{{data: {default_mission}}}"'
+            )
         self.macro_process = None
 
         # Publisher to twist_mux e-stop lock

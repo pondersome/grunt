@@ -3,7 +3,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, GroupAction, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node, PushRosNamespace
 from launch_ros.substitutions import FindPackageShare
 import os
@@ -158,6 +158,9 @@ def generate_launch_description():
         DeclareLaunchArgument('gps_quality_threshold', default_value='4', description='Min GPS quality for heading cal (0=none..5=rtk_fixed)'),
         DeclareLaunchArgument('gps_h_acc_cal_threshold_m', default_value='0.5', description='Max h_acc (m) for heading calibration'),
         DeclareLaunchArgument('Nav2', default_value='0', description='Enable Nav2 GPS waypoint following (requires Localization)'),
+        DeclareLaunchArgument('Behaviors', default_value='0', description='Start grunt_behaviors BT runner + waypoint recorder (requires Nav2 for missions)'),
+        DeclareLaunchArgument('property', default_value='ranchero', description='Active property name. Mission YAMLs are read/written under grunt_missions/properties/<property>/.'),
+        DeclareLaunchArgument('grunt_missions_root', default_value=os.path.expanduser('~/ros2_ws/grunt_missions'), description='Root of the grunt_missions repo'),
         DeclareLaunchArgument('KeyboardTeleop', default_value='0', description='Start keyboard driven teleop'),
         DeclareLaunchArgument('JoystickTeleop', default_value='1', description='Start joystick driven teleop'),
         # P2OS velocity and acceleration limits
@@ -304,6 +307,17 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('Localization'))
     )
 
+    # Active property's mission directory:
+    #   <grunt_missions_root>/properties/<property>/
+    # Both the BT runner (loads missions to dispatch) and the
+    # waypoint_recorder (writes new ones) share this path. Operator's
+    # macro button "play latest" also scans this dir.
+    missions_dir = PathJoinSubstitution([
+        LaunchConfiguration('grunt_missions_root'),
+        'properties',
+        LaunchConfiguration('property'),
+    ])
+
     gp_nav2 = GroupAction(
         actions=[
             IncludeLaunchDescription(
@@ -314,7 +328,9 @@ def generate_launch_description():
                     'prefix': LaunchConfiguration('prefix'),
                 }.items()
             ),
-            # Joystick commands: e-stop, macro execution, future utilities
+            # Joystick commands: e-stop, macro execution, future utilities.
+            # Macro is wired to play_latest_mission so the operator can
+            # record-and-play within a single button workflow.
             Node(
                 package='grunt_bringup',
                 executable='joy_estop',
@@ -324,11 +340,47 @@ def generate_launch_description():
                     'deadman_button': 6,  # left bumper — e-stop acknowledge/release
                     'macro_button': 12,   # Home — execute stored macro
                     'prefix': LaunchConfiguration('prefix'),
+                    'macro_cmd': [
+                        'ros2 run grunt_bringup play_latest_mission ',
+                        missions_dir,
+                        ' /', LaunchConfiguration('prefix'),
+                        '/bt_runner/start_mission',
+                    ],
                 }],
                 output='screen',
             ),
         ],
         condition=IfCondition(LaunchConfiguration('Nav2'))
+    )
+
+    # Behaviors layer: BT runner + waypoint recorder. Gated separately
+    # from Nav2 so the recorder can run without Nav2 (you can record
+    # waypoints with just Localization up). For full play-back you'll
+    # want Nav2:=1 Behaviors:=1 together.
+    gp_behaviors = GroupAction(
+        actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource([
+                    FindPackageShare('grunt_behaviors'), '/launch', '/behaviors.launch.py'
+                ]),
+                launch_arguments={
+                    'prefix': LaunchConfiguration('prefix'),
+                    'missions_dir': missions_dir,
+                }.items(),
+            ),
+            Node(
+                package='grunt_bringup',
+                executable='waypoint_recorder',
+                name='waypoint_recorder',
+                parameters=[{
+                    'missions_dir': missions_dir,
+                    'record_button': 4,  # Y on GameSir Nova Lite
+                    'save_button': 3,    # X on GameSir Nova Lite
+                }],
+                output='screen',
+            ),
+        ],
+        condition=IfCondition(LaunchConfiguration('Behaviors'))
     )
 
     gp_arm_preset = GroupAction(
@@ -368,6 +420,7 @@ def generate_launch_description():
         gp_imu,
         gp_localization,
         gp_nav2,
+        gp_behaviors,
         gp_lidar,
         gp_joy_tele,
         gp_key_tele,

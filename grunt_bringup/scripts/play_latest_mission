@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""
+Helper: find the most recently modified mission YAML in a directory and
+publish its bare name (sans .yaml extension) to start_mission.
+
+Intended to be invoked as a joy_commands macro for the record-then-play
+operator workflow:
+  1. Drive, mark waypoints with Y
+  2. X to save (writes <missions_dir>/<timestamp>.yaml)
+  3. Press the macro button — this script picks that fresh recording
+     and dispatches it via start_mission.
+
+Stupid by design: no schema awareness, no property concept here. The
+caller chose missions_dir; the latest .yaml in it wins. Replace with
+something more functional (UI panel, mission picker) when the
+record-then-play workflow outgrows it.
+"""
+import glob
+import os
+import subprocess
+import sys
+
+
+def main(argv):
+    if len(argv) < 3:
+        print(
+            'Usage: play_latest_mission <missions_dir> <start_mission_topic>',
+            file=sys.stderr)
+        return 1
+
+    missions_dir = argv[1]
+    topic = argv[2]
+
+    pattern = os.path.join(missions_dir, '*.yaml')
+    candidates = glob.glob(pattern)
+    if not candidates:
+        print(f'No missions found in {missions_dir}', file=sys.stderr)
+        return 1
+
+    latest = max(candidates, key=os.path.getmtime)
+    name = os.path.splitext(os.path.basename(latest))[0]
+
+    print(f'Playing latest: {name} ({latest})')
+
+    # Use ros2 cli to publish — keeps this script free of rclpy init
+    # overhead and matches the existing macro pattern.
+    result = subprocess.run([
+        'ros2', 'topic', 'pub', '--once', topic,
+        'std_msgs/msg/String', f'{{data: {name}}}',
+    ])
+    return result.returncode
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
