@@ -7,13 +7,17 @@ E-stop (B/button 1):
   any active Nav2 missions. Engage-only — release is exclusively via
   the deadman button after releasing it first.
 
-Macro (Home/button 12):
-  Executes a stored shell command string. Set via the ~/set_macro topic.
-  Default: send a GPS waypoint goal scoped to the `prefix` parameter.
-  Useful for testing Nav2 from the field without access to a terminal.
+Home button (button 12):
+  Default: finds the most recently modified mission YAML in missions_dir
+  and publishes its name to bt_runner/start_mission via native rclpy
+  publisher (no subprocess, no DDS discovery race).
+  Override: if macro_cmd is set (via parameter or ~/set_macro topic),
+  executes that shell command instead. Useful for field debugging or
+  non-mission automation.
 """
+import glob
+import os
 import subprocess
-import shlex
 
 import rclpy
 from rclpy.node import Node
@@ -40,31 +44,28 @@ class JoyCommands(Node):
         self.deadman_prev = False
         self.deadman_released_since_estop = False
         self.macro_button_prev = False
-        # Macro command. Two ways to configure:
-        #   1. macro_cmd parameter: explicit shell command. Wins if set.
-        #      Used by launch to wire play_latest_mission for the
-        #      record-then-play workflow.
-        #   2. default_mission parameter: bare mission name. Builds a
-        #      simple "publish this name to start_mission" command.
-        # Either way, the macro can be overridden at runtime via the
-        # ~/set_macro topic.
+
+        # Home button behavior:
+        #   Default: find latest mission YAML → publish to start_mission
+        #     (native rclpy publisher, no DDS race).
+        #   Override: if macro_cmd is set, run that shell command instead.
+        #     Settable via parameter or ~/set_macro topic at runtime.
+        self.declare_parameter('missions_dir', '')
         self.declare_parameter('macro_cmd', '')
-        self.declare_parameter('default_mission', 'example_mission')
-        override = self.get_parameter('macro_cmd').value
-        default_mission = self.get_parameter('default_mission').value
-        if override:
-            self.macro_cmd = override
-        else:
-            self.macro_cmd = (
-                f'ros2 topic pub --once /{prefix}/bt_runner/start_mission '
-                f'std_msgs/msg/String "{{data: {default_mission}}}"'
-            )
+        self.missions_dir = self.get_parameter('missions_dir').value
+        self.macro_cmd = self.get_parameter('macro_cmd').value
         self.macro_process = None
 
         # Publisher to twist_mux e-stop lock
         self.estop_pub = self.create_publisher(Bool, 'estop/joystick', 10)
 
-        # Subscribe to joystick and macro topic
+        # Publisher for mission dispatch — same DDS participant as this
+        # node, so bt_runner's subscription is already matched. No
+        # discovery race.
+        self.start_mission_pub = self.create_publisher(
+            String, 'bt_runner/start_mission', 10)
+
+        # Subscribe to joystick and optional macro override
         self.create_subscription(Joy, 'joy', self._joy_cb, 10)
         self.create_subscription(String, '~/set_macro', self._set_macro_cb, 10)
 
@@ -77,8 +78,8 @@ class JoyCommands(Node):
 
         self.get_logger().info(
             f'Joy commands ready (estop=button {self.estop_button}, '
-            f'macro=button {self.macro_button}, deadman=button {self.deadman_button})')
-        self.get_logger().info(f'Default macro: {self.macro_cmd[:80]}...')
+            f'mission=button {self.macro_button}, deadman=button {self.deadman_button}, '
+            f'missions_dir={self.missions_dir or "(not set)"})')
 
     def _joy_cb(self, msg: Joy):
         # Read button states
@@ -108,11 +109,15 @@ class JoyCommands(Node):
                   self.deadman_released_since_estop):
                 self._release_estop('deadman acknowledge')
 
-        # Macro button: rising edge executes stored command
+        # Home button: rising edge. If macro_cmd is set, run that shell
+        # command; otherwise dispatch the latest mission natively.
         macro_pressed = (self.macro_button < len(msg.buttons) and
                          bool(msg.buttons[self.macro_button]))
         if macro_pressed and not self.macro_button_prev:
-            self._execute_macro()
+            if self.macro_cmd:
+                self._execute_macro()
+            else:
+                self._dispatch_latest_mission()
 
         self.estop_button_prev = estop_pressed
         self.deadman_prev = deadman_pressed
@@ -165,17 +170,40 @@ class JoyCommands(Node):
         except Exception as e:
             self.get_logger().warn(f'BT resume call failed: {e}')
 
+    def _dispatch_latest_mission(self):
+        """Find the most recently modified mission YAML in missions_dir
+        and publish its name to bt_runner/start_mission."""
+        if not self.missions_dir:
+            self.get_logger().warn(
+                'missions_dir not configured — cannot dispatch mission')
+            return
+
+        candidates = glob.glob(os.path.join(self.missions_dir, '*.yaml'))
+        if not candidates:
+            self.get_logger().warn(
+                f'No mission files in {self.missions_dir}')
+            return
+
+        latest = max(candidates, key=os.path.getmtime)
+        name = os.path.splitext(os.path.basename(latest))[0]
+
+        msg = String()
+        msg.data = name
+        self.start_mission_pub.publish(msg)
+        self.get_logger().info(f'Dispatched mission: {name}')
+
     def _set_macro_cb(self, msg: String):
-        """Store a new macro command string."""
+        """Override the Home button to run a shell command instead of
+        dispatching the latest mission. Publish empty string to clear
+        the override and return to mission-dispatch behavior."""
         self.macro_cmd = msg.data
-        self.get_logger().info(f'Macro set: {self.macro_cmd[:80]}...')
+        if self.macro_cmd:
+            self.get_logger().info(f'Macro override set: {self.macro_cmd[:80]}...')
+        else:
+            self.get_logger().info('Macro override cleared — Home dispatches latest mission')
 
     def _execute_macro(self):
-        """Execute the stored macro command in a subprocess."""
-        if not self.macro_cmd:
-            self.get_logger().warn('No macro set')
-            return
-        # Don't launch if a previous macro is still running
+        """Execute the macro_cmd shell command in a subprocess."""
         if self.macro_process and self.macro_process.poll() is None:
             self.get_logger().warn('Previous macro still running, ignoring')
             return

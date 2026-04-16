@@ -150,6 +150,22 @@ def generate_launch_description():
                     # collision_monitor excluded for Phase 1 — no sensors,
                     # and disabled scan source causes 72% CPU spin-wait.
                     # Re-add when LiDAR obstacle detection is configured.
+                ]
+            ),
+        ]
+    )
+
+    # Lifecycle manager starts separately, 5s after the other Nav2 nodes,
+    # so bt_navigator has time to finish loading BT plugins before the
+    # manager tries to configure it. Without this delay, the NUC's quad-core
+    # can't finish plugin loading before lifecycle_manager's service call
+    # times out, and the entire Nav2 stack fails to come up.
+    nav2_lifecycle = TimerAction(
+        period=25.0,
+        actions=[
+            GroupAction(
+                actions=[
+                    PushRosNamespace('nav'),
                     Node(
                         package='nav2_lifecycle_manager',
                         executable='lifecycle_manager',
@@ -158,6 +174,7 @@ def generate_launch_description():
                         parameters=[
                             {'autostart': True},
                             {'node_names': lifecycle_nodes},
+                            {'bond_timeout': 10.0},
                         ],
                     ),
                 ]
@@ -177,4 +194,5 @@ def generate_launch_description():
             description='Nav2 parameters file'
         ),
         nav2_nodes,
+        nav2_lifecycle,
     ])

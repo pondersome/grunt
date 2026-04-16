@@ -328,24 +328,20 @@ def generate_launch_description():
                     'prefix': LaunchConfiguration('prefix'),
                 }.items()
             ),
-            # Joystick commands: e-stop, macro execution, future utilities.
-            # Macro is wired to play_latest_mission so the operator can
-            # record-and-play within a single button workflow.
+            # Joystick commands: e-stop, mission dispatch, future utilities.
+            # Home button finds latest mission in missions_dir and
+            # publishes directly to bt_runner/start_mission (native
+            # rclpy publisher, no subprocess DDS race).
             Node(
                 package='grunt_bringup',
                 executable='joy_estop',
                 name='joy_commands',
                 parameters=[{
-                    'estop_button': 1,    # B (red) — e-stop toggle
+                    'estop_button': 1,    # B (red) — e-stop engage
                     'deadman_button': 6,  # left bumper — e-stop acknowledge/release
-                    'macro_button': 12,   # Home — execute stored macro
+                    'macro_button': 12,   # Home — dispatch latest mission
                     'prefix': LaunchConfiguration('prefix'),
-                    'macro_cmd': [
-                        'ros2 run grunt_bringup play_latest_mission ',
-                        missions_dir,
-                        ' /', LaunchConfiguration('prefix'),
-                        '/bt_runner/start_mission',
-                    ],
+                    'missions_dir': missions_dir,
                 }],
                 output='screen',
             ),

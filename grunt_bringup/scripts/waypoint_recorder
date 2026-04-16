@@ -36,6 +36,14 @@ from sensor_msgs.msg import Joy, NavSatFix
 from nav_msgs.msg import Odometry
 import yaml
 
+# NavPVT (u-blox raw) carries the precise h_acc the supervisor uses;
+# NavSatFix.position_covariance is a derived/optional field. Optional
+# import so the recorder can still run on stacks without ublox_msgs.
+try:
+    from ublox_msgs.msg import NavPVT
+except ImportError:
+    NavPVT = None
+
 
 def quaternion_to_yaw(q):
     """ENU yaw from a geometry_msgs/Quaternion."""
@@ -53,12 +61,14 @@ class WaypointRecorder(Node):
         self.declare_parameter('save_button', 3)     # X on GameSir Nova Lite
         self.declare_parameter('fix_topic', 'rtk/fix_gated')
         self.declare_parameter('odom_topic', 'odometry/global')
+        self.declare_parameter('navpvt_topic', 'rtk/navpvt')
 
         self.missions_dir = self.get_parameter('missions_dir').value
         self.record_button = self.get_parameter('record_button').value
         self.save_button = self.get_parameter('save_button').value
         fix_topic = self.get_parameter('fix_topic').value
         odom_topic = self.get_parameter('odom_topic').value
+        navpvt_topic = self.get_parameter('navpvt_topic').value
 
         if not self.missions_dir:
             self.get_logger().fatal(
@@ -78,6 +88,7 @@ class WaypointRecorder(Node):
         self.last_fix = None
         self.last_yaw = None
         self.last_alt = None
+        self.last_h_acc_m = None  # from NavPVT, not NavSatFix
         self.current_name = None
         self.waypoints = []
 
@@ -88,17 +99,29 @@ class WaypointRecorder(Node):
         self.create_subscription(Joy, 'joy', self._joy_cb, 10)
         self.create_subscription(NavSatFix, fix_topic, self._fix_cb, 10)
         self.create_subscription(Odometry, odom_topic, self._odom_cb, 10)
+        if NavPVT is not None:
+            self.create_subscription(NavPVT, navpvt_topic, self._navpvt_cb, 10)
+        else:
+            self.get_logger().warn(
+                'ublox_msgs not available — h_acc will not be recorded.')
 
         self.get_logger().info(
             f'Waypoint recorder ready: missions_dir={self.missions_dir}, '
             f'record=button {self.record_button}, save=button {self.save_button}, '
-            f'fix={fix_topic}, odom={odom_topic}')
+            f'fix={fix_topic}, odom={odom_topic}, '
+            f'navpvt={navpvt_topic if NavPVT else "(unavailable)"}')
 
     def _fix_cb(self, msg: NavSatFix):
         self.last_fix = msg
 
     def _odom_cb(self, msg: Odometry):
         self.last_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
+
+    def _navpvt_cb(self, msg):
+        # h_acc field is in millimeters per the u-blox spec; convert
+        # to meters for the YAML record. Stored independently from the
+        # gated fix because they arrive on separate topics.
+        self.last_h_acc_m = msg.h_acc / 1000.0
 
     def _joy_cb(self, msg: Joy):
         record_pressed = (
@@ -137,17 +160,41 @@ class WaypointRecorder(Node):
             self.waypoints = []
             self.get_logger().info(f'New recording opened: {self.current_name}')
 
+        # Capture the GPS fix message's own timestamp (set by the
+        # ublox driver when the fix was received). More meaningful
+        # than the button-press wall time when looking at recordings
+        # later — tells you the actual GPS measurement time.
+        fix_time = self._stamp_to_iso(self.last_fix.header.stamp)
+
         wp = {
             'lat': float(self.last_fix.latitude),
             'lon': float(self.last_fix.longitude),
             'alt': float(self.last_fix.altitude),
             'yaw': round(float(self.last_yaw), 4),
+            'fix_time': fix_time,
         }
+        # h_acc only present when NavPVT is available and we've seen a
+        # message. Optional in the schema; downstream loaders ignore
+        # unknown keys today (forward-compatible) and may consume this
+        # for trust-weighting later.
+        if self.last_h_acc_m is not None:
+            wp['h_acc'] = round(self.last_h_acc_m, 3)
+
         self.waypoints.append(wp)
+        h_acc_str = f' h_acc={wp["h_acc"]:.3f}m' if 'h_acc' in wp else ''
         self.get_logger().info(
             f'Recorded waypoint #{len(self.waypoints)}: '
             f'lat={wp["lat"]:.6f} lon={wp["lon"]:.6f} '
-            f'alt={wp["alt"]:.1f} yaw={wp["yaw"]:.3f}')
+            f'alt={wp["alt"]:.1f} yaw={wp["yaw"]:.3f}{h_acc_str} '
+            f'@ {fix_time}')
+
+    @staticmethod
+    def _stamp_to_iso(stamp):
+        """builtin_interfaces/Time -> ISO-8601 UTC string."""
+        secs = stamp.sec + stamp.nanosec / 1e9
+        return datetime.datetime.fromtimestamp(
+            secs, datetime.timezone.utc).strftime(
+                '%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
     def _save(self):
         if self.current_name is None or not self.waypoints:

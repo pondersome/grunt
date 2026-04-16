@@ -94,7 +94,14 @@ class LocalizationSupervisor(Node):
         self.declare_parameter('allow_re_datum', True)
         self.declare_parameter('re_datum_cooldown', 30.0)
 
-        self.declare_parameter('gps_h_acc_threshold_m', 20.0)
+        # Default 0.5m matches the cal threshold: assumes RTK is the
+        # normal operating mode. Override at launch (e.g.,
+        # gps_h_acc_threshold_m:=2.0) when running without RTK
+        # corrections so the recorder/relay still see fixes.
+        # TODO: refactor to derive accuracy thresholds from quality
+        # threshold automatically — see project_behaviors_layer.md
+        # backlog ("GPS threshold unification").
+        self.declare_parameter('gps_h_acc_threshold_m', 0.5)
         self.declare_parameter('gps_h_acc_cal_threshold_m', 0.5)  # max h_acc for drive cal start/end
         self.declare_parameter('map_frame', 'map')
 

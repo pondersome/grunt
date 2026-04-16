@@ -79,7 +79,11 @@ controller_server:
     general_goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.5    # 0.5m — appropriate for GPS accuracy
+      xy_goal_tolerance: 0.6    # Must be < lookahead_dist (0.8) to avoid RPP's
+                                # carrot-within-tolerance rotate trap. At 0.6m this
+                                # is ~1.5x our F9P non-RTK h_acc (~0.3-0.4m). See
+                                # project_supervisor_threshold_refactor.md for the
+                                # auto-derivation backlog.
       yaw_goal_tolerance: 0.25  # ~14 degrees
     # Using Regulated Pure Pursuit instead of MPPI for Phase 1.
     # RPP is much lighter on CPU — critical for the quad-core NUC
@@ -88,11 +92,16 @@ controller_server:
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
       desired_linear_vel: 0.3
-      lookahead_dist: 0.6
-      min_lookahead_dist: 0.3
-      max_lookahead_dist: 0.9
+      lookahead_dist: 0.8
+      min_lookahead_dist: 0.7
+      max_lookahead_dist: 1.2
       lookahead_time: 1.5
       rotate_to_heading_angular_vel: 0.6
+      # RPP's "rotate to goal heading" uses the CARROT (lookahead) pose
+      # distance as its "at goal?" check — xy_goal_tolerance MUST be <
+      # lookahead_dist or RPP locks into rotate-only mode. Currently
+      # 0.6 < 0.8. See bag 260415-200304-mission for the diagnosis.
+      use_rotate_to_heading: true
       transform_tolerance: 0.1
       use_velocity_scaled_lookahead_dist: false
       min_approach_linear_velocity: 0.05
@@ -109,6 +118,14 @@ controller_server:
 
 behavior_server:
   ros__parameters:
+    # Frame names — without these explicit, behavior_server defaults to
+    # unprefixed "odom" / "map" / "base_link", which don't exist in our
+    # namespaced TF tree. Manifests as "Current robot pose is not available"
+    # on any spin/backup/drive_on_heading recovery.
+    local_frame: grunt1/odom
+    global_frame: grunt1/map
+    robot_base_frame: grunt1/base_link
+    transform_tolerance: 0.1
     local_costmap_topic: local_costmap/costmap_raw
     global_costmap_topic: global_costmap/costmap_raw
     local_footprint_topic: local_costmap/published_footprint
