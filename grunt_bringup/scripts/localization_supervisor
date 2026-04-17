@@ -336,8 +336,8 @@ class LocalizationSupervisor(Node):
         elif self.calib_msg_count >= 3 and self.mag_cal == 0:
             self.imu_mode = 'imuplus'
             self.get_logger().info(
-                'IMU mode detected: IMUPlus (no magnetometer). '
-                f'Drive {self.heading_cal_distance:.1f}m with good GPS to establish heading.')
+                '\033[32mIMU mode detected: IMUPlus (no magnetometer). '
+                f'Drive {self.heading_cal_distance:.1f}m with good GPS to establish heading.\033[0m')
 
     # ── Heading Evaluation ──
 

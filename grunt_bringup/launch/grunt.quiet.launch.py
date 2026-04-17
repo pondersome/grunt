@@ -84,6 +84,8 @@ def create_bno055_node(context, *args, **kwargs):
             package='bno055',
             executable='bno055',
             name='bno055',
+            respawn=True,
+            respawn_delay=3.0,
             parameters=[config, {'frame_id': imu_frame_id}],
         )
     ]
@@ -154,11 +156,11 @@ def generate_launch_description():
         DeclareLaunchArgument('initial_arm_preset', default_value='bumper', description='Initial arm preset on startup (e.g., bumper, tenhut, lookout@forward)'),
         DeclareLaunchArgument('RTK', default_value='1', description='Enable GNSS RTK'),
         DeclareLaunchArgument('IMU', default_value='1', description='Enable BNO055 IMU'),
-        DeclareLaunchArgument('Localization', default_value='0', description='Enable robot_localization EKF stack (requires IMU and RTK)'),
+        DeclareLaunchArgument('Localization', default_value='1', description='Enable robot_localization EKF stack (requires IMU and RTK)'),
         DeclareLaunchArgument('gps_quality_threshold', default_value='4', description='Min GPS quality for heading cal (0=none..5=rtk_fixed)'),
         DeclareLaunchArgument('gps_h_acc_cal_threshold_m', default_value='0.5', description='Max h_acc (m) for heading calibration'),
-        DeclareLaunchArgument('Nav2', default_value='0', description='Enable Nav2 GPS waypoint following (requires Localization)'),
-        DeclareLaunchArgument('Behaviors', default_value='0', description='Start grunt_behaviors BT runner + waypoint recorder (requires Nav2 for missions)'),
+        DeclareLaunchArgument('Nav2', default_value='1', description='Enable Nav2 GPS waypoint following (requires Localization)'),
+        DeclareLaunchArgument('Behaviors', default_value='1', description='Start grunt_behaviors BT runner + waypoint recorder (requires Nav2 for missions)'),
         DeclareLaunchArgument('property', default_value='ranchero', description='Active property name. Mission YAMLs are read/written under grunt_missions/properties/<property>/.'),
         DeclareLaunchArgument('grunt_missions_root', default_value=os.path.expanduser('~/ros2_ws/grunt_missions'), description='Root of the grunt_missions repo'),
         DeclareLaunchArgument('KeyboardTeleop', default_value='0', description='Start keyboard driven teleop'),
@@ -168,20 +170,20 @@ def generate_launch_description():
         #   transveltop=1.5 m/s, rotveltop=6.28 rad/s (360 deg/s)
         #   transacctop=2.0 m/s² (applies to both accel and decel)
         #   rotacctop=5.24 rad/s² / 300 deg/s² (applies to both accel and decel)
-        DeclareLaunchArgument('max_xspeed', default_value='0.5', description='Max translational velocity (m/s). Firmware ceiling: 1.5 m/s'),
-        DeclareLaunchArgument('max_yawspeed', default_value='1.7453', description='Max rotational velocity (rad/s). Firmware default: ~1.75 rad/s (100 deg/s). Ceiling: 6.28 rad/s (360 deg/s)'),
-        DeclareLaunchArgument('max_xaccel', default_value='0.0', description='Translational acceleration (m/s²). 0.0 = firmware default. Ceiling: 2.0 m/s²'),
-        DeclareLaunchArgument('max_xdecel', default_value='0.0', description='Translational deceleration (m/s²). 0.0 = firmware default. Ceiling: 2.0 m/s²'),
-        DeclareLaunchArgument('max_yawaccel', default_value='0.0', description='Rotational acceleration (rad/s²). 0.0 = firmware default (~1.75 rad/s²). Ceiling: 5.24 rad/s²'),
-        DeclareLaunchArgument('max_yawdecel', default_value='0.0', description='Rotational deceleration (rad/s²). 0.0 = firmware default (~1.75 rad/s²). Ceiling: 5.24 rad/s²'),
-        DeclareLaunchArgument('p2os_baud_rate', default_value='0', description='Serial baud rate (9600/19200/38400/57600/115200). 0 = use robot model default'),
+        DeclareLaunchArgument('max_xspeed', default_value='1.5', description='Max translational velocity (m/s). Firmware ceiling: 1.5 m/s'),
+        DeclareLaunchArgument('max_yawspeed', default_value='5', description='Max rotational velocity (rad/s). Firmware default: ~1.75 rad/s (100 deg/s). Ceiling: 6.28 rad/s (360 deg/s)'),
+        DeclareLaunchArgument('max_xaccel', default_value='1.5', description='Translational acceleration (m/s²). 0.0 = firmware default. Ceiling: 2.0 m/s²'),
+        DeclareLaunchArgument('max_xdecel', default_value='2.0', description='Translational deceleration (m/s²). 0.0 = firmware default. Ceiling: 2.0 m/s²'),
+        DeclareLaunchArgument('max_yawaccel', default_value='5.0', description='Rotational acceleration (rad/s²). 0.0 = firmware default (~1.75 rad/s²). Ceiling: 5.24 rad/s²'),
+        DeclareLaunchArgument('max_yawdecel', default_value='5.0', description='Rotational deceleration (rad/s²). 0.0 = firmware default (~1.75 rad/s²). Ceiling: 5.24 rad/s²'),
+        DeclareLaunchArgument('p2os_baud_rate', default_value='115200', description='Serial baud rate (9600/19200/38400/57600/115200). 0 = use robot model default'),
         DeclareLaunchArgument('cmd_vel_timeout', default_value='0.2', description='Driver-level cmd_vel silence watchdog (s). Zeroes wheels if no cmd_vel arrives within this interval. 0.0 disables.'),
         # Teleop velocity limits (what joystick sends before driver clamp)
-        DeclareLaunchArgument('max_vx', default_value='0.6', description='Teleop max linear velocity (m/s)'),
-        DeclareLaunchArgument('max_vx_turbo', default_value='0.6', description='Teleop max linear velocity with turbo button (m/s)'),
-        DeclareLaunchArgument('max_vw', default_value='0.8', description='Teleop max angular velocity (rad/s)'),
-        DeclareLaunchArgument('max_vw_turbo', default_value='0.8', description='Teleop max angular velocity with turbo button (rad/s)'),
-        DeclareLaunchArgument('teleop_rate', default_value='10', description='Teleop publish loop rate (Hz)'),
+        DeclareLaunchArgument('max_vx', default_value='0.8', description='Teleop max linear velocity (m/s)'),
+        DeclareLaunchArgument('max_vx_turbo', default_value='1.5', description='Teleop max linear velocity with turbo button (m/s)'),
+        DeclareLaunchArgument('max_vw', default_value='1.5', description='Teleop max angular velocity (rad/s)'),
+        DeclareLaunchArgument('max_vw_turbo', default_value='3.14', description='Teleop max angular velocity with turbo button (rad/s)'),
+        DeclareLaunchArgument('teleop_rate', default_value='30', description='Teleop publish loop rate (Hz)'),
     ]
 
     # Define the included launch descriptions with conditions

@@ -61,7 +61,10 @@ def generate_launch_description():
             package='ublox_gps',
             executable='ublox_gps_node',
             output='both',
-            parameters=[ublox_params_default],
+            parameters=[
+                ublox_params_default,
+                {'frame_id': [LaunchConfiguration('prefix'), '/mast/gps_link']},
+            ],
             remappings=[
                 ('ntrip_client/nmea', 'nmea'),
                 ('ntrip_client/rtcm', 'rtcm'),

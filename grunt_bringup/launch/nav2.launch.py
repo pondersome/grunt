@@ -82,6 +82,8 @@ def generate_launch_description():
                         package='nav2_controller',
                         executable='controller_server',
                         output='screen',
+                        respawn=True,
+                        respawn_delay=5.0,
                         parameters=[configured_params],
                         remappings=cmd_vel_remappings + [
                             ('odom', ['/', prefix, '/odometry/local']),
@@ -92,6 +94,8 @@ def generate_launch_description():
                         executable='smoother_server',
                         name='smoother_server',
                         output='screen',
+                        respawn=True,
+                        respawn_delay=5.0,
                         parameters=[configured_params],
                         remappings=base_remappings,
                     ),
@@ -100,6 +104,8 @@ def generate_launch_description():
                         executable='planner_server',
                         name='planner_server',
                         output='screen',
+                        respawn=True,
+                        respawn_delay=5.0,
                         parameters=[configured_params],
                         remappings=base_remappings,
                     ),
@@ -108,6 +114,8 @@ def generate_launch_description():
                         executable='route_server',
                         name='route_server',
                         output='screen',
+                        respawn=True,
+                        respawn_delay=5.0,
                         parameters=[configured_params],
                         remappings=base_remappings,
                     ),
@@ -116,6 +124,8 @@ def generate_launch_description():
                         executable='behavior_server',
                         name='behavior_server',
                         output='screen',
+                        respawn=True,
+                        respawn_delay=5.0,
                         parameters=[configured_params],
                         remappings=cmd_vel_remappings,
                     ),
@@ -124,6 +134,8 @@ def generate_launch_description():
                         executable='bt_navigator',
                         name='bt_navigator',
                         output='screen',
+                        respawn=True,
+                        respawn_delay=5.0,
                         parameters=[configured_params],
                         remappings=base_remappings,
                     ),
@@ -132,15 +144,10 @@ def generate_launch_description():
                         executable='waypoint_follower',
                         name='waypoint_follower',
                         output='screen',
+                        respawn=True,
+                        respawn_delay=5.0,
                         parameters=[configured_params],
                         remappings=base_remappings + [
-                            # Workaround for Nav2 bug: waypoint_follower.cpp:98
-                            # hardcodes the service name "/fromLL" with a leading
-                            # slash, which bypasses the node namespace and makes
-                            # it un-namespaceable in a normal way. We remap the
-                            # absolute path to our per-robot namespaced service.
-                            # Remove this once the upstream fix lands — track
-                            # via the ros-navigation/navigation2 issue.
                             ('/fromLL', ['/', prefix, '/fromLL']),
                         ],
                     ),
@@ -175,6 +182,7 @@ def generate_launch_description():
                             {'autostart': True},
                             {'node_names': lifecycle_nodes},
                             {'bond_timeout': 10.0},
+                            {'bond_respawn_max_duration': 60.0},
                         ],
                     ),
                 ]
