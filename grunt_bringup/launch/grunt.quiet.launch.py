@@ -163,6 +163,7 @@ def generate_launch_description():
         DeclareLaunchArgument('Behaviors', default_value='1', description='Start grunt_behaviors BT runner + waypoint recorder (requires Nav2 for missions)'),
         DeclareLaunchArgument('Wifi', default_value='1', description='Start isr_wifi connected-link telemetry + pose-correlated sampler'),
         DeclareLaunchArgument('wifi_interface', default_value='wlo1', description='Linux wireless interface for the primary operational link'),
+        DeclareLaunchArgument('WifiSwitcher', default_value='true', description='Enable the Phase 1.5 resiliency switcher (one-way fallback via nmcli)'),
         DeclareLaunchArgument('property', default_value='ranchero', description='Active property name. Mission YAMLs are read/written under grunt_missions/properties/<property>/.'),
         DeclareLaunchArgument('grunt_missions_root', default_value=os.path.expanduser('~/ros2_ws/grunt_missions'), description='Root of the grunt_missions repo'),
         DeclareLaunchArgument('KeyboardTeleop', default_value='0', description='Start keyboard driven teleop'),
@@ -420,6 +421,7 @@ def generate_launch_description():
                     'prefix': LaunchConfiguration('prefix'),
                     'interface': LaunchConfiguration('wifi_interface'),
                     'adapter_role': 'primary',
+                    'enable_switcher': LaunchConfiguration('WifiSwitcher'),
                 }.items(),
             )
         ],
