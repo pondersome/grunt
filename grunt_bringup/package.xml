@@ -24,6 +24,7 @@
   <exec_depend>nav2_waypoint_follower</exec_depend>
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>grunt_behaviors</exec_depend>
+  <exec_depend>isr_wifi</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

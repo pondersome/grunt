@@ -161,6 +161,8 @@ def generate_launch_description():
         DeclareLaunchArgument('gps_h_acc_cal_threshold_m', default_value='0.5', description='Max h_acc (m) for heading calibration'),
         DeclareLaunchArgument('Nav2', default_value='1', description='Enable Nav2 GPS waypoint following (requires Localization)'),
         DeclareLaunchArgument('Behaviors', default_value='1', description='Start grunt_behaviors BT runner + waypoint recorder (requires Nav2 for missions)'),
+        DeclareLaunchArgument('Wifi', default_value='1', description='Start isr_wifi connected-link telemetry + pose-correlated sampler'),
+        DeclareLaunchArgument('wifi_interface', default_value='wlo1', description='Linux wireless interface for the primary operational link'),
         DeclareLaunchArgument('property', default_value='ranchero', description='Active property name. Mission YAMLs are read/written under grunt_missions/properties/<property>/.'),
         DeclareLaunchArgument('grunt_missions_root', default_value=os.path.expanduser('~/ros2_ws/grunt_missions'), description='Root of the grunt_missions repo'),
         DeclareLaunchArgument('KeyboardTeleop', default_value='0', description='Start keyboard driven teleop'),
@@ -404,6 +406,26 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('RTK'))
     )
 
+    # ISR Wi-Fi monitoring. The isr_wifi launch itself is hardware-agnostic;
+    # we pass wlo1 (or whatever the robot's primary adapter is) here. The
+    # child launch uses the absolute-path PushRosNamespace idiom so it
+    # lands at /<prefix>/wifi/ cleanly.
+    gp_wifi = GroupAction(
+        actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource([
+                    FindPackageShare('isr_wifi'), '/launch', '/wifi.launch.py'
+                ]),
+                launch_arguments={
+                    'prefix': LaunchConfiguration('prefix'),
+                    'interface': LaunchConfiguration('wifi_interface'),
+                    'adapter_role': 'primary',
+                }.items(),
+            )
+        ],
+        condition=IfCondition(LaunchConfiguration('Wifi'))
+    )
+
 
     # Parent GroupAction that applies a namespace
     parent_group = GroupAction([
@@ -419,6 +441,7 @@ def generate_launch_description():
         gp_localization,
         gp_nav2,
         gp_behaviors,
+        gp_wifi,
         gp_lidar,
         gp_joy_tele,
         gp_key_tele,
