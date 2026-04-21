@@ -1,0 +1,58 @@
+# grunt.service — auto-boot the grunt robot stack
+#
+# Install:
+#   sudo cp /home/karim/ros2_ws/src/grunt/install/autostart/grunt.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable grunt.service     # auto-start on every boot
+#   sudo systemctl start grunt.service      # start right now
+#
+# Watch live output (color + full detail, like attaching to a terminal):
+#   journalctl -fu grunt
+#
+# Stop / restart:
+#   sudo systemctl stop grunt
+#   sudo systemctl restart grunt
+#
+# Shutdown path: ExecStop parks the arm to the bumper preset and
+# publishes zero cmd_vel briefly. systemd then SIGTERMs the whole
+# cgroup (KillMode=control-group) — including p2os_driver, whose
+# rclcpp signal handler runs Shutdown() (SONAR-off → STOP → CLOSE)
+# before the process exits. TimeoutStopSec is sized for Nav2
+# lifecycle deactivation + the driver's serial writes to complete.
+
+[Unit]
+Description=Grunt robot autonomy stack (ROS 2 Jazzy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=karim
+Group=karim
+Environment=GRUNT_PREFIX=grunt1
+Environment=HOME=/home/karim
+WorkingDirectory=/home/karim/ros2_ws
+
+# exec replaces the bash shell so systemd tracks the ros2 launch PID
+# directly. sourcing is inline because systemd's Environment= doesn't
+# run shell expansions.
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/karim/ros2_ws/install/setup.bash && exec ros2 launch grunt_bringup grunt.quiet.launch.py prefix:=${GRUNT_PREFIX} use_sonar:=True'
+
+ExecStop=/home/karim/ros2_ws/src/grunt/install/autostart/grunt_park_and_stop.sh ${GRUNT_PREFIX}
+
+# 25s covers: ExecStop (~5s) + Nav2 lifecycle shutdown (5-10s) +
+# p2os Shutdown() serial writes (~1s). Short enough that a wedged
+# stop doesn't delay reboot indefinitely.
+TimeoutStopSec=25
+
+# Restart on crash; `systemctl stop` stays stopped.
+Restart=on-failure
+RestartSec=10
+
+# Cgroup-wide SIGTERM is the critical bit — every node's own rclcpp
+# signal handler runs, not just the launch tool's.
+KillMode=control-group
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
