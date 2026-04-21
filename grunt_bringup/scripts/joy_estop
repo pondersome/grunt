@@ -33,10 +33,12 @@ class JoyCommands(Node):
         self.declare_parameter('estop_button', 1)    # B button (red)
         self.declare_parameter('deadman_button', 6)   # left bumper
         self.declare_parameter('macro_button', 12)    # Home button
+        self.declare_parameter('reset_cal_button', 11)  # Menu (small) — reset localization calibration
         self.declare_parameter('prefix', 'grunt1')   # robot namespace prefix
         self.estop_button = self.get_parameter('estop_button').value
         self.deadman_button = self.get_parameter('deadman_button').value
         self.macro_button = self.get_parameter('macro_button').value
+        self.reset_cal_button = self.get_parameter('reset_cal_button').value
         prefix = self.get_parameter('prefix').value
 
         self.estop_active = False
@@ -44,6 +46,7 @@ class JoyCommands(Node):
         self.deadman_prev = False
         self.deadman_released_since_estop = False
         self.macro_button_prev = False
+        self.reset_cal_button_prev = False
 
         # Home button behavior:
         #   Default: find latest mission YAML → publish to start_mission
@@ -76,9 +79,16 @@ class JoyCommands(Node):
         # twist_mux unlock still frees the wheels.
         self.resume_client = self.create_client(Trigger, 'bt_runner/resume')
 
+        # Calibration reset — clears the localization supervisor's
+        # heading/datum state so it restarts the init sequence. Triggered
+        # by the Menu (small) button so an accidental press is unlikely.
+        self.reset_cal_client = self.create_client(
+            Trigger, 'localization_supervisor/reset_calibration')
+
         self.get_logger().info(
             f'Joy commands ready (estop=button {self.estop_button}, '
             f'mission=button {self.macro_button}, deadman=button {self.deadman_button}, '
+            f'reset_cal=button {self.reset_cal_button}, '
             f'missions_dir={self.missions_dir or "(not set)"})')
 
     def _joy_cb(self, msg: Joy):
@@ -119,9 +129,16 @@ class JoyCommands(Node):
             else:
                 self._dispatch_latest_mission()
 
+        # Menu (small) button: rising edge → request calibration reset.
+        reset_cal_pressed = (self.reset_cal_button < len(msg.buttons) and
+                             bool(msg.buttons[self.reset_cal_button]))
+        if reset_cal_pressed and not self.reset_cal_button_prev:
+            self._request_reset_calibration()
+
         self.estop_button_prev = estop_pressed
         self.deadman_prev = deadman_pressed
         self.macro_button_prev = macro_pressed
+        self.reset_cal_button_prev = reset_cal_pressed
 
     def _activate_estop(self):
         self.estop_active = True
@@ -191,6 +208,25 @@ class JoyCommands(Node):
         msg.data = name
         self.start_mission_pub.publish(msg)
         self.get_logger().info(f'Dispatched mission: {name}')
+
+    def _request_reset_calibration(self):
+        if not self.reset_cal_client.service_is_ready():
+            self.get_logger().warn(
+                'localization_supervisor/reset_calibration not available — ignoring')
+            return
+        self.get_logger().info('Calibration reset requested (Menu button)')
+        future = self.reset_cal_client.call_async(Trigger.Request())
+        future.add_done_callback(self._on_reset_cal_response)
+
+    def _on_reset_cal_response(self, future):
+        try:
+            response = future.result()
+            if response.success:
+                self.get_logger().info(f'Calibration reset: {response.message}')
+            else:
+                self.get_logger().warn(f'Calibration reset refused: {response.message}')
+        except Exception as e:
+            self.get_logger().warn(f'Calibration reset call failed: {e}')
 
     def _set_macro_cb(self, msg: String):
         """Override the Home button to run a shell command instead of

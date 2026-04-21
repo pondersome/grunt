@@ -59,6 +59,12 @@ def create_p2os_node(context, *args, **kwargs):
                 'max_yawdecel': max_yawdecel,
                 'baud_rate': p2os_baud_rate,
                 'cmd_vel_timeout': cmd_vel_timeout,
+                # Lift sonar frames to top-plate height. URDF
+                # pioneer3at_body.xacro places front_sonar at z=0.25 and
+                # back_sonar at z=0.247 above base_link; 0.25 is close
+                # enough for virtual-bumper use without per-sensor
+                # Z entries in the robot_params table.
+                'sonar_z_offset_m': 0.25,
             }],
             remappings=remappings
         )
@@ -345,6 +351,7 @@ def generate_launch_description():
                     'estop_button': 1,    # B (red) — e-stop engage
                     'deadman_button': 6,  # left bumper — e-stop acknowledge/release
                     'macro_button': 12,   # Home — dispatch latest mission
+                    'reset_cal_button': 11,  # Menu (small) — localization calibration reset
                     'prefix': LaunchConfiguration('prefix'),
                     'missions_dir': missions_dir,
                 }],
