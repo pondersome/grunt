@@ -337,10 +337,14 @@ def generate_launch_description():
         actions=[
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource([
-                    FindPackageShare('grunt_bringup'), '/launch', '/nav2.launch.py'
+                    FindPackageShare('grunt_nav'), '/launch', '/nav.launch.py'
                 ]),
                 launch_arguments={
                     'prefix': LaunchConfiguration('prefix'),
+                    # Outdoor is the only mode implemented in Phase A.
+                    # Phase B adds indoor; Phase C adds runtime
+                    # switching based on env state.
+                    'nav_mode': 'outdoor',
                 }.items()
             ),
             # Joystick commands: e-stop, mission dispatch, future utilities.

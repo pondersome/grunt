@@ -1,12 +1,20 @@
 """
-Nav2 outdoor GPS waypoint following launch file for Grunt.
+Nav2 OUTDOOR-mode launch for grunt — GPS waypoint following, open
+ground, RPP controller with cost-regulated approach, collision_monitor
+safety, large global costmap.
+
+One of two per-mode launch files in grunt_nav (the other is
+nav_indoor.launch.py). Dispatched by nav.launch.py based on the
+`nav_mode` argument. Both modes share the same Nav2 node set; they
+differ in params (nav2_outdoor.yaml vs nav2_indoor.yaml) and BT XML.
 
 Customized from nav2_bringup's navigation_launch.py:
 - Removed docking_server (not used)
 - Removed composition mode (unnecessary on NUC)
 - Added /nav sub-namespace for grouping (like /rtk for GPS nodes)
 - Delayed startup to let base robot stack stabilize
-- cmd_vel remapped to cmd_vel_nav (twist_mux priority 50 < joystick 100)
+- Controller publishes to cmd_vel_nav_raw; collision_monitor gates
+  into cmd_vel_nav (twist_mux priority 50 < joystick 100)
 """
 import os
 
@@ -20,7 +28,7 @@ from nav2_common.launch import RewrittenYaml, ReplaceString
 
 
 def generate_launch_description():
-    grunt_bringup_dir = get_package_share_directory('grunt_bringup')
+    grunt_nav_dir = get_package_share_directory('grunt_nav')
 
     prefix = LaunchConfiguration('prefix')
     params_file = LaunchConfiguration('nav2_params_file')
@@ -41,23 +49,24 @@ def generate_launch_description():
     # Use absolute paths for TF and cmd_vel so the /nav sub-namespace
     # doesn't redirect them away from the main robot topics
     remappings = [('/tf', '/tf'), ('/tf_static', '/tf_static')]
-    # cmd_vel chain with collision_monitor inline:
+    # cmd_vel chain with collision_monitor inline — BOTH controller
+    # and behavior_server route through it:
     #   controller_server  →  /grunt1/cmd_vel_nav_raw
+    #   behavior_server    →  /grunt1/cmd_vel_nav_raw
     #   collision_monitor  (subscribes raw, gates via polygons, publishes:)
     #                      →  /grunt1/cmd_vel_nav
     #   twist_mux          (priority 50)
-    # behavior_server still publishes to cmd_vel_nav directly — its
-    # recovery motions (spin, backup, drive_on_heading) are collision-aware
-    # on their own and shouldn't be gated by a bumper polygon that might
-    # block exactly the recovery that's trying to clear a situation.
+    # Rationale: a "deadlocked" recovery (robot can't complete a spin
+    # or backup because persisted cloud points still trigger the stop
+    # polygon) is no worse than a no-op wait — operator intervenes in
+    # both cases. But letting the non-deadlock cases self-recover
+    # strictly dominates the wait-only alternative.
     controller_cmd_vel_remappings = remappings + [
         ('cmd_vel', ['/', prefix, '/cmd_vel_nav_raw']),
     ]
-    behavior_cmd_vel_remappings = remappings + [
-        ('cmd_vel', ['/', prefix, '/cmd_vel_nav']),
-    ]
+    behavior_cmd_vel_remappings = controller_cmd_vel_remappings
     # Legacy alias — kept for any node that doesn't distinguish.
-    cmd_vel_remappings = behavior_cmd_vel_remappings
+    cmd_vel_remappings = controller_cmd_vel_remappings
     # Nodes that don't publish cmd_vel just get TF remappings
     base_remappings = remappings
 
@@ -227,7 +236,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'nav2_params_file',
-            default_value=os.path.join(grunt_bringup_dir, 'config', 'nav2_outdoor_params.yaml'),
+            default_value=os.path.join(grunt_nav_dir, 'config', 'nav2_outdoor.yaml'),
             description='Nav2 parameters file'
         ),
         nav2_nodes,

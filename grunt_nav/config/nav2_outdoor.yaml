@@ -4,10 +4,13 @@
 # Customized for Pioneer 3-AT skid-steer with RTK GPS localization.
 #
 # Phase 1: Open-space GPS waypoint following (done).
-# Phase 2: Sonar reactive safety via collision_monitor subscribing to
-#          /grunt1/sonar/cloud (done 2026-04-22). Costmap-side sonar
-#          integration (RangeSensorLayer) deferred — see memory/
-#          project_sonar_costmap_investigation.md for why.
+# Phase 2: Sonar-driven obstacle awareness (done 2026-04-22):
+#            - collision_monitor with /grunt1/sonar/cloud feeds reactive
+#              cmd_vel gating (FootprintStop + FootprintApproach polygons)
+#            - ObstacleLayer on local_costmap with the same cloud for
+#              costmap-side marks and cost-regulated RPP slowdown
+#          RangeSensorLayer (per-Range-topic pathway) was tried and
+#          abandoned — see memory/project_sonar_costmap_investigation.md.
 # Phase 3 (future): Add voxel_layer on local costmap for 3D LiDAR.
 #
 # Namespace templating: the literal `grunt1` in this file is a
@@ -217,10 +220,17 @@ collision_monitor:
     FootprintStop:
       type: "polygon"
       action_type: "stop"
-      # Inflate the robot footprint by ~15cm so we stop before the
-      # chassis actually touches anything, matching the sonar min_range
-      # below which sensors can't confirm an obstacle is still there.
-      points: "[[0.40, 0.32], [0.40, -0.32], [-0.32, -0.32], [-0.32, 0.32]]"
+      # Forward edge at 0.55m — pushes the stop trigger out past the
+      # deceleration envelope. At 0.3 m/s commanded, RPP's regulated
+      # approach brings us to ~0.15 m/s near the polygon edge; allowing
+      # ~0.15m of stopping distance from that speed means forward hit
+      # detected at 0.55m, robot comes to rest at ~0.40m. That's where
+      # sensor 4's min_range (0.15m) starts being a problem in base_link
+      # frame (0.24 + 0.15 = 0.39m) — so stopping at ~0.40m keeps the
+      # obstacle *just* inside sensor reach where persistence can
+      # continue to refresh if it does show up again.
+      # Side/rear edges inflate chassis by ~7cm for clearance margin.
+      points: "[[0.55, 0.32], [0.55, -0.32], [-0.32, -0.32], [-0.32, 0.32]]"
       min_points: 1
       visualize: true
       enabled: true
@@ -251,13 +261,15 @@ collision_monitor:
       topic: "/grunt1/sonar/cloud"
       min_height: -0.1   # sonars mount at z=0.25m; filter any floor bounces
       max_height: 1.0
-      # Persist cloud points in the odom frame for 3s after arrival.
-      # Pioneer sonars have a 0.15m minimum range — as the robot closes
-      # on an obstacle, the last pre-deadzone echo is at ~0.2m, and the
-      # point vanishes from the live cloud before the footprint reaches
-      # it. Without persistence, collision_monitor loses its stop
-      # signal during the final 0.15m and the robot accelerates through.
-      # 3s is enough at 0.3 m/s to cover the full dead-zone traverse.
+      # Persistence covers the sensor dead zone (< 0.15m) during
+      # approach — the last pre-deadzone echo gets held long enough
+      # for the footprint polygon to sweep over it while the robot
+      # finishes decelerating. Don't overload this to also do
+      # "keep the robot stopped after contact" — that belongs at
+      # the behavior layer as an explicit escape branch (Phase D /
+      # backlog: grunt_behaviors BT subtree watching
+      # collision_monitor_state), not by tuning persistence up to
+      # outlast progress_checker.
       observation_persistence: 3.0
       enabled: true
 
@@ -285,16 +297,46 @@ local_costmap:
       # overhangs) — the LiDAR / depth path is the real answer there.
       width: 6
       height: 6
-      # sonar_layer is DEFERRED. When RangeSensorLayer was in this
-      # plugins list with the 16 /sonar/range_N topics, the local
-      # costmap's isCurrent() stayed false indefinitely and every goal
-      # hit "Costmap timed out waiting for update" in controller_server.
-      # Root cause not isolated in the 2026-04-21/22 session — see
-      # memory/project_sonar_costmap_investigation.md for what was tried
-      # and next steps. Reactive safety is preserved via collision_monitor
-      # subscribing to /grunt1/sonar/cloud (below) — that doesn't depend
-      # on the costmap layer pipeline.
-      plugins: ["inflation_layer"]
+      # obstacle_layer consumes the sonar PointCloud2 directly (simpler
+      # than RangeSensorLayer's per-topic mess). Critically: it marks
+      # current_=true on each observation, which is what rescues the
+      # costmap from the clear_entirely_local_costmap trap that
+      # otherwise leaves an inflation-only costmap permanently stuck
+      # non-current after a BT recovery runs (bug documented in
+      # memory/project_sonar_costmap_investigation.md).
+      #
+      # RangeSensorLayer (per-sensor Range topics) was tried and
+      # abandoned — see the same memory file.
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: "sonar_cloud"
+        sonar_cloud:
+          topic: /grunt1/sonar/cloud
+          data_type: "PointCloud2"
+          # Our cloud publishes points in base_link frame (not per-sensor
+          # frame). Raytracing is slightly lossy as a result — clears
+          # go from robot-center rather than the actual transducer, but
+          # accuracy is fine for bumper-distance obstacle awareness.
+          sensor_frame: grunt1/base_link
+          marking: true
+          clearing: true
+          obstacle_max_range: 5.0
+          obstacle_min_range: 0.15
+          raytrace_max_range: 5.5
+          raytrace_min_range: 0.15
+          min_obstacle_height: -0.1
+          max_obstacle_height: 1.0
+          expected_update_rate: 10.0
+          inf_is_valid: false
+          # Same purpose as collision_monitor's observation_persistence —
+          # keep marks alive after the obstacle enters the sonar dead
+          # zone (< 0.15m) so the cells stay painted until the robot
+          # moves away. Also means clear_entirely_local_costmap
+          # recoveries won't leave the costmap stuck non-current for
+          # longer than this.
+          observation_persistence: 3.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
