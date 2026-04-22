@@ -65,6 +65,10 @@ def create_p2os_node(context, *args, **kwargs):
                 # enough for virtual-bumper use without per-sensor
                 # Z entries in the robot_params table.
                 'sonar_z_offset_m': 0.25,
+                # Legacy SonarArray topic has no consumers now that
+                # Range + PointCloud2 are live. Skip it to save one
+                # publish per SIP cycle.
+                'sonar_publish_array': False,
             }],
             remappings=remappings
         )

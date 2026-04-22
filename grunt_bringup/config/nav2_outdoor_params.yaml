@@ -3,8 +3,12 @@
 # Based on nav2_gps_waypoint_follower_demo's nav2_no_map_params.yaml
 # Customized for Pioneer 3-AT skid-steer with RTK GPS localization.
 #
-# Phase 1: No obstacle detection — open-space navigation only.
-# Phase 2 (future): Add voxel_layer on local costmap for 3D LiDAR.
+# Phase 1: Open-space GPS waypoint following (done).
+# Phase 2: Sonar reactive safety via collision_monitor subscribing to
+#          /grunt1/sonar/cloud (done 2026-04-22). Costmap-side sonar
+#          integration (RangeSensorLayer) deferred — see memory/
+#          project_sonar_costmap_investigation.md for why.
+# Phase 3 (future): Add voxel_layer on local costmap for 3D LiDAR.
 #
 # Namespace templating: the literal `grunt1` in this file is a
 # placeholder. nav2.launch.py uses nav2_common.launch.ReplaceString to
@@ -22,6 +26,13 @@ bt_navigator:
     bt_loop_duration: 10
     default_server_timeout: 20
     wait_for_service_timeout: 5
+    # 0.1s was too tight: Foxglove 3D panel publishes goals with the
+    # current timestamp, and under CPU pressure the global EKF's
+    # map->odom TF publish can lag ~50-100ms. That caused
+    # "Failed to transform goal pose" on every click even though the
+    # transform WAS available a moment later. 0.5s gives the TF buffer
+    # room to interpolate without masking real tree problems.
+    transform_tolerance: 0.5
     # Use built-in default BT and plugin list
     # Explicit plugin_lib_names omitted to avoid duplicate registration
     # errors with nav2_bringup's own plugin loading on Jazzy
@@ -65,6 +76,11 @@ planner_server:
 controller_server:
   ros__parameters:
     controller_frequency: 10.0  # reduced from 20 for CPU-constrained NUC
+    # Default 0.3s assumes a costmap updating at 5+ Hz. Bumped to 1.0s
+    # so it comfortably covers a 3Hz (333ms) local costmap update
+    # period plus any jitter. Prevents "Costmap timed out waiting for
+    # update" aborts the instant a goal arrives.
+    costmap_update_timeout: 3.0 # todo lower this
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.5
     min_theta_velocity_threshold: 0.001
@@ -109,7 +125,11 @@ controller_server:
       use_collision_detection: false
       max_allowed_time_to_collision_up_to_carrot: 1.0
       use_regulated_linear_velocity_scaling: true
-      use_cost_regulated_linear_velocity_scaling: false
+      # Turned on 2026-04-21 when RangeSensorLayer was added to local
+      # costmap. Makes RPP slow desired_linear_vel as marked costmap
+      # cells approach the lookahead point — works with the existing
+      # regulated_linear_scaling_min_radius / _min_speed thresholds.
+      use_cost_regulated_linear_velocity_scaling: true
       regulated_linear_scaling_min_radius: 0.9
       regulated_linear_scaling_min_speed: 0.25
       allow_reversing: false
@@ -141,8 +161,10 @@ behavior_server:
     wait:
       plugin: "nav2_behaviors::Wait"
 
-# Global costmap: rolling window, no static map, no obstacles (Phase 1)
-# Phase 2 will add obstacle_layer for LiDAR
+# Global costmap: rolling window, no static map, no obstacles.
+# Short-range sonar is deliberately NOT added here — the 400 m global
+# plan shouldn't be swayed by 5 m sonar hits. Phase 3 will add
+# obstacle_layer for 3D LiDAR once that subsystem is wired.
 global_costmap:
   global_costmap:
     ros__parameters:
@@ -156,7 +178,8 @@ global_costmap:
       rolling_window: true
       width: 400
       height: 400
-      # Phase 1: inflation only, no obstacle detection
+      # Global plan stays obstacle-free; sonar obstacles live in the
+      # local costmap only (see phase 2 note at the top of this file).
       plugins: ["inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
@@ -164,8 +187,10 @@ global_costmap:
         inflation_radius: 0.55
       always_send_full_costmap: true
 
-# Collision monitor: passthrough for Phase 1 (no obstacle sensors)
-# Phase 2 will add LiDAR observation sources and stop/slowdown polygons
+# Collision monitor: FootprintApproach polygon fed by the sonar
+# PointCloud2 (added 2026-04-21). Phase 3 will add LiDAR observation
+# sources and potentially more polygons (stop, slowdown) for layered
+# response.
 collision_monitor:
   ros__parameters:
     base_frame_id: grunt1/base_link
@@ -187,19 +212,26 @@ collision_monitor:
       min_points: 6
       visualize: false
       enabled: true
-    observation_sources: ["scan"]
-    scan:
-      source_timeout: 5.0
-      type: "scan"
-      topic: "nonexistent_scan_topic"
-      enabled: false
+    # Sonar PointCloud2 as the observation source. The sonar fan-out
+    # in p2os_driver publishes /grunt1/sonar/cloud at the SIP rate
+    # (~10 Hz) with one point per live echo in base_link frame.
+    # collision_monitor uses this with the FootprintApproach polygon
+    # above to react to near hits faster than the 5 Hz local costmap
+    # updates can — critical for teleop-speed approach to an obstacle.
+    observation_sources: ["sonar_cloud"]
+    sonar_cloud:
+      type: "pointcloud"
+      topic: "/grunt1/sonar/cloud"
+      min_height: -0.1   # sonars mount at z=0.25m; filter any floor bounces
+      max_height: 1.0
+      enabled: true
 
 # Note: docking_server and lifecycle_manager_navigation are configured
 # directly in nav2.launch.py, not here. The launch file controls which
 # nodes are managed (docking_server is excluded).
 
-# Local costmap: rolling window, no obstacles (Phase 1)
-# Phase 2 will add voxel_layer for 3D LiDAR
+# Local costmap: rolling window with sonar-driven obstacle layer
+# (added 2026-04-21). Phase 3 will add voxel_layer for 3D LiDAR alongside.
 local_costmap:
   local_costmap:
     ros__parameters:
@@ -210,9 +242,23 @@ local_costmap:
       robot_radius: 0.25
       resolution: 0.05
       rolling_window: true
-      width: 3
-      height: 3
-      # Phase 1: inflation only, no obstacle detection
+      # 6 m square rolling window. Sonar max range is 5 m, so 6 m gives
+      # full sensor reach with a small margin. Will clip the high end of
+      # what 3D LiDAR and depth camera eventually contribute — revisit
+      # when those are integrated and we know real-world useful ranges.
+      # Sonar doesn't see mast-height cantilevered obstacles (e.g. table
+      # overhangs) — the LiDAR / depth path is the real answer there.
+      width: 6
+      height: 6
+      # sonar_layer is DEFERRED. When RangeSensorLayer was in this
+      # plugins list with the 16 /sonar/range_N topics, the local
+      # costmap's isCurrent() stayed false indefinitely and every goal
+      # hit "Costmap timed out waiting for update" in controller_server.
+      # Root cause not isolated in the 2026-04-21/22 session — see
+      # memory/project_sonar_costmap_investigation.md for what was tried
+      # and next steps. Reactive safety is preserved via collision_monitor
+      # subscribing to /grunt1/sonar/cloud (below) — that doesn't depend
+      # on the costmap layer pipeline.
       plugins: ["inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
