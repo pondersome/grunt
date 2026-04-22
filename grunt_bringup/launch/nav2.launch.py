@@ -33,8 +33,7 @@ def generate_launch_description():
         'route_server',
         'behavior_server',
         # velocity_smoother excluded — Phase 1, simplify the cmd_vel chain.
-        # collision_monitor excluded — Phase 1 has no sensors, and the
-        # disabled scan source causes 72% CPU spin-wait.
+        'collision_monitor',  # sonar PointCloud2 source; routes controller cmd_vel through polygons
         'bt_navigator',
         'waypoint_follower',
     ]
@@ -42,8 +41,23 @@ def generate_launch_description():
     # Use absolute paths for TF and cmd_vel so the /nav sub-namespace
     # doesn't redirect them away from the main robot topics
     remappings = [('/tf', '/tf'), ('/tf_static', '/tf_static')]
-    # cmd_vel remappings need absolute path to reach twist_mux at /<prefix>/cmd_vel_nav
-    cmd_vel_remappings = remappings + [('cmd_vel', ['/', prefix, '/cmd_vel_nav'])]
+    # cmd_vel chain with collision_monitor inline:
+    #   controller_server  →  /grunt1/cmd_vel_nav_raw
+    #   collision_monitor  (subscribes raw, gates via polygons, publishes:)
+    #                      →  /grunt1/cmd_vel_nav
+    #   twist_mux          (priority 50)
+    # behavior_server still publishes to cmd_vel_nav directly — its
+    # recovery motions (spin, backup, drive_on_heading) are collision-aware
+    # on their own and shouldn't be gated by a bumper polygon that might
+    # block exactly the recovery that's trying to clear a situation.
+    controller_cmd_vel_remappings = remappings + [
+        ('cmd_vel', ['/', prefix, '/cmd_vel_nav_raw']),
+    ]
+    behavior_cmd_vel_remappings = remappings + [
+        ('cmd_vel', ['/', prefix, '/cmd_vel_nav']),
+    ]
+    # Legacy alias — kept for any node that doesn't distinguish.
+    cmd_vel_remappings = behavior_cmd_vel_remappings
     # Nodes that don't publish cmd_vel just get TF remappings
     base_remappings = remappings
 
@@ -85,7 +99,7 @@ def generate_launch_description():
                         respawn=True,
                         respawn_delay=5.0,
                         parameters=[configured_params],
-                        remappings=cmd_vel_remappings + [
+                        remappings=controller_cmd_vel_remappings + [
                             ('odom', ['/', prefix, '/odometry/local']),
                         ],
                     ),
@@ -152,11 +166,26 @@ def generate_launch_description():
                         ],
                     ),
                     # velocity_smoother excluded for Phase 1 — simplifies
-                    # the cmd_vel chain. Controller publishes directly to
-                    # twist_mux via /grunt1/cmd_vel_nav.
-                    # collision_monitor excluded for Phase 1 — no sensors,
-                    # and disabled scan source causes 72% CPU spin-wait.
-                    # Re-add when LiDAR obstacle detection is configured.
+                    # the cmd_vel chain. Controller publishes to
+                    # cmd_vel_nav_raw; collision_monitor gates it into
+                    # cmd_vel_nav.
+                    Node(
+                        package='nav2_collision_monitor',
+                        executable='collision_monitor',
+                        name='collision_monitor',
+                        output='screen',
+                        respawn=True,
+                        respawn_delay=5.0,
+                        parameters=[configured_params],
+                        # Absolute topic names — collision_monitor reads
+                        # from controller's raw output, publishes the
+                        # gated result as the canonical cmd_vel_nav that
+                        # twist_mux (and behavior_server) consume.
+                        remappings=remappings + [
+                            ('cmd_vel_in', ['/', prefix, '/cmd_vel_nav_raw']),
+                            ('cmd_vel_out', ['/', prefix, '/cmd_vel_nav']),
+                        ],
+                    ),
                 ]
             ),
         ]

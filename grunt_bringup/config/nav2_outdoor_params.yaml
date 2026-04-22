@@ -195,21 +195,48 @@ collision_monitor:
   ros__parameters:
     base_frame_id: grunt1/base_link
     odom_frame_id: grunt1/odom
-    cmd_vel_in_topic: /grunt1/cmd_vel_nav
-    cmd_vel_out_topic: /grunt1/cmd_vel_nav
+    # Collision_monitor sits between controller_server and twist_mux:
+    #   controller → /grunt1/cmd_vel_nav_raw (input)
+    #   polygons gate → /grunt1/cmd_vel_nav (output, twist_mux consumes)
+    # These topic names are remapped by nav2.launch.py, but listing them
+    # here keeps the YAML self-documenting.
+    cmd_vel_in_topic: cmd_vel_in
+    cmd_vel_out_topic: cmd_vel_out
     state_topic: collision_monitor_state
     transform_tolerance: 0.2
     source_timeout: 1.0
     base_shift_correction: true
     stop_pub_timeout: 2.0
-    polygons: ["FootprintApproach"]
+    polygons: ["FootprintStop", "FootprintApproach"]
+    # Hard-stop zone: if even a single sonar point lands inside an
+    # inflated footprint polygon, cut cmd_vel to zero immediately.
+    # This is the true "virtual bumper" — catches the case where an
+    # obstacle is directly in front and close enough that predictive
+    # scaling (FootprintApproach below) would still let the robot
+    # coast into it before sensors go dead (~0.15m min_range).
+    FootprintStop:
+      type: "polygon"
+      action_type: "stop"
+      # Inflate the robot footprint by ~15cm so we stop before the
+      # chassis actually touches anything, matching the sonar min_range
+      # below which sensors can't confirm an obstacle is still there.
+      points: "[[0.40, 0.32], [0.40, -0.32], [-0.32, -0.32], [-0.32, 0.32]]"
+      min_points: 1
+      visualize: true
+      enabled: true
+    # Predictive slowdown zone: scale cmd_vel down as time-to-collision
+    # shortens, along the projected footprint path. This catches
+    # obstacles that are further out but on-course, giving the robot
+    # a chance to decelerate smoothly before FootprintStop engages.
     FootprintApproach:
       type: "polygon"
       action_type: "approach"
       footprint_topic: local_costmap/published_footprint
-      time_before_collision: 1.2
+      time_before_collision: 2.0
       simulation_time_step: 0.1
-      min_points: 6
+      # Sonar clouds are sparse (max 16 points total, usually 3-5 in
+      # any given polygon projection). 1 point is enough to act on.
+      min_points: 1
       visualize: false
       enabled: true
     # Sonar PointCloud2 as the observation source. The sonar fan-out
@@ -224,6 +251,14 @@ collision_monitor:
       topic: "/grunt1/sonar/cloud"
       min_height: -0.1   # sonars mount at z=0.25m; filter any floor bounces
       max_height: 1.0
+      # Persist cloud points in the odom frame for 3s after arrival.
+      # Pioneer sonars have a 0.15m minimum range — as the robot closes
+      # on an obstacle, the last pre-deadzone echo is at ~0.2m, and the
+      # point vanishes from the live cloud before the footprint reaches
+      # it. Without persistence, collision_monitor loses its stop
+      # signal during the final 0.15m and the robot accelerates through.
+      # 3s is enough at 0.3 m/s to cover the full dead-zone traverse.
+      observation_persistence: 3.0
       enabled: true
 
 # Note: docking_server and lifecycle_manager_navigation are configured
