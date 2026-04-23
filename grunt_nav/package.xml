@@ -28,6 +28,10 @@
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
 
+  <!-- For clear_costmap_timer Python helper. -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+
   <export>
     <build_type>ament_cmake</build_type>
   </export>

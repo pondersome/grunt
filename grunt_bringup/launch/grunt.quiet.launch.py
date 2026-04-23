@@ -170,6 +170,7 @@ def generate_launch_description():
         DeclareLaunchArgument('gps_quality_threshold', default_value='4', description='Min GPS quality for heading cal (0=none..5=rtk_fixed)'),
         DeclareLaunchArgument('gps_h_acc_cal_threshold_m', default_value='0.5', description='Max h_acc (m) for heading calibration'),
         DeclareLaunchArgument('Nav2', default_value='1', description='Enable Nav2 GPS waypoint following (requires Localization)'),
+        DeclareLaunchArgument('nav_mode', default_value='outdoor', description='Nav2 configuration mode: outdoor (GPS/RPP, open ground) or indoor (MPPI, tight spaces, no map frame)'),
         DeclareLaunchArgument('Behaviors', default_value='1', description='Start grunt_behaviors BT runner + waypoint recorder (requires Nav2 for missions)'),
         DeclareLaunchArgument('Wifi', default_value='1', description='Start isr_wifi connected-link telemetry + pose-correlated sampler'),
         DeclareLaunchArgument('wifi_interface', default_value='wlo1', description='Linux wireless interface for the primary operational link'),
@@ -341,10 +342,10 @@ def generate_launch_description():
                 ]),
                 launch_arguments={
                     'prefix': LaunchConfiguration('prefix'),
-                    # Outdoor is the only mode implemented in Phase A.
-                    # Phase B adds indoor; Phase C adds runtime
-                    # switching based on env state.
-                    'nav_mode': 'outdoor',
+                    # Pass the user-selected nav_mode (default outdoor).
+                    # Phase C will replace this static arg with a
+                    # runtime switcher driven by environment state.
+                    'nav_mode': LaunchConfiguration('nav_mode'),
                 }.items()
             ),
             # Joystick commands: e-stop, mission dispatch, future utilities.

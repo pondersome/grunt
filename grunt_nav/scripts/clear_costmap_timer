@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""
+Periodic ClearCostmapAroundRobot caller for grunt's indoor nav.
+
+Sparse sonar + ObstacleLayer raytracing leaves stale marks behind
+the robot that don't get cleared naturally — raytracing only zeroes
+cells along the ray from sensor origin to hit point, so marks off
+the current beam paths persist. See
+memory/project_costmap_hygiene_backlog.md for full context.
+
+This node fires the local_costmap's clear_around service at a
+configurable rate with a wide reset_distance, so fresh sonar
+observations re-mark within each tick while old marks clear.
+The natural defense is that the sonar cloud arrives at ~10Hz —
+anything currently in front of a sensor gets re-marked within
+100ms of being cleared.
+
+Parameters:
+  rate_hz (float, default 5.0)
+    Service call frequency.
+  reset_distance (float, default 4.0)
+    Radius around the robot within which cells are cleared each
+    call. Match to the local_costmap size (our indoor config is 4m).
+  service_name (string, default 'local_costmap/clear_around_local_costmap')
+    Relative service path. Resolved under the node's namespace.
+"""
+import rclpy
+from rclpy.node import Node
+from nav2_msgs.srv import ClearCostmapAroundRobot
+
+
+class ClearCostmapTimer(Node):
+    def __init__(self) -> None:
+        super().__init__('clear_costmap_timer')
+
+        self.declare_parameter('rate_hz', 5.0)
+        self.declare_parameter('reset_distance', 4.0)
+        self.declare_parameter(
+            'service_name',
+            'local_costmap/clear_around_local_costmap',
+        )
+
+        rate_hz = self.get_parameter('rate_hz').value
+        self.reset_distance = self.get_parameter('reset_distance').value
+        service_name = self.get_parameter('service_name').value
+
+        self.client = self.create_client(
+            ClearCostmapAroundRobot, service_name,
+        )
+        self.period_s = 1.0 / float(rate_hz)
+        self.timer = self.create_timer(self.period_s, self.tick)
+
+        self.get_logger().info(
+            f'clear_costmap_timer: calling {service_name} every '
+            f'{self.period_s:.3f}s with reset_distance={self.reset_distance}m'
+        )
+
+    def tick(self) -> None:
+        if not self.client.service_is_ready():
+            # Service hasn't come up yet (Nav2 still initializing), or
+            # costmap went through a lifecycle cycle. Quietly skip —
+            # logging every miss would flood the journal.
+            return
+        req = ClearCostmapAroundRobot.Request()
+        req.reset_distance = self.reset_distance
+        # Fire-and-forget. If the clear fails, the next tick will try
+        # again. We don't block on response to avoid falling behind.
+        self.client.call_async(req)
+
+
+def main():
+    rclpy.init()
+    node = ClearCostmapTimer()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == '__main__':
+    main()

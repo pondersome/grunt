@@ -12,11 +12,19 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}
 )
 
-# Launch files — dispatcher + per-mode entry points. Scripts (mode
-# switcher node) will get added in Phase C via install(PROGRAMS ...).
+# Launch files — dispatcher + per-mode entry points.
 install(DIRECTORY
   launch
   DESTINATION share/${PROJECT_NAME}
+)
+
+# Python scripts — helper nodes launched alongside Nav2. For now:
+#   clear_costmap_timer — periodic ClearCostmapAroundRobot caller,
+#     used in indoor mode to keep sparse-sensor stale marks from
+#     accumulating. See memory/project_costmap_hygiene_backlog.md.
+install(PROGRAMS
+  scripts/clear_costmap_timer
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 ament_package()

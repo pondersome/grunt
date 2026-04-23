@@ -1,0 +1,382 @@
+# Nav2 indoor navigation configuration for Grunt.
+#
+# Companion to nav2_outdoor.yaml. Switched between at launch time by
+# nav.launch.py (nav_mode:=indoor|outdoor); eventually switched at
+# runtime by a mode-switcher node driven by environment state (see
+# ponderdocs/nav/docs/grunt_nav_architecture.md).
+#
+# Primary indoor differences from outdoor:
+#   - MPPI controller (trajectory sampling + obstacle avoidance),
+#     vs outdoor's RPP (pure path following).
+#   - global_frame: grunt1/odom (no GPS/map frame indoors).
+#   - Tighter goal tolerances (0.2m vs 0.6m).
+#   - Smaller global costmap (30m vs 400m), higher resolution.
+#   - Smaller local costmap (4m vs 6m) tuned for tight spaces.
+#   - Lower velocity limits.
+#
+# Architectural note — collision_monitor vs local planner:
+#   The local PLANNER (MPPI here, RPP outdoor) plans trajectories
+#   against the LOCAL COSTMAP. It decides "what should the robot do
+#   next?" MPPI's ObstaclesCritic consumes the costmap's obstacle
+#   layer marks.
+#   The COLLISION MONITOR is a separate node that runs between the
+#   controller's cmd_vel output and the actuator. It subscribes
+#   DIRECTLY to the sonar cloud (not via the costmap) and gates
+#   cmd_vel via footprint polygons. It answers "is this motion
+#   safe RIGHT NOW?" and vetoes actuation on polygon hit.
+#   Both layers share sonar as an upstream signal, but they act
+#   independently and are layered for defense in depth.
+#
+# Namespace templating: the literal `grunt1` in this file is a
+# placeholder substituted by nav_indoor.launch.py's ReplaceString.
+
+bt_navigator:
+  ros__parameters:
+    # Indoors we operate without a GPS datum, so there's no map frame.
+    # Nav2 plans and navigates in the odom frame, which IS always
+    # available (published by ekf_local). Consequence: goals set in
+    # Foxglove need Fixed frame = grunt1/odom for frame_id to match.
+    global_frame: grunt1/odom
+    robot_base_frame: grunt1/base_link
+    odom_topic: /grunt1/odometry/local
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    wait_for_service_timeout: 5
+    transform_tolerance: 0.5
+    # Indoor BT replaces Jazzy's default to avoid the
+    # ClearEntireCostmap trap (see project_sonar_costmap_investigation.md
+    # — left inflation-only costmap permanently non-current after
+    # recovery). Uses ClearCostmapAroundRobot instead.
+    default_nav_to_pose_bt_xml: $(find-pkg-share grunt_nav)/behavior_trees/navigate_to_pose_indoor.xml
+
+waypoint_follower:
+  ros__parameters:
+    loop_rate: 20
+    stop_on_failure: false
+    global_frame_id: grunt1/odom
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      waypoint_pause_duration: 0
+
+velocity_smoother:
+  ros__parameters:
+    smoothing_frequency: 20.0
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.3, 0.0, 0.8]       # slower indoor
+    min_velocity: [-0.2, 0.0, -0.8]
+    max_accel: [1.0, 0.0, 1.5]
+    max_decel: [-1.0, 0.0, -1.5]
+    odom_topic: "/grunt1/odometry/local"
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 5.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner::NavfnPlanner"
+      # Tighter tolerance indoor — goal must be reached more precisely.
+      tolerance: 0.3
+      use_astar: false
+      # allow_unknown:true lets the planner route through unexplored
+      # cells. Indoors we don't want to route through walls we just
+      # haven't observed yet. But our global_costmap doesn't have
+      # obstacle_layer — everything is "unknown" until we explore.
+      # Keep true, rely on local_costmap's obstacle_layer + MPPI to
+      # actually navigate around what sonar discovers.
+      allow_unknown: true
+
+controller_server:
+  ros__parameters:
+    controller_frequency: 10.0   # same as outdoor; NUC-conservative
+    costmap_update_timeout: 3.0  # see outdoor.yaml for context
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      # Indoor moves are slower and shorter; require less movement
+      # per window, allow less total time before declaring stuck.
+      required_movement_radius: 0.1
+      movement_time_allowance: 15.0
+    general_goal_checker:
+      stateful: true
+      plugin: "nav2_controller::SimpleGoalChecker"
+      # Tight indoor goal tolerance — room-scale navigation needs
+      # better precision than the outdoor F9P-derived 0.6m.
+      xy_goal_tolerance: 0.2
+      yaw_goal_tolerance: 0.25
+
+    # MPPI: Model Predictive Path Integral controller. Unlike RPP
+    # (outdoor), MPPI samples many candidate trajectories over a short
+    # horizon and scores them against a cost function. The
+    # ObstaclesCritic (below) reads the local_costmap's obstacle_layer
+    # marks, so MPPI naturally deviates around sonar-detected
+    # obstacles rather than plowing along a global path.
+    # CPU cost: higher than RPP but manageable on the NUC at
+    # batch_size=1000.
+    FollowPath:
+      plugin: "nav2_mppi_controller::MPPIController"
+      # MPPI requires model_dt >= controller period (1/controller_frequency).
+      # We run controller_frequency at 10 Hz (period 0.1s) for NUC CPU
+      # budget, so model_dt matches. time_steps=30 gives a 3s horizon,
+      # enough for path-following at grunt's indoor speeds (~0.2 m/s
+      # → 0.6m look-ahead).
+      time_steps: 30           # horizon = time_steps * model_dt = 3.0s
+      model_dt: 0.1
+      batch_size: 1000         # trajectories sampled per iteration
+      vx_std: 0.2
+      vy_std: 0.2
+      # Wider angular sampling so MPPI explores detour trajectories.
+      # At 0.4 the noise envelope keeps candidates tight around the
+      # direct path; at 0.6 MPPI more aggressively samples sideways
+      # motion that can route around obstacles.
+      wz_std: 0.6
+      # Velocity bounds — match grunt's p2os_driver clamps and the
+      # indoor velocity_smoother ceiling above.
+      vx_max: 0.3
+      vx_min: -0.2
+      wz_max: 0.8
+      ax_max: 1.5
+      ax_min: -1.5
+      ay_max: 1.5
+      az_max: 2.0
+      iteration_count: 1
+      prune_distance: 1.7
+      transform_tolerance: 0.1
+      temperature: 0.3
+      gamma: 0.015
+      # Skid-steer can be treated as DiffDrive for motion modeling —
+      # MPPI's built-in DiffDrive model handles the non-holonomic
+      # constraint correctly for grunt.
+      motion_model: "DiffDrive"
+      visualize: true          # publishes candidate trajectory markers
+      regenerate_noises: false
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+      AckermannConstraints:
+        min_turning_r: 0.0     # not used with DiffDrive model
+      critics:
+        ["ConstraintCritic", "ObstaclesCritic", "GoalCritic",
+         "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic",
+         "PathAngleCritic", "PreferForwardCritic"]
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.4
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+      PreferForwardCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.5
+      # The critical safety critic — reads obstacle_layer cells.
+      # Weights tuned toward "treat near-obstacles as nearly-lethal"
+      # so MPPI prefers detours when any route exists.
+      ObstaclesCritic:
+        enabled: true
+        cost_power: 1
+        # Stronger repulsion so MPPI actively deviates around marks
+        # rather than slowing into them. Default 1.5 leaves trajectory
+        # sampling biased toward the direct path; 3.0 noticeably
+        # favors detours when any exist.
+        repulsion_weight: 3.0
+        critical_weight: 20.0
+        consider_footprint: false
+        collision_cost: 10000.0
+        collision_margin_distance: 0.1
+        near_goal_distance: 0.5
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 14.0
+        max_path_occupancy_ratio: 0.07
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: false
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        mode: 0
+
+behavior_server:
+  ros__parameters:
+    local_frame: grunt1/odom
+    # No map frame indoor. Behaviors that need a global frame fall
+    # back to local_frame when global is unavailable.
+    global_frame: grunt1/odom
+    robot_base_frame: grunt1/base_link
+    transform_tolerance: 0.1
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "wait"]
+    spin:
+      plugin: "nav2_behaviors::Spin"
+    backup:
+      plugin: "nav2_behaviors::BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors::DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors::Wait"
+
+# Global costmap: small, fine-resolution, no obstacles. Planner lays
+# out a straight line to the goal; MPPI on local costmap handles
+# dynamic obstacle avoidance. Keeps the planner from rejecting valid
+# paths because sonar briefly marked a doorway.
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: grunt1/odom
+      robot_base_frame: grunt1/base_link
+      # Match local_costmap's under-report (0.20) so the planner and
+      # controller agree on inscribed zones. See local_costmap above
+      # for why this is safe given collision_monitor's polygon check.
+      robot_radius: 0.20
+      resolution: 0.1
+      track_unknown_space: true
+      rolling_window: true
+      width: 30
+      height: 30
+      plugins: ["inflation_layer"]
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 10.0
+        inflation_radius: 0.25
+      always_send_full_costmap: true
+
+# Local costmap: smaller window (4m vs outdoor 6m), tighter inflation.
+# Same plugins as outdoor (obstacle_layer consuming sonar cloud +
+# inflation) — this is where MPPI's ObstaclesCritic gets its data.
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: grunt1/odom
+      robot_base_frame: grunt1/base_link
+      # 0.20 is a deliberate under-report for indoor use. Real P3AT
+      # chassis is ~0.5m wide so true radius is 0.25. But that
+      # creates a 0.5m inscribed zone around each sonar mark — and
+      # sparse-sensor clusters make those zones merge into large
+      # black blobs that block otherwise-passable gaps.
+      # collision_monitor's FootprintStop polygon below enforces the
+      # REAL chassis geometry (0.55m forward, 0.32m side), so lying
+      # to the planner about radius is safe: MPPI may attempt tighter
+      # paths than a "honest" planner would, and if that approach is
+      # actually unsafe, the polygon catches it.
+      robot_radius: 0.20
+      resolution: 0.05
+      rolling_window: true
+      width: 4
+      height: 4
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: "sonar_cloud"
+        sonar_cloud:
+          topic: /grunt1/sonar/cloud
+          data_type: "PointCloud2"
+          sensor_frame: grunt1/base_link
+          marking: true
+          clearing: true
+          obstacle_max_range: 5.0
+          obstacle_min_range: 0.15
+          raytrace_max_range: 5.5
+          raytrace_min_range: 0.15
+          min_obstacle_height: -0.1
+          max_obstacle_height: 1.0
+          expected_update_rate: 10.0
+          inf_is_valid: false
+          observation_persistence: 3.0
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # Steeper falloff (10 vs outdoor's 3) so the gradient zone
+        # beyond the inscribed radius is narrower — keeps pass-
+        # throughs between clustered sonar marks actually reachable
+        # for MPPI's trajectory sampling.
+        cost_scaling_factor: 10.0
+        # Just enough beyond robot_radius (0.20) to give the gradient
+        # somewhere to land. Any larger and sparse-sensor clusters
+        # merge their inflation zones into walls.
+        inflation_radius: 0.25
+      always_send_full_costmap: true
+
+# Collision monitor: same polygons as outdoor. The polygon geometry
+# is chassis-relative and sonar-dead-zone-aware — not environment-
+# specific — so it doesn't need to diverge between modes.
+#
+# See the architecture note at the top of this file for how this
+# layer interacts with the local planner (MPPI). Short version:
+# MPPI picks a trajectory; collision_monitor vetoes it if a live
+# sonar reading lands in the stop polygon.
+collision_monitor:
+  ros__parameters:
+    base_frame_id: grunt1/base_link
+    odom_frame_id: grunt1/odom
+    cmd_vel_in_topic: cmd_vel_in
+    cmd_vel_out_topic: cmd_vel_out
+    state_topic: collision_monitor_state
+    transform_tolerance: 0.2
+    source_timeout: 1.0
+    base_shift_correction: true
+    stop_pub_timeout: 2.0
+    polygons: ["FootprintStop", "FootprintApproach"]
+    FootprintStop:
+      type: "polygon"
+      action_type: "stop"
+      points: "[[0.55, 0.32], [0.55, -0.32], [-0.32, -0.32], [-0.32, 0.32]]"
+      min_points: 1
+      visualize: true
+      enabled: true
+    FootprintApproach:
+      type: "polygon"
+      action_type: "approach"
+      footprint_topic: local_costmap/published_footprint
+      time_before_collision: 2.0
+      simulation_time_step: 0.1
+      min_points: 1
+      visualize: false
+      enabled: true
+    observation_sources: ["sonar_cloud"]
+    sonar_cloud:
+      type: "pointcloud"
+      topic: "/grunt1/sonar/cloud"
+      min_height: -0.1
+      max_height: 1.0
+      observation_persistence: 3.0
+      enabled: true
