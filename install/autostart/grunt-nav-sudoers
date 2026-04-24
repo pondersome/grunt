@@ -1,0 +1,20 @@
+# Sudoers drop-in for grunt nav_mode_switcher.
+#
+# Allows the `karim` user to stop/start grunt-nav@*.service units
+# without a password prompt, so nav_mode_switcher can switch Nav2
+# modes at runtime via `sudo -n systemctl stop/start`.
+#
+# Install:
+#   sudo visudo -cf /home/karim/ros2_ws/src/grunt/install/autostart/grunt-nav-sudoers
+#   sudo install -m 0440 \
+#     /home/karim/ros2_ws/src/grunt/install/autostart/grunt-nav-sudoers \
+#     /etc/sudoers.d/grunt-nav
+#   # (Do NOT edit /etc/sudoers.d/grunt-nav directly — use visudo.)
+#
+# Scope is deliberately narrow: only stop/start of grunt-nav@*, and
+# only via the absolute systemctl path. No generic systemctl or other
+# privileged commands. A typo that lets nav_mode_switcher restart
+# grunt.service itself would defeat the decoupling entirely.
+
+karim ALL=(root) NOPASSWD: /usr/bin/systemctl stop grunt-nav@*.service
+karim ALL=(root) NOPASSWD: /usr/bin/systemctl start grunt-nav@*.service

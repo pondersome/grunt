@@ -2,16 +2,14 @@
 Dispatcher launch file for grunt_nav.
 
 Routes to nav_indoor.launch.py or nav_outdoor.launch.py based on the
-`nav_mode` launch argument. In Phase A (current) only outdoor exists,
-so this is a thin passthrough to nav_outdoor.launch.py — the stub
-establishes the interface that grunt_bringup uses now and that the
-future mode-switcher + nav_indoor.launch.py will hang off of.
+`nav_mode` launch argument. Called from nav_standalone.launch.py,
+which wraps this in the appropriate PushRosNamespace(prefix).
 
-In Phase C this file (or a sibling) will bring up BOTH nav stacks
-under separate namespaces using lifecycle-based quiescence, with a
-mode-switcher node flipping activation in response to environment
-state. See ~/.claude/plans/sharded-mapping-sonnet.md for the
-architecture plan.
+Phase C1: mode switching is implemented at the systemd layer —
+nav_mode_switcher stops/starts grunt-nav@<mode>.service units,
+each of which launches nav_standalone.launch.py with a different
+nav_mode argument. This dispatcher remains the single point where
+the mode selection becomes a per-mode launch include.
 """
 
 from launch import LaunchDescription
@@ -28,9 +26,6 @@ def generate_launch_description():
 
     grunt_nav_share = FindPackageShare('grunt_nav')
 
-    # For now only nav_outdoor.launch.py exists; nav_indoor arrives in
-    # Phase B of the grunt_nav rollout. The dispatcher supports the
-    # same `nav_mode` selector that the Phase C switcher will toggle.
     outdoor = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([grunt_nav_share, 'launch', 'nav_outdoor.launch.py'])
@@ -41,10 +36,6 @@ def generate_launch_description():
         ),
     )
 
-    # Placeholder for Phase B. Keeps the dispatcher's interface
-    # stable — callers can ask for nav_mode:=indoor today and get a
-    # sensible error when the file isn't there yet, rather than having
-    # us restructure callers when indoor lands.
     indoor = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([grunt_nav_share, 'launch', 'nav_indoor.launch.py'])

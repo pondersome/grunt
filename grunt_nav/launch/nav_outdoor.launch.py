@@ -195,6 +195,28 @@ def generate_launch_description():
                             ('cmd_vel_out', ['/', prefix, '/cmd_vel_nav']),
                         ],
                     ),
+                    # Same sparse-sensor stale-mark workaround as indoor:
+                    # raytrace clearing only clears along live hit rays,
+                    # so marks behind/beside the robot accumulate. On
+                    # outdoor the consequence is RPP's cost-regulated
+                    # slowdown triggering near phantom obstacles — less
+                    # severe than indoor MPPI's detour sensitivity but
+                    # still worth cleaning up. reset_distance matches
+                    # the 6m outdoor local_costmap window (indoor uses
+                    # 4m for its 4m costmap).
+                    # See memory/project_costmap_hygiene_backlog.md.
+                    Node(
+                        package='grunt_nav',
+                        executable='clear_costmap_timer',
+                        name='clear_costmap_timer',
+                        output='screen',
+                        respawn=True,
+                        respawn_delay=5.0,
+                        parameters=[{
+                            'rate_hz': 5.0,
+                            'reset_distance': 6.0,
+                        }],
+                    ),
                 ]
             ),
         ]

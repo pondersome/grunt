@@ -1,0 +1,75 @@
+# grunt-nav@.service — per-mode Nav2 systemd unit for grunt
+#
+# Template unit. Instance name (%i) selects the nav_mode:
+#   grunt-nav@indoor.service    → launches nav_standalone with nav_mode:=indoor
+#   grunt-nav@outdoor.service   → launches nav_standalone with nav_mode:=outdoor
+#
+# Why this exists:
+#   Nav2 used to launch as part of grunt.service via grunt.quiet.launch.py.
+#   That coupled Nav2's lifecycle to the rest of the stack — p2os_driver,
+#   EKFs, IMU, GPS, etc. — which made switching Nav2 configurations
+#   expensive (full stack bounce) and noisy (sensor drivers cycled
+#   unnecessarily). Moving Nav2 into its own systemd unit lets the
+#   nav_mode_switcher node restart just this unit to switch modes,
+#   leaving the main stack untouched.
+#
+# Install:
+#   sudo cp /home/karim/ros2_ws/src/grunt/install/autostart/grunt-nav@.service \
+#     /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable grunt-nav@indoor.service    # default boot mode
+#
+# Switching at runtime:
+#   nav_mode_switcher handles this via `sudo systemctl stop/start`.
+#   Manual: `sudo systemctl stop grunt-nav@<old>.service && \
+#            sudo systemctl start grunt-nav@<new>.service`
+#
+# Watch live output:
+#   journalctl -fu grunt-nav@indoor      # or @outdoor
+#
+# Dependency model:
+#   BindsTo=grunt.service + After=grunt.service — this unit requires
+#   grunt.service to be running. When grunt.service stops, this unit
+#   stops too (BindsTo is stronger than Wants). When grunt.service
+#   restarts, this unit also stops but does NOT auto-restart — the
+#   admin re-enables the desired mode.
+
+[Unit]
+Description=Grunt Nav2 stack (%i mode)
+BindsTo=grunt.service
+After=grunt.service
+
+[Service]
+Type=simple
+User=karim
+Group=karim
+Environment=GRUNT_PREFIX=grunt1
+Environment=HOME=/home/karim
+WorkingDirectory=/home/karim/ros2_ws
+
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/karim/ros2_ws/install/setup.bash && exec ros2 launch grunt_nav nav_standalone.launch.py prefix:=${GRUNT_PREFIX} nav_mode:=%i'
+
+# 15s is enough for Nav2's lifecycle_manager to deactivate + cleanup
+# its managed nodes, plus the launch process to tear down.
+TimeoutStopSec=15
+
+# Disable per-service CPU accounting so the kernel CFS scheduler
+# distributes CPU across individual processes. Without this, cgroup-
+# level CPU weighting gives this unit's heavy processes (MPPI,
+# costmaps) only ~half the CPU they'd get as members of a single
+# combined cgroup — observed as MPPI trajectory stutter on the NUC.
+# Same setting lives on grunt.service.
+CPUAccounting=no
+
+# Crash-only restart — intentional systemctl stop (e.g. via
+# nav_mode_switcher) stays stopped so the other mode can take over.
+Restart=on-failure
+RestartSec=10
+
+# Cgroup SIGTERM so every Nav2 node's rclcpp signal handler runs
+# (controller_server's on_cleanup, costmap publishers, etc).
+KillMode=control-group
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

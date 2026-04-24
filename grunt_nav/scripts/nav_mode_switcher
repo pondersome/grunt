@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""
+nav_mode_switcher — runtime Nav2 mode switcher for grunt (Phase C1).
+
+Drives systemd grunt-nav@<mode>.service templates to switch between
+indoor and outdoor Nav2 configurations without bouncing the main grunt
+stack. Intentionally dumb and explicit — no environs-driven auto
+switching, no live parameter swapping. Just:
+
+    set_mode request arrives
+    -> stop the currently-active grunt-nav@*.service
+    -> start the requested grunt-nav@<target>.service
+    -> publish new mode on the latched topic
+
+Interface:
+    Subscribe: /<ns>/set_mode   std_msgs/String   "indoor" | "outdoor"
+    Publish:   /<ns>/mode       std_msgs/String   current active mode
+                                                  ("indoor" | "outdoor" |
+                                                   "unknown" if neither
+                                                   systemd unit is active,
+                                                   e.g. dev-terminal mode)
+
+    Default node namespace when launched by grunt.quiet.launch.py:
+    /grunt1/nav/nav_mode_switcher.
+
+Dev-terminal mode:
+    If neither grunt-nav@*.service is active (developer launched Nav2
+    via `ros2 launch grunt_nav nav_standalone.launch.py` in a terminal
+    instead of under systemd), set_mode requests are rejected with a
+    log error. There's no safe way to hijack a terminal-launched stack
+    from here, and silently failing would be worse than failing loudly.
+
+Requires: sudoers NOPASSWD for systemctl stop/start on grunt-nav@*
+(see src/grunt/install/autostart/grunt-nav-sudoers).
+"""
+
+import subprocess
+import threading
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile
+from std_msgs.msg import String
+
+
+VALID_MODES = ('indoor', 'outdoor')
+UNIT_TEMPLATE = 'grunt-nav@{mode}.service'
+
+
+class NavModeSwitcher(Node):
+    def __init__(self):
+        super().__init__('nav_mode_switcher')
+
+        # Latched topic so late subscribers (Foxglove, dashboards) see
+        # the current mode without waiting for a change event.
+        latched_qos = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.mode_pub = self.create_publisher(String, 'mode', latched_qos)
+
+        self.set_mode_sub = self.create_subscription(
+            String, 'set_mode', self._on_set_mode, 10
+        )
+
+        # Serialize systemctl calls — two overlapping set_mode messages
+        # could otherwise race and leave both units active or neither.
+        self._lock = threading.Lock()
+
+        current = self._detect_active_mode()
+        self._publish_mode(current)
+        self.get_logger().info(f'nav_mode_switcher started, current mode: {current}')
+
+    def _detect_active_mode(self) -> str:
+        """Return the mode whose grunt-nav@<mode>.service is active, or
+        'unknown' if neither/both are."""
+        active = [m for m in VALID_MODES if self._is_unit_active(m)]
+        if len(active) == 1:
+            return active[0]
+        if len(active) == 0:
+            return 'unknown'
+        # Both active — shouldn't happen, but report it so it's visible.
+        self.get_logger().warn(
+            f'multiple grunt-nav@*.service units active: {active}. '
+            'Publishing first as current; inspect systemd state.'
+        )
+        return active[0]
+
+    def _is_unit_active(self, mode: str) -> bool:
+        unit = UNIT_TEMPLATE.format(mode=mode)
+        # `systemctl is-active` exits 0 if active, non-zero otherwise.
+        # No sudo required for a read.
+        result = subprocess.run(
+            ['systemctl', 'is-active', '--quiet', unit],
+            timeout=5,
+        )
+        return result.returncode == 0
+
+    def _publish_mode(self, mode: str) -> None:
+        msg = String()
+        msg.data = mode
+        self.mode_pub.publish(msg)
+
+    def _on_set_mode(self, msg: String) -> None:
+        target = msg.data.strip().lower()
+        if target not in VALID_MODES:
+            self.get_logger().error(
+                f'set_mode rejected: "{msg.data}" not in {VALID_MODES}'
+            )
+            return
+
+        if not self._lock.acquire(blocking=False):
+            self.get_logger().warn(
+                f'set_mode={target} while another switch is in flight; ignoring'
+            )
+            return
+
+        try:
+            self._switch_to(target)
+        finally:
+            self._lock.release()
+
+    def _switch_to(self, target: str) -> None:
+        current = self._detect_active_mode()
+
+        if current == target:
+            self.get_logger().info(f'already in {target} mode, no-op')
+            self._publish_mode(current)
+            return
+
+        if current == 'unknown':
+            # Dev-terminal mode: no systemd unit active. We can start the
+            # target unit, but if the dev has Nav2 running in a terminal
+            # there'll be two stacks fighting for /<ns>/nav/*. Refuse to
+            # start in this state rather than silently creating chaos.
+            self.get_logger().error(
+                f'no grunt-nav@*.service is active — refusing to switch to '
+                f'{target}. If Nav2 is running in a terminal, stop it first '
+                f'(Ctrl-C) and retry, or enable a systemd unit with '
+                f'`sudo systemctl start grunt-nav@{target}.service`.'
+            )
+            return
+
+        self.get_logger().info(f'switching nav mode: {current} -> {target}')
+
+        old_unit = UNIT_TEMPLATE.format(mode=current)
+        new_unit = UNIT_TEMPLATE.format(mode=target)
+
+        # Stop old first to avoid two Nav2 stacks briefly coexisting on
+        # the same /<ns>/nav/* topics. Brief (~5-10s) gap is expected
+        # and acceptable — teleop stays available via twist_mux.
+        try:
+            subprocess.run(
+                ['sudo', '-n', 'systemctl', 'stop', old_unit],
+                check=True, timeout=30,
+            )
+            subprocess.run(
+                ['sudo', '-n', 'systemctl', 'start', new_unit],
+                check=True, timeout=30,
+            )
+        except subprocess.CalledProcessError as exc:
+            self.get_logger().error(
+                f'systemctl call failed: {exc}. Nav2 may be in a partially-'
+                f'switched state. Check `systemctl status grunt-nav@*.service`.'
+            )
+            # Publish what's actually active now rather than what we wanted.
+            self._publish_mode(self._detect_active_mode())
+            return
+        except subprocess.TimeoutExpired:
+            self.get_logger().error(
+                'systemctl call timed out. Check systemd state manually.'
+            )
+            self._publish_mode(self._detect_active_mode())
+            return
+
+        new_state = self._detect_active_mode()
+        if new_state != target:
+            self.get_logger().error(
+                f'requested {target} but systemd reports active={new_state}'
+            )
+        else:
+            self.get_logger().info(f'nav mode switch complete: {target}')
+        self._publish_mode(new_state)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = NavModeSwitcher()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

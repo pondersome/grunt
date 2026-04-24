@@ -169,8 +169,13 @@ def generate_launch_description():
         DeclareLaunchArgument('Localization', default_value='1', description='Enable robot_localization EKF stack (requires IMU and RTK)'),
         DeclareLaunchArgument('gps_quality_threshold', default_value='4', description='Min GPS quality for heading cal (0=none..5=rtk_fixed)'),
         DeclareLaunchArgument('gps_h_acc_cal_threshold_m', default_value='0.5', description='Max h_acc (m) for heading calibration'),
-        DeclareLaunchArgument('Nav2', default_value='1', description='Enable Nav2 GPS waypoint following (requires Localization)'),
-        DeclareLaunchArgument('nav_mode', default_value='outdoor', description='Nav2 configuration mode: outdoor (GPS/RPP, open ground) or indoor (MPPI, tight spaces, no map frame)'),
+        # Nav2 has moved to its own systemd unit (grunt-nav@.service) and
+        # is launched separately from this file. The nav_mode_switcher
+        # node below handles runtime mode selection. For dev runs, start
+        # Nav2 in a second terminal:
+        #   ros2 launch grunt_nav nav_standalone.launch.py \
+        #     prefix:=<prefix> nav_mode:=indoor|outdoor
+        DeclareLaunchArgument('NavModeSwitcher', default_value='1', description='Start the nav_mode_switcher that drives grunt-nav@<mode>.service units'),
         DeclareLaunchArgument('Behaviors', default_value='1', description='Start grunt_behaviors BT runner + waypoint recorder (requires Nav2 for missions)'),
         DeclareLaunchArgument('Wifi', default_value='1', description='Start isr_wifi connected-link telemetry + pose-correlated sampler'),
         DeclareLaunchArgument('wifi_interface', default_value='wlo1', description='Linux wireless interface for the primary operational link'),
@@ -334,40 +339,41 @@ def generate_launch_description():
         LaunchConfiguration('property'),
     ])
 
-    gp_nav2 = GroupAction(
+    # Joystick commands: e-stop, mission dispatch, cal reset. Deliberately
+    # NOT gated by Nav2 — e-stop and macro buttons must keep working even
+    # during a Nav2 mode-switch restart window. Was previously grouped
+    # under Nav2 when Nav2 launched from here; now that Nav2 lives in
+    # its own systemd unit, this moves to its own top-level group.
+    gp_joy_commands = Node(
+        package='grunt_bringup',
+        executable='joy_estop',
+        name='joy_commands',
+        parameters=[{
+            'estop_button': 1,    # B (red) — e-stop engage
+            'deadman_button': 6,  # left bumper — e-stop acknowledge/release
+            'macro_button': 12,   # Home — dispatch latest mission
+            'reset_cal_button': 11,  # Menu (small) — localization calibration reset
+            'prefix': LaunchConfiguration('prefix'),
+            'missions_dir': missions_dir,
+        }],
+        output='screen',
+    )
+
+    # nav_mode_switcher lives in the main stack so it stays available
+    # while Nav2 itself is restarting between modes. Namespaced to
+    # /<prefix>/nav/ so its set_mode subscription and mode publisher
+    # line up with where callers expect Nav2 status to live.
+    gp_nav_mode_switcher = GroupAction(
         actions=[
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource([
-                    FindPackageShare('grunt_nav'), '/launch', '/nav.launch.py'
-                ]),
-                launch_arguments={
-                    'prefix': LaunchConfiguration('prefix'),
-                    # Pass the user-selected nav_mode (default outdoor).
-                    # Phase C will replace this static arg with a
-                    # runtime switcher driven by environment state.
-                    'nav_mode': LaunchConfiguration('nav_mode'),
-                }.items()
-            ),
-            # Joystick commands: e-stop, mission dispatch, future utilities.
-            # Home button finds latest mission in missions_dir and
-            # publishes directly to bt_runner/start_mission (native
-            # rclpy publisher, no subprocess DDS race).
+            PushRosNamespace('nav'),
             Node(
-                package='grunt_bringup',
-                executable='joy_estop',
-                name='joy_commands',
-                parameters=[{
-                    'estop_button': 1,    # B (red) — e-stop engage
-                    'deadman_button': 6,  # left bumper — e-stop acknowledge/release
-                    'macro_button': 12,   # Home — dispatch latest mission
-                    'reset_cal_button': 11,  # Menu (small) — localization calibration reset
-                    'prefix': LaunchConfiguration('prefix'),
-                    'missions_dir': missions_dir,
-                }],
+                package='grunt_nav',
+                executable='nav_mode_switcher',
+                name='nav_mode_switcher',
                 output='screen',
             ),
         ],
-        condition=IfCondition(LaunchConfiguration('Nav2'))
+        condition=IfCondition(LaunchConfiguration('NavModeSwitcher'))
     )
 
     # Behaviors layer: BT runner + waypoint recorder. Gated separately
@@ -457,7 +463,8 @@ def generate_launch_description():
         gp_description_rtk,
         gp_imu,
         gp_localization,
-        gp_nav2,
+        gp_joy_commands,
+        gp_nav_mode_switcher,
         gp_behaviors,
         gp_wifi,
         gp_lidar,

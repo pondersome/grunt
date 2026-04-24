@@ -25,6 +25,25 @@ Description=Grunt robot autonomy stack (ROS 2 Jazzy)
 After=network-online.target
 Wants=network-online.target
 
+# Pull in Nav2 (indoor by default) when grunt.service starts manually.
+# `systemctl enable grunt-nav@indoor.service` is only honored at boot
+# via multi-user.target — a mid-session `systemctl start grunt.service`
+# won't activate it without this Wants. BindsTo=grunt.service on the
+# nav unit already handles the reverse (nav stops when grunt stops).
+#
+# Caveat: each `systemctl restart grunt.service` bounces Nav2 back to
+# indoor even if the operator had switched to outdoor earlier. Any
+# runtime mode change is discarded on full-stack restart; the
+# nav_mode_switcher can be used to flip modes again post-start.
+#
+# To change the default mode, edit this line to point to
+# grunt-nav@outdoor.service.
+#
+# Ordering: deliberately NO After= here. The nav unit already has
+# After=grunt.service, so nav waits for grunt. Adding the reverse
+# would be circular.
+Wants=grunt-nav@indoor.service
+
 [Service]
 Type=simple
 User=karim
@@ -44,6 +63,15 @@ ExecStop=/home/karim/ros2_ws/src/grunt/install/autostart/grunt_park_and_stop.sh 
 # p2os Shutdown() serial writes (~1s). Short enough that a wedged
 # stop doesn't delay reboot indefinitely.
 TimeoutStopSec=25
+
+# Disable per-service CPU accounting so the kernel CFS scheduler
+# distributes CPU across individual processes instead of across
+# cgroups. Observed: splitting Nav2 into its own systemd unit
+# (grunt-nav@.service) halved Nav2's effective CPU share on the
+# quad-core NUC, causing MPPI trajectory stutter. With accounting
+# off, both cgroups compete process-by-process as before.
+# Same setting lives on grunt-nav@.service.
+CPUAccounting=no
 
 # Restart on crash; `systemctl stop` stays stopped.
 Restart=on-failure

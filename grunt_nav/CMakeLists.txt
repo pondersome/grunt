@@ -18,12 +18,17 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}
 )
 
-# Python scripts — helper nodes launched alongside Nav2. For now:
+# Python scripts — helper nodes launched alongside or around Nav2:
 #   clear_costmap_timer — periodic ClearCostmapAroundRobot caller,
 #     used in indoor mode to keep sparse-sensor stale marks from
 #     accumulating. See memory/project_costmap_hygiene_backlog.md.
+#   nav_mode_switcher — Phase C1 runtime mode switcher. Lives in the
+#     main grunt stack (not inside Nav2) so it stays up while Nav2
+#     itself is being restarted between modes. Drives systemd
+#     grunt-nav@<mode>.service units.
 install(PROGRAMS
   scripts/clear_costmap_timer
+  scripts/nav_mode_switcher
   DESTINATION lib/${PROJECT_NAME}
 )
 
