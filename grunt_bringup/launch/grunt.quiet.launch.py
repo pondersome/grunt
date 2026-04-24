@@ -402,6 +402,20 @@ def generate_launch_description():
                 }],
                 output='screen',
             ),
+            # Mission path overlay for Foxglove's Map panel. Subscribes
+            # to ~/show_mission (std_msgs/String); on publish, emits the
+            # named GPS mission's path as foxglove_msgs/GeoJSON on
+            # ~/geojson (latched). Empty payload clears. GPS missions
+            # only — pose (odom/map) missions belong on the 3D panel.
+            Node(
+                package='grunt_bringup',
+                executable='mission_overlay',
+                name='mission_overlay',
+                parameters=[{
+                    'missions_dir': missions_dir,
+                }],
+                output='screen',
+            ),
         ],
         condition=IfCondition(LaunchConfiguration('Behaviors'))
     )

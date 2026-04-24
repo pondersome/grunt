@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+mission_overlay — publishes a mission's GPS waypoints as GeoJSON for
+Foxglove's Map panel.
+
+Standalone node (not a BT leaf). Subscribes to a `show_mission` topic;
+on each message, loads the named mission from missions_dir and emits
+its path on a latched `geojson` topic. Empty message clears.
+
+Foxglove's Map panel auto-detects foxglove_msgs/GeoJSON topics and
+renders their geometry (Points, LineStrings, Polygons) on top of the
+basemap tiles. This is the clean native path for a mission-path
+overlay — richer than a single NavSatFix marker, no client-side
+config once the topic is discovered.
+
+Intentionally single-mission at a time: pub an empty payload (or
+pub a new name) to swap. If multi-mission comparison becomes useful
+later, add a per-mission topic suffix.
+
+Pose missions (frame != 'gps') are refused — Foxglove's Map panel
+projects into WGS84 tiles; an odom-frame pose has no geo meaning.
+Pose missions belong on the 3D panel with a MarkerArray overlay
+(separate tool).
+"""
+import json
+import os
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile
+from std_msgs.msg import String
+import yaml
+
+# foxglove_msgs is apt-installable as ros-jazzy-foxglove-msgs. Import
+# lazily with a clear error so the package check points at the fix.
+try:
+    from foxglove_msgs.msg import GeoJSON
+except ImportError as exc:
+    raise SystemExit(
+        'foxglove_msgs not available. Install with:\n'
+        '  sudo apt install ros-jazzy-foxglove-msgs\n'
+        f'Original error: {exc}')
+
+
+class MissionOverlay(Node):
+    def __init__(self):
+        super().__init__('mission_overlay')
+
+        self.declare_parameter('missions_dir', '')
+        self.declare_parameter('show_topic', '~/show_mission')
+        self.declare_parameter('geojson_topic', '~/geojson')
+
+        self.missions_dir = self.get_parameter('missions_dir').value
+        show_topic = self.get_parameter('show_topic').value
+        geojson_topic = self.get_parameter('geojson_topic').value
+
+        if not self.missions_dir:
+            self.get_logger().fatal(
+                'missions_dir parameter is required and was empty')
+            raise RuntimeError('missions_dir empty')
+
+        # Latched so a panel that opens after the publish still sees
+        # the current overlay. TRANSIENT_LOCAL depth 1 matches the
+        # nav_mode pattern.
+        latched_qos = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.geojson_pub = self.create_publisher(
+            GeoJSON, geojson_topic, latched_qos)
+
+        self.create_subscription(
+            String, show_topic, self._on_show_mission, 10)
+
+        # Seed the topic with an empty FeatureCollection so the latched
+        # subscriber state is defined — otherwise the Map panel sees
+        # "topic exists but no message yet" and doesn't register it
+        # for auto-detection until the first real publish.
+        self._publish_empty()
+
+        self.get_logger().info(
+            f'mission_overlay ready: missions_dir={self.missions_dir}, '
+            f'show_topic={show_topic}, geojson_topic={geojson_topic}')
+
+    def _on_show_mission(self, msg: String):
+        name = msg.data.strip()
+        if not name:
+            self.get_logger().info('show_mission cleared')
+            self._publish_empty()
+            return
+
+        path = os.path.join(self.missions_dir, f'{name}.yaml')
+        try:
+            with open(path, 'r') as f:
+                mission = yaml.safe_load(f)
+        except OSError as e:
+            self.get_logger().error(f'Mission load failed: {e}')
+            return
+        except yaml.YAMLError as e:
+            self.get_logger().error(f'YAML parse failed: {e}')
+            return
+
+        if not isinstance(mission, dict):
+            self.get_logger().error(
+                f'{path}: top-level YAML is not a map')
+            return
+
+        frame = mission.get('frame')
+        if frame != 'gps':
+            self.get_logger().warn(
+                f"Mission '{name}' has frame='{frame}' — only GPS missions "
+                f'are geo-projectable and can be overlaid on the Map panel. '
+                f'Use a 3D panel MarkerArray for pose missions.')
+            return
+
+        waypoints = mission.get('waypoints')
+        if not isinstance(waypoints, list) or not waypoints:
+            self.get_logger().error(
+                f'{path}: waypoints missing or empty')
+            return
+
+        geojson = self._build_geojson(name, mission, waypoints)
+        self._publish(geojson)
+        self.get_logger().info(
+            f"Published overlay for '{name}' ({len(waypoints)} waypoints)")
+
+    def _build_geojson(self, name, mission, waypoints):
+        # GeoJSON coordinate order is [lon, lat, alt] — opposite of our
+        # YAML's lat/lon keys. Same gotcha as KML; keep the conversion
+        # pinned to one place.
+        line_coords = []
+        for wp in waypoints:
+            try:
+                lon = float(wp['lon'])
+                lat = float(wp['lat'])
+            except (KeyError, TypeError, ValueError):
+                self.get_logger().warn(f'Skipping malformed waypoint: {wp}')
+                continue
+            coord = [lon, lat]
+            if 'alt' in wp:
+                try:
+                    coord.append(float(wp['alt']))
+                except (TypeError, ValueError):
+                    pass
+            line_coords.append(coord)
+
+        features = [
+            {
+                'type': 'Feature',
+                'properties': {
+                    'name': name,
+                    'role': 'path',
+                    'description': mission.get('description', ''),
+                },
+                'geometry': {
+                    'type': 'LineString',
+                    'coordinates': line_coords,
+                },
+            }
+        ]
+
+        # Start / end markers so the path has visible endpoints and
+        # direction is readable at a glance in the panel.
+        if line_coords:
+            features.append({
+                'type': 'Feature',
+                'properties': {'name': f'{name} start', 'role': 'start'},
+                'geometry': {'type': 'Point', 'coordinates': line_coords[0]},
+            })
+        if len(line_coords) >= 2:
+            features.append({
+                'type': 'Feature',
+                'properties': {'name': f'{name} end', 'role': 'end'},
+                'geometry': {'type': 'Point', 'coordinates': line_coords[-1]},
+            })
+
+        return {'type': 'FeatureCollection', 'features': features}
+
+    def _publish(self, geojson_obj):
+        msg = GeoJSON()
+        msg.geojson = json.dumps(geojson_obj, separators=(',', ':'))
+        self.geojson_pub.publish(msg)
+
+    def _publish_empty(self):
+        self._publish({'type': 'FeatureCollection', 'features': []})
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = MissionOverlay()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+
+
+if __name__ == '__main__':
+    main()

@@ -25,6 +25,7 @@ install(PROGRAMS
   scripts/waypoint_recorder
   scripts/play_latest_mission
   scripts/kml_import
+  scripts/mission_overlay
   DESTINATION lib/${PROJECT_NAME}
 )
 
