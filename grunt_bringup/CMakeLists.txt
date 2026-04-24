@@ -24,6 +24,7 @@ install(PROGRAMS
   scripts/joy_estop
   scripts/waypoint_recorder
   scripts/play_latest_mission
+  scripts/kml_import
   DESTINATION lib/${PROJECT_NAME}
 )
 

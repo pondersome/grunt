@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+kml_import — convert a KML (or KMZ) Path into a grunt mission YAML.
+
+Workflow:
+  operator draws a path in Google Earth using the Path tool, saves as
+  KML or KMZ, runs this tool, gets a mission YAML that grunt_behaviors
+  can dispatch via RunGpsMission.
+
+What this tool handles:
+  - A single LineString per KML. That's what Google Earth's Path tool
+    produces, and LineString coordinates are the only KML primitive
+    where order is semantically preserved — which is what we need for
+    a waypoint sequence.
+  - KMZ (zipped KML container): the tool unzips in memory and reads
+    the first .kml inside (typically doc.kml).
+
+What this tool deliberately does NOT handle:
+  - Individual Placemark Points. In KML, Points are visual markers
+    without a reliable document-order guarantee; they map more
+    naturally to individual goal-placemarks than to a sequenced path.
+    If that workflow emerges later, it goes in a sibling tool.
+  - Multiple LineStrings in one file. One KML, one mission — fail
+    noisily rather than guess which path was intended.
+  - Yaw / heading. KML doesn't carry heading for a path. The mission
+    schema makes yaw optional; Nav2's FollowGPSWaypoints picks an
+    approach heading when it's unset.
+
+Coordinate convention — READ THIS:
+  KML coordinates are "longitude,latitude,altitude" (lon first). Not
+  "lat,lon". Our output YAML is lat/lon-keyed per the existing
+  mission schema; this tool handles the flip.
+"""
+import argparse
+import os
+import re
+import sys
+import xml.etree.ElementTree as ET
+import zipfile
+
+import yaml
+
+
+# KML's default namespace. Google Earth always writes this; a KML
+# without it is malformed.
+KML_NS = 'http://www.opengis.net/kml/2.2'
+
+
+def read_kml_text(path):
+    """Return the KML document text from either a .kml file or a
+    .kmz zip. For KMZ, pick the first *.kml entry (Google Earth
+    writes doc.kml at the root)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.kmz':
+        with zipfile.ZipFile(path) as zf:
+            kml_names = [n for n in zf.namelist() if n.lower().endswith('.kml')]
+            if not kml_names:
+                raise ValueError(f'{path}: no .kml entry inside the KMZ')
+            with zf.open(kml_names[0]) as f:
+                return f.read().decode('utf-8')
+    with open(path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+def find_single_linestring(root):
+    """Locate the one LineString in the KML. Raise if zero or many —
+    ambiguous inputs should fail loudly rather than quietly pick one."""
+    # Search namespaced and un-namespaced to tolerate KMLs that strip
+    # the xmlns (rare but seen in the wild).
+    ns_path = f'.//{{{KML_NS}}}LineString'
+    bare_path = './/LineString'
+    lines = root.findall(ns_path) + root.findall(bare_path)
+    if not lines:
+        raise ValueError(
+            'No LineString found. This tool expects a Path drawn with '
+            "Google Earth's Path tool. Individual Placemark Points are "
+            'not imported — see the header comment.')
+    if len(lines) > 1:
+        raise ValueError(
+            f'{len(lines)} LineStrings found. This tool expects exactly '
+            'one path per KML. Split the file in Google Earth (or export '
+            'each path separately) and re-run.')
+    return lines[0]
+
+
+def parse_coordinates(line_string):
+    """Pull the <coordinates> child of a LineString and return a list
+    of (lon, lat, alt) tuples. KML coordinates are whitespace-separated
+    tuples of comma-separated doubles."""
+    # ElementTree element truth is child-count based, so "or" between
+    # two find() results silently picks wrong when the first has no
+    # children (e.g. a <coordinates> leaf with only text). Use
+    # explicit is-None checks.
+    coords_elem = line_string.find(f'{{{KML_NS}}}coordinates')
+    if coords_elem is None:
+        coords_elem = line_string.find('coordinates')
+    if coords_elem is None or not coords_elem.text:
+        raise ValueError('LineString has no <coordinates> content.')
+
+    tokens = coords_elem.text.strip().split()
+    out = []
+    for tok in tokens:
+        parts = tok.split(',')
+        if len(parts) < 2:
+            raise ValueError(
+                f'Bad coordinate tuple {tok!r} — expected lon,lat[,alt].')
+        try:
+            lon = float(parts[0])
+            lat = float(parts[1])
+            alt = float(parts[2]) if len(parts) >= 3 and parts[2] else 0.0
+        except ValueError as e:
+            raise ValueError(
+                f'Bad coordinate tuple {tok!r}: {e}') from e
+        out.append((lon, lat, alt))
+    if not out:
+        raise ValueError('LineString has <coordinates> but it parsed empty.')
+    return out
+
+
+def find_placemark_name(root):
+    """Best-effort: the name of the Placemark containing the LineString,
+    used as a fallback mission name."""
+    for pm in root.iter(f'{{{KML_NS}}}Placemark'):
+        if pm.find(f'.//{{{KML_NS}}}LineString') is not None:
+            name_el = pm.find(f'{{{KML_NS}}}name')
+            if name_el is not None and name_el.text:
+                return name_el.text.strip()
+    return None
+
+
+# YAML-safe mission names: strip .kml/.kmz suffixes, replace anything
+# that isn't alnum/dash/underscore with a dash, collapse runs. Keeps
+# filenames predictable and avoids YAML quoting surprises.
+_NAME_SAFE_RE = re.compile(r'[^A-Za-z0-9_-]+')
+
+
+def sanitize_name(s):
+    s = os.path.splitext(s)[0]  # .kml / .kmz off
+    s = os.path.splitext(s)[0]  # e.g. foo.kml.kmz → foo
+    s = _NAME_SAFE_RE.sub('-', s).strip('-')
+    return s or 'imported-mission'
+
+
+def build_mission(coords, name, source_basename):
+    waypoints = [
+        {
+            'lat': round(lat, 8),
+            'lon': round(lon, 8),
+            'alt': round(alt, 3),
+        }
+        for (lon, lat, alt) in coords
+    ]
+    return {
+        'name': name,
+        'description':
+            f'Imported from {source_basename} via kml_import '
+            f'({len(waypoints)} waypoints)',
+        'frame': 'gps',
+        'waypoints': waypoints,
+    }
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(
+        description='Convert a KML/KMZ Path into a grunt mission YAML.')
+    parser.add_argument('kml_path', help='Path to the .kml or .kmz file')
+    parser.add_argument(
+        '--name',
+        help='Mission name override. Default: Placemark <name>, else '
+             'filename stem. Becomes the YAML stem too.')
+    parser.add_argument(
+        '--output-dir',
+        help='Directory to write the YAML into. Default: same directory '
+             'as the input KML.')
+    parser.add_argument(
+        '--force', action='store_true',
+        help='Overwrite an existing YAML with the same name.')
+    args = parser.parse_args(argv[1:])
+
+    try:
+        kml_text = read_kml_text(args.kml_path)
+    except (OSError, ValueError, zipfile.BadZipFile) as e:
+        print(f'Read failed: {e}', file=sys.stderr)
+        return 1
+
+    try:
+        root = ET.fromstring(kml_text)
+    except ET.ParseError as e:
+        print(f'XML parse failed: {e}', file=sys.stderr)
+        return 1
+
+    try:
+        line = find_single_linestring(root)
+        coords = parse_coordinates(line)
+    except ValueError as e:
+        print(f'{args.kml_path}: {e}', file=sys.stderr)
+        return 1
+
+    # Name resolution: --name override, else Placemark/name, else
+    # filename stem.
+    if args.name:
+        name = sanitize_name(args.name)
+    else:
+        placemark_name = find_placemark_name(root)
+        if placemark_name:
+            name = sanitize_name(placemark_name)
+        else:
+            name = sanitize_name(os.path.basename(args.kml_path))
+
+    output_dir = (
+        args.output_dir
+        if args.output_dir
+        else os.path.dirname(os.path.abspath(args.kml_path)))
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f'{name}.yaml')
+
+    if os.path.exists(out_path) and not args.force:
+        print(
+            f'{out_path} exists; use --force to overwrite.',
+            file=sys.stderr)
+        return 1
+
+    mission = build_mission(
+        coords, name, source_basename=os.path.basename(args.kml_path))
+
+    try:
+        with open(out_path, 'w') as f:
+            yaml.safe_dump(
+                mission, f, default_flow_style=None, sort_keys=False)
+    except OSError as e:
+        print(f'Write failed: {e}', file=sys.stderr)
+        return 1
+
+    print(
+        f'Wrote {out_path} ({len(coords)} waypoints, '
+        f'from {os.path.basename(args.kml_path)})')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
