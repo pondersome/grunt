@@ -6,25 +6,34 @@ ponderdocs/behaviors/docs/architecture.md ("Operator tools sit beside
 the BT, not inside it").
 
 Joystick:
-  Y (record): append the current GPS fix + heading as a new waypoint.
-              First press without an open file auto-generates a
-              YYMMDD-HHMMSS-named recording.
+  Y (record): append the current location as a new waypoint. Kind
+              (GPS or pose) is determined by the nav_mode latched on
+              /<prefix>/nav/mode at first Y press. First press without
+              an open file auto-generates a YYMMDD-HHMMSS-named
+              recording.
   X (save):   write the current recording to disk and reset. Next Y
               press starts a fresh recording.
 
-Sources:
-  rtk/fix_gated   — only quality-gated fixes are recorded. If the
-                    supervisor hasn't gated through any fixes (e.g.,
-                    indoors, or before calibration), Y is refused with
-                    a warning.
-  odometry/global — yaw is taken from the global EKF's quaternion at
-                    record time (ENU yaw). Requires localization to
-                    have produced a map-frame pose.
+Mode sensing:
+  Subscribes to /<prefix>/nav/mode (std_msgs/String, latched) to pick
+  recording kind:
+    outdoor  → GPS waypoint (lat/lon/alt/yaw), sourced from rtk/fix_gated
+               and odometry/global.
+    indoor   → Pose waypoint (x/y/z/yaw) in the configured pose_frame
+               (default grunt1/odom). Sourced from a TF lookup
+               base_link -> pose_frame.
+    unknown  → refuse to record (neither grunt-nav@* service active).
 
-Output:
-  YAML written to <missions_dir>, schema matching grunt_behaviors's
-  RunGpsMission loader. Filename = <name>.yaml; in-file 'name' must
-  match per the loader's strict validation.
+Pose frame caveat:
+  Default pose_frame is grunt1/odom, which is SESSION-LOCAL: odom
+  resets on every boot and drifts with dead reckoning. Pose missions
+  recorded in odom are only meaningful within the session they were
+  recorded. When a proper map frame is available (AMCL/SLAM),
+  re-record in grunt1/map for durability.
+
+Kind transitions mid-recording are refused — operator must save or
+discard before switching modes. Prevents a mix of GPS and pose
+waypoints in a single file, which the loader would reject anyway.
 """
 import datetime
 import math
@@ -32,8 +41,12 @@ import os
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from sensor_msgs.msg import Joy, NavSatFix
 from nav_msgs.msg import Odometry
+from std_msgs.msg import String
+import tf2_ros
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 import yaml
 
 # NavPVT (u-blox raw) carries the precise h_acc the supervisor uses;
@@ -62,6 +75,12 @@ class WaypointRecorder(Node):
         self.declare_parameter('fix_topic', 'rtk/fix_gated')
         self.declare_parameter('odom_topic', 'odometry/global')
         self.declare_parameter('navpvt_topic', 'rtk/navpvt')
+        self.declare_parameter('mode_topic', 'nav/mode')
+        self.declare_parameter('base_frame', 'grunt1/base_link')
+        # Pose frame for indoor recording. grunt1/odom is session-local
+        # (resets each boot). Change to grunt1/map once an AMCL/SLAM
+        # pipeline is providing a durable map→odom TF.
+        self.declare_parameter('pose_frame', 'grunt1/odom')
 
         self.missions_dir = self.get_parameter('missions_dir').value
         self.record_button = self.get_parameter('record_button').value
@@ -69,14 +88,15 @@ class WaypointRecorder(Node):
         fix_topic = self.get_parameter('fix_topic').value
         odom_topic = self.get_parameter('odom_topic').value
         navpvt_topic = self.get_parameter('navpvt_topic').value
+        mode_topic = self.get_parameter('mode_topic').value
+        self.base_frame = self.get_parameter('base_frame').value
+        self.pose_frame = self.get_parameter('pose_frame').value
 
         if not self.missions_dir:
             self.get_logger().fatal(
                 'missions_dir parameter is required and was empty')
             raise RuntimeError('missions_dir empty')
 
-        # Make the destination directory eagerly so first-save doesn't
-        # surprise the operator with a permission error in the field.
         try:
             os.makedirs(self.missions_dir, exist_ok=True)
         except OSError as e:
@@ -84,17 +104,27 @@ class WaypointRecorder(Node):
                 f'Cannot create missions_dir {self.missions_dir}: {e}')
             raise
 
-        # Recording state
+        # GPS recording state
         self.last_fix = None
         self.last_yaw = None
-        self.last_alt = None
-        self.last_h_acc_m = None  # from NavPVT, not NavSatFix
+        self.last_h_acc_m = None
+
+        # Current nav mode (latched). Set by /<prefix>/nav/mode
+        # subscription; "unknown" until the first message arrives.
+        self.current_mode = 'unknown'
+
+        # Recording state
         self.current_name = None
+        self.recording_kind = None   # 'gps' or 'pose' — locked at first record
         self.waypoints = []
 
-        # Edge-detection state for buttons (we react on rising edge).
+        # Edge-detection state for buttons.
         self.record_button_prev = False
         self.save_button_prev = False
+
+        # TF listener for indoor pose lookups.
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self.create_subscription(Joy, 'joy', self._joy_cb, 10)
         self.create_subscription(NavSatFix, fix_topic, self._fix_cb, 10)
@@ -105,11 +135,19 @@ class WaypointRecorder(Node):
             self.get_logger().warn(
                 'ublox_msgs not available — h_acc will not be recorded.')
 
+        # Latched mode subscription — TRANSIENT_LOCAL matches the
+        # publisher in nav_mode_switcher so we see the current mode
+        # even if we start after the switcher.
+        latched_qos = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(String, mode_topic, self._mode_cb, latched_qos)
+
         self.get_logger().info(
             f'Waypoint recorder ready: missions_dir={self.missions_dir}, '
             f'record=button {self.record_button}, save=button {self.save_button}, '
-            f'fix={fix_topic}, odom={odom_topic}, '
-            f'navpvt={navpvt_topic if NavPVT else "(unavailable)"}')
+            f'mode_topic={mode_topic}, pose_frame={self.pose_frame}')
 
     def _fix_cb(self, msg: NavSatFix):
         self.last_fix = msg
@@ -118,10 +156,13 @@ class WaypointRecorder(Node):
         self.last_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
 
     def _navpvt_cb(self, msg):
-        # h_acc field is in millimeters per the u-blox spec; convert
-        # to meters for the YAML record. Stored independently from the
-        # gated fix because they arrive on separate topics.
         self.last_h_acc_m = msg.h_acc / 1000.0
+
+    def _mode_cb(self, msg: String):
+        if msg.data != self.current_mode:
+            self.get_logger().info(
+                f'nav mode: {self.current_mode} -> {msg.data}')
+        self.current_mode = msg.data
 
     def _joy_cb(self, msg: Joy):
         record_pressed = (
@@ -140,13 +181,38 @@ class WaypointRecorder(Node):
         self.save_button_prev = save_pressed
 
     def _record(self):
-        # Refuse cleanly rather than recording garbage. Both gates must
-        # have produced a message before we'll commit a waypoint.
+        # Kind is determined by current nav mode.
+        if self.current_mode == 'outdoor':
+            kind = 'gps'
+        elif self.current_mode == 'indoor':
+            kind = 'pose'
+        else:
+            self.get_logger().warn(
+                f'nav mode is "{self.current_mode}" — refusing to record. '
+                f'Start a grunt-nav@*.service (indoor or outdoor) first.')
+            return
+
+        # Lock the recording kind at first waypoint; refuse mid-
+        # recording mode changes.
+        if self.recording_kind is None:
+            self.recording_kind = kind
+        elif self.recording_kind != kind:
+            self.get_logger().warn(
+                f'Current mode is {self.current_mode} (kind={kind}) but '
+                f'active recording is {self.recording_kind}. Save or discard '
+                f'the current recording before switching modes.')
+            return
+
+        if kind == 'gps':
+            self._record_gps()
+        else:
+            self._record_pose()
+
+    def _record_gps(self):
         if self.last_fix is None:
             self.get_logger().warn(
                 'No rtk/fix_gated message yet — refusing to record. '
-                '(Outdoors, the supervisor may still be waiting for an '
-                'acceptable fix.)')
+                '(The supervisor may still be waiting for an acceptable fix.)')
             return
         if self.last_yaw is None:
             self.get_logger().warn(
@@ -156,14 +222,8 @@ class WaypointRecorder(Node):
             return
 
         if self.current_name is None:
-            self.current_name = datetime.datetime.now().strftime('%y%m%d-%H%M%S')
-            self.waypoints = []
-            self.get_logger().info(f'New recording opened: {self.current_name}')
+            self._open_new_recording()
 
-        # Capture the GPS fix message's own timestamp (set by the
-        # ublox driver when the fix was received). More meaningful
-        # than the button-press wall time when looking at recordings
-        # later — tells you the actual GPS measurement time.
         fix_time = self._stamp_to_iso(self.last_fix.header.stamp)
 
         wp = {
@@ -173,20 +233,54 @@ class WaypointRecorder(Node):
             'yaw': round(float(self.last_yaw), 4),
             'fix_time': fix_time,
         }
-        # h_acc only present when NavPVT is available and we've seen a
-        # message. Optional in the schema; downstream loaders ignore
-        # unknown keys today (forward-compatible) and may consume this
-        # for trust-weighting later.
         if self.last_h_acc_m is not None:
             wp['h_acc'] = round(self.last_h_acc_m, 3)
 
         self.waypoints.append(wp)
         h_acc_str = f' h_acc={wp["h_acc"]:.3f}m' if 'h_acc' in wp else ''
         self.get_logger().info(
-            f'Recorded waypoint #{len(self.waypoints)}: '
+            f'Recorded GPS waypoint #{len(self.waypoints)}: '
             f'lat={wp["lat"]:.6f} lon={wp["lon"]:.6f} '
             f'alt={wp["alt"]:.1f} yaw={wp["yaw"]:.3f}{h_acc_str} '
             f'@ {fix_time}')
+
+    def _record_pose(self):
+        # Look up base_frame in pose_frame to get current robot pose.
+        # Use time=0 (latest) — recording is an operator action, not
+        # synchronized with a particular sensor tick.
+        try:
+            t = self.tf_buffer.lookup_transform(
+                self.pose_frame, self.base_frame, rclpy.time.Time())
+        except (LookupException, ConnectivityException,
+                ExtrapolationException) as e:
+            self.get_logger().warn(
+                f'TF lookup {self.base_frame} -> {self.pose_frame} '
+                f'failed: {e}. Refusing to record.')
+            return
+
+        if self.current_name is None:
+            self._open_new_recording()
+
+        yaw = quaternion_to_yaw(t.transform.rotation)
+        wp = {
+            'x': round(float(t.transform.translation.x), 4),
+            'y': round(float(t.transform.translation.y), 4),
+            'z': round(float(t.transform.translation.z), 4),
+            'yaw': round(float(yaw), 4),
+            'tf_time': self._stamp_to_iso(t.header.stamp),
+        }
+        self.waypoints.append(wp)
+        self.get_logger().info(
+            f'Recorded pose waypoint #{len(self.waypoints)} in '
+            f'{self.pose_frame}: x={wp["x"]:.3f} y={wp["y"]:.3f} '
+            f'yaw={wp["yaw"]:.3f}')
+
+    def _open_new_recording(self):
+        self.current_name = datetime.datetime.now().strftime('%y%m%d-%H%M%S')
+        self.waypoints = []
+        self.get_logger().info(
+            f'New recording opened: {self.current_name} '
+            f'(kind={self.recording_kind})')
 
     @staticmethod
     def _stamp_to_iso(stamp):
@@ -202,19 +296,24 @@ class WaypointRecorder(Node):
                 'Nothing to save (no active recording or no waypoints yet)')
             return
 
+        # Frame string matches the mission loader's discrimination:
+        # "gps" for GPS missions, the TF frame id for pose missions.
+        if self.recording_kind == 'gps':
+            frame = 'gps'
+        else:
+            frame = self.pose_frame
+
         mission = {
             'name': self.current_name,
             'description':
                 f'Recorded via joystick on {datetime.datetime.now().isoformat(timespec="seconds")}',
-            'frame': 'gps',
+            'frame': frame,
             'waypoints': self.waypoints,
         }
 
         path = os.path.join(self.missions_dir, f'{self.current_name}.yaml')
         try:
             with open(path, 'w') as f:
-                # Inline waypoint dicts for human-readability; block top
-                # level for navigation in editors.
                 yaml.safe_dump(
                     mission, f, default_flow_style=None, sort_keys=False)
         except OSError as e:
@@ -223,11 +322,12 @@ class WaypointRecorder(Node):
 
         self.get_logger().info(
             f'Saved mission "{self.current_name}" '
-            f'({len(self.waypoints)} waypoints) to {path}')
+            f'(kind={self.recording_kind}, {len(self.waypoints)} waypoints) '
+            f'to {path}')
 
-        # Reset for the next recording. Operator can immediately press Y
-        # to begin a fresh mission with a fresh auto-name.
+        # Reset for the next recording.
         self.current_name = None
+        self.recording_kind = None
         self.waypoints = []
 
 
