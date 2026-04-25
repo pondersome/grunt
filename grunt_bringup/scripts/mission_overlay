@@ -49,10 +49,12 @@ class MissionOverlay(Node):
         self.declare_parameter('missions_dir', '')
         self.declare_parameter('show_topic', '~/show_mission')
         self.declare_parameter('geojson_topic', '~/geojson')
+        self.declare_parameter('selected_mission_topic', '~/selected_mission')
 
         self.missions_dir = self.get_parameter('missions_dir').value
         show_topic = self.get_parameter('show_topic').value
         geojson_topic = self.get_parameter('geojson_topic').value
+        selected_topic = self.get_parameter('selected_mission_topic').value
 
         if not self.missions_dir:
             self.get_logger().fatal(
@@ -69,18 +71,27 @@ class MissionOverlay(Node):
         self.geojson_pub = self.create_publisher(
             GeoJSON, geojson_topic, latched_qos)
 
+        # selected_mission tracks the operator's currently-displayed
+        # mission name. joy_commands subscribes to it so the Home
+        # button dispatches what the operator is looking at, instead
+        # of always picking "latest by mtime". Empty string == no
+        # selection (fall back to mtime behavior at the consumer).
+        self.selected_pub = self.create_publisher(
+            String, selected_topic, latched_qos)
+
         self.create_subscription(
             String, show_topic, self._on_show_mission, 10)
 
-        # Seed the topic with an empty FeatureCollection so the latched
-        # subscriber state is defined — otherwise the Map panel sees
-        # "topic exists but no message yet" and doesn't register it
-        # for auto-detection until the first real publish.
+        # Seed both topics with empty messages so latched subscriber
+        # state is defined — otherwise late subscribers see "topic
+        # exists but no message yet" and won't register the topic for
+        # auto-detection (Map panel) or selection (joy_commands).
         self._publish_empty()
 
         self.get_logger().info(
             f'mission_overlay ready: missions_dir={self.missions_dir}, '
-            f'show_topic={show_topic}, geojson_topic={geojson_topic}')
+            f'show_topic={show_topic}, geojson_topic={geojson_topic}, '
+            f'selected_mission_topic={selected_topic}')
 
     def _on_show_mission(self, msg: String):
         name = msg.data.strip()
@@ -106,21 +117,30 @@ class MissionOverlay(Node):
             return
 
         frame = mission.get('frame')
-        if frame != 'gps':
-            self.get_logger().warn(
-                f"Mission '{name}' has frame='{frame}' — only GPS missions "
-                f'are geo-projectable and can be overlaid on the Map panel. '
-                f'Use a 3D panel MarkerArray for pose missions.')
-            return
-
         waypoints = mission.get('waypoints')
         if not isinstance(waypoints, list) or not waypoints:
             self.get_logger().error(
                 f'{path}: waypoints missing or empty')
             return
 
+        # Selection vs visualization are intentionally separable:
+        # any valid mission becomes the operator's selection (so the
+        # Home button can dispatch a pose mission too), even though
+        # the GeoJSON overlay only renders GPS missions on the Map
+        # panel. Pose missions get an empty GeoJSON publish so the
+        # map clears any prior overlay rather than misleading the
+        # operator into thinking the previous path still applies.
+        self._publish_selected(name)
+
+        if frame != 'gps':
+            self.get_logger().info(
+                f"Selected pose mission '{name}' (frame='{frame}'); "
+                'clearing Map overlay (pose missions render on the 3D panel).')
+            self._publish_empty_geojson()
+            return
+
         geojson = self._build_geojson(name, mission, waypoints)
-        self._publish(geojson)
+        self._publish_geojson(geojson)
         self.get_logger().info(
             f"Published overlay for '{name}' ({len(waypoints)} waypoints)")
 
@@ -176,13 +196,25 @@ class MissionOverlay(Node):
 
         return {'type': 'FeatureCollection', 'features': features}
 
-    def _publish(self, geojson_obj):
+    def _publish_geojson(self, geojson_obj):
         msg = GeoJSON()
         msg.geojson = json.dumps(geojson_obj, separators=(',', ':'))
         self.geojson_pub.publish(msg)
 
+    def _publish_empty_geojson(self):
+        self._publish_geojson({'type': 'FeatureCollection', 'features': []})
+
+    def _publish_selected(self, name: str):
+        msg = String()
+        msg.data = name
+        self.selected_pub.publish(msg)
+
     def _publish_empty(self):
-        self._publish({'type': 'FeatureCollection', 'features': []})
+        # Empty GeoJSON + empty selection. Used at startup so latched
+        # subscribers immediately see a defined state, and on explicit
+        # clear (empty show_mission payload).
+        self._publish_empty_geojson()
+        self._publish_selected('')
 
 
 def main(args=None):

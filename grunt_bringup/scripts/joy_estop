@@ -21,6 +21,7 @@ import subprocess
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from sensor_msgs.msg import Joy
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
@@ -48,16 +49,24 @@ class JoyCommands(Node):
         self.macro_button_prev = False
         self.reset_cal_button_prev = False
 
-        # Home button behavior:
-        #   Default: find latest mission YAML → publish to start_mission
-        #     (native rclpy publisher, no DDS race).
-        #   Override: if macro_cmd is set, run that shell command instead.
-        #     Settable via parameter or ~/set_macro topic at runtime.
+        # Home button behavior (priority order):
+        #   1. macro_cmd set → run that shell command.
+        #   2. mission_overlay has a selection → dispatch that mission.
+        #   3. Fall back to latest YAML by mtime.
+        # macro_cmd is settable via parameter or ~/set_macro topic at
+        # runtime. The selection comes from mission_overlay's latched
+        # ~/selected_mission topic — mission_overlay owns "what's the
+        # operator looking at?" and we just consume it.
         self.declare_parameter('missions_dir', '')
         self.declare_parameter('macro_cmd', '')
+        self.declare_parameter(
+            'selected_mission_topic',
+            f'/{prefix}/mission_overlay/selected_mission')
         self.missions_dir = self.get_parameter('missions_dir').value
         self.macro_cmd = self.get_parameter('macro_cmd').value
+        selected_topic = self.get_parameter('selected_mission_topic').value
         self.macro_process = None
+        self.selected_mission_name = ''
 
         # Publisher to twist_mux e-stop lock
         self.estop_pub = self.create_publisher(Bool, 'estop/joystick', 10)
@@ -71,6 +80,16 @@ class JoyCommands(Node):
         # Subscribe to joystick and optional macro override
         self.create_subscription(Joy, 'joy', self._joy_cb, 10)
         self.create_subscription(String, '~/set_macro', self._set_macro_cb, 10)
+
+        # Latched subscription — must match mission_overlay's
+        # TRANSIENT_LOCAL publisher QoS to receive the latched value
+        # if we start after the overlay node.
+        latched_qos = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            String, selected_topic, self._on_selected_mission, latched_qos)
 
         # Behaviors-layer resume service — the deadman-acknowledge release
         # path calls this so the BT re-arms and returns to whatever branch
@@ -119,15 +138,14 @@ class JoyCommands(Node):
                   self.deadman_released_since_estop):
                 self._release_estop('deadman acknowledge')
 
-        # Home button: rising edge. If macro_cmd is set, run that shell
-        # command; otherwise dispatch the latest mission natively.
+        # Home button: rising edge. macro_cmd > selected mission > latest by mtime.
         macro_pressed = (self.macro_button < len(msg.buttons) and
                          bool(msg.buttons[self.macro_button]))
         if macro_pressed and not self.macro_button_prev:
             if self.macro_cmd:
                 self._execute_macro()
             else:
-                self._dispatch_latest_mission()
+                self._dispatch_mission()
 
         # Menu (small) button: rising edge → request calibration reset.
         reset_cal_pressed = (self.reset_cal_button < len(msg.buttons) and
@@ -187,18 +205,41 @@ class JoyCommands(Node):
         except Exception as e:
             self.get_logger().warn(f'BT resume call failed: {e}')
 
-    def _dispatch_latest_mission(self):
-        """Find the most recently modified mission YAML in missions_dir
-        and publish its name to bt_runner/start_mission."""
+    def _on_selected_mission(self, msg: String):
+        """mission_overlay tells us which mission the operator is looking at.
+        Empty string means no selection (fall back to mtime at dispatch time)."""
+        new_selection = msg.data.strip()
+        if new_selection != self.selected_mission_name:
+            if new_selection:
+                self.get_logger().info(
+                    f'Selected mission updated: {new_selection}')
+            else:
+                self.get_logger().info(
+                    'Selected mission cleared — Home will dispatch latest by mtime')
+        self.selected_mission_name = new_selection
+
+    def _dispatch_mission(self):
+        """Dispatch the operator's selected mission if any, else the most
+        recently modified mission YAML in missions_dir."""
+        if self.selected_mission_name:
+            msg = String()
+            msg.data = self.selected_mission_name
+            self.start_mission_pub.publish(msg)
+            self.get_logger().info(
+                f'Dispatched selected mission: {self.selected_mission_name}')
+            return
+
         if not self.missions_dir:
             self.get_logger().warn(
-                'missions_dir not configured — cannot dispatch mission')
+                'missions_dir not configured and no mission selected — '
+                'cannot dispatch')
             return
 
         candidates = glob.glob(os.path.join(self.missions_dir, '*.yaml'))
         if not candidates:
             self.get_logger().warn(
-                f'No mission files in {self.missions_dir}')
+                f'No mission files in {self.missions_dir} '
+                'and no mission selected')
             return
 
         latest = max(candidates, key=os.path.getmtime)
@@ -207,7 +248,7 @@ class JoyCommands(Node):
         msg = String()
         msg.data = name
         self.start_mission_pub.publish(msg)
-        self.get_logger().info(f'Dispatched mission: {name}')
+        self.get_logger().info(f'Dispatched latest-by-mtime mission: {name}')
 
     def _request_reset_calibration(self):
         if not self.reset_cal_client.service_is_ready():
