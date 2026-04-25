@@ -164,10 +164,20 @@ behavior_server:
     wait:
       plugin: "nav2_behaviors::Wait"
 
-# Global costmap: rolling window, no static map, no obstacles.
-# Short-range sonar is deliberately NOT added here — the 400 m global
-# plan shouldn't be swayed by 5 m sonar hits. Phase 3 will add
-# obstacle_layer for 3D LiDAR once that subsystem is wired.
+# Global costmap: rolling window, no static map, sonar-aware.
+# Phase 2 (initial): inflation only. Phase 3 (planned): voxel_layer
+# for 3D LiDAR.
+# Phase 2.5 (2026-04-25): added obstacle_layer with sonar so that
+# RPP's planner produces routes AROUND obstacles. Without it the
+# planner emits a straight-line path on every re-issue, and after a
+# collision_monitor-triggered EscapeSequence the new path passes
+# through the same physical obstacle (only laterally shifted by the
+# escape's small drive). With obstacle_layer the planner sees the
+# obstacle and reroutes properly. observation_persistence is much
+# longer than the local costmap's (30s vs 3s) so the obstacle stays
+# visible across the planner's 1Hz call cadence and the multi-second
+# escape sequence — and raytracing naturally clears marks as the
+# robot moves past them.
 global_costmap:
   global_costmap:
     ros__parameters:
@@ -181,9 +191,33 @@ global_costmap:
       rolling_window: true
       width: 400
       height: 400
-      # Global plan stays obstacle-free; sonar obstacles live in the
-      # local costmap only (see phase 2 note at the top of this file).
-      plugins: ["inflation_layer"]
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: "sonar_cloud"
+        sonar_cloud:
+          topic: /grunt1/sonar/cloud
+          data_type: "PointCloud2"
+          # Sonar cloud points come in base_link frame (per p2os_driver
+          # config). Same as the local costmap's obstacle_layer
+          # configuration.
+          sensor_frame: grunt1/base_link
+          marking: true
+          clearing: true
+          obstacle_max_range: 5.0
+          obstacle_min_range: 0.15
+          raytrace_max_range: 5.5
+          raytrace_min_range: 0.15
+          min_obstacle_height: -0.1
+          max_obstacle_height: 1.0
+          expected_update_rate: 10.0
+          inf_is_valid: false
+          # Long persistence so the planner sees an obstacle long
+          # enough to reroute around it, even across the multi-second
+          # EscapeSequence cycle. Raytracing handles natural decay
+          # as the robot moves past obstacles.
+          observation_persistence: 30.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
