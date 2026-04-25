@@ -13,6 +13,11 @@
 #   sudo systemctl stop grunt
 #   sudo systemctl restart grunt
 #
+# Switch active property (cascades to missions_dir for all consumers):
+#   sudo grunt-set-property dallas_makerspace
+#   grunt-set-property --show
+# (Or manually: edit /etc/default/grunt, restart grunt.service.)
+#
 # Shutdown path: ExecStop parks the arm to the bumper preset and
 # publishes zero cmd_vel briefly. systemd then SIGTERMs the whole
 # cgroup (KillMode=control-group) — including p2os_driver, whose
@@ -49,13 +54,23 @@ Type=simple
 User=karim
 Group=karim
 Environment=GRUNT_PREFIX=grunt1
+Environment=GRUNT_PROPERTY=ranchero
 Environment=HOME=/home/karim
 WorkingDirectory=/home/karim/ros2_ws
+
+# Operator-controlled overrides live in /etc/default/grunt (standard
+# Linux pattern). Currently used to switch the active property:
+#   echo 'GRUNT_PROPERTY=dallas_makerspace' | sudo tee /etc/default/grunt
+#   sudo systemctl restart grunt
+# Or use the grunt-set-property helper script for the same effect.
+# Leading dash on the path: missing file is fine, fall back to the
+# Environment= defaults above.
+EnvironmentFile=-/etc/default/grunt
 
 # exec replaces the bash shell so systemd tracks the ros2 launch PID
 # directly. sourcing is inline because systemd's Environment= doesn't
 # run shell expansions.
-ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/karim/ros2_ws/install/setup.bash && exec ros2 launch grunt_bringup grunt.quiet.launch.py prefix:=${GRUNT_PREFIX} use_sonar:=True'
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/karim/ros2_ws/install/setup.bash && exec ros2 launch grunt_bringup grunt.quiet.launch.py prefix:=${GRUNT_PREFIX} property:=${GRUNT_PROPERTY} use_sonar:=True'
 
 ExecStop=/home/karim/ros2_ws/src/grunt/install/autostart/grunt_park_and_stop.sh ${GRUNT_PREFIX}
 

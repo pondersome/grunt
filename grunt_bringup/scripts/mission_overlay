@@ -22,6 +22,7 @@ projects into WGS84 tiles; an odom-frame pose has no geo meaning.
 Pose missions belong on the 3D panel with a MarkerArray overlay
 (separate tool).
 """
+import glob
 import json
 import os
 
@@ -29,6 +30,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 import yaml
 
 # foxglove_msgs is apt-installable as ros-jazzy-foxglove-msgs. Import
@@ -50,11 +52,13 @@ class MissionOverlay(Node):
         self.declare_parameter('show_topic', '~/show_mission')
         self.declare_parameter('geojson_topic', '~/geojson')
         self.declare_parameter('selected_mission_topic', '~/selected_mission')
+        self.declare_parameter('available_missions_topic', '~/available_missions')
 
         self.missions_dir = self.get_parameter('missions_dir').value
         show_topic = self.get_parameter('show_topic').value
         geojson_topic = self.get_parameter('geojson_topic').value
         selected_topic = self.get_parameter('selected_mission_topic').value
+        available_topic = self.get_parameter('available_missions_topic').value
 
         if not self.missions_dir:
             self.get_logger().fatal(
@@ -79,26 +83,89 @@ class MissionOverlay(Node):
         self.selected_pub = self.create_publisher(
             String, selected_topic, latched_qos)
 
+        # available_missions: latched JSON list of mission names found
+        # in missions_dir (no .yaml extension). Refreshed on every
+        # cycle service call and on every show_mission so the list
+        # reflects newly-recorded or newly-imported missions without
+        # a node restart. Foxglove can echo it via Topic Echo for
+        # debugging; the cycle services are the natural consumer.
+        self.available_pub = self.create_publisher(
+            String, available_topic, latched_qos)
+
         self.create_subscription(
             String, show_topic, self._on_show_mission, 10)
 
-        # Seed both topics with empty messages so latched subscriber
-        # state is defined — otherwise late subscribers see "topic
-        # exists but no message yet" and won't register the topic for
-        # auto-detection (Map panel) or selection (joy_commands).
+        # Cycle services let two Foxglove Call Service panels (next /
+        # previous) step through the available missions in sorted
+        # order. Each call: rescan the dir, advance/retreat the index,
+        # republish show_mission/selected/geojson for the new pick.
+        # Trigger-shaped because they have no input payload and the
+        # response is just "did we advance, and to what?".
+        self.create_service(
+            Trigger, '~/cycle_next', self._on_cycle_next)
+        self.create_service(
+            Trigger, '~/cycle_previous', self._on_cycle_previous)
+
+        # Index into the most-recent available_missions list. -1 means
+        # no selection yet; first cycle_next call lands on index 0.
+        self.cycle_index = -1
+        self.available_missions = []
+
+        # Seed all latched topics with empty/initial messages so late
+        # subscribers see a defined state.
+        self._refresh_available()
         self._publish_empty()
 
         self.get_logger().info(
             f'mission_overlay ready: missions_dir={self.missions_dir}, '
             f'show_topic={show_topic}, geojson_topic={geojson_topic}, '
-            f'selected_mission_topic={selected_topic}')
+            f'selected_mission_topic={selected_topic}, '
+            f'available_missions_topic={available_topic}, '
+            f'{len(self.available_missions)} missions found.')
+
+    def _refresh_available(self):
+        """Scan missions_dir for *.yaml files. Publishes a JSON-encoded
+        list (sorted) on available_pub. Returns the list. Cheap (~ms
+        for typical mission counts) — call on each cycle to pick up
+        new YAMLs without polling."""
+        try:
+            paths = glob.glob(os.path.join(self.missions_dir, '*.yaml'))
+        except OSError as e:
+            self.get_logger().warn(f'available scan failed: {e}')
+            paths = []
+        names = sorted(os.path.splitext(os.path.basename(p))[0] for p in paths)
+        self.available_missions = names
+        msg = String()
+        # JSON list — a Topic Echo panel renders cleanly, and the
+        # format is forward-compatible for richer payloads (ts/kind/etc).
+        msg.data = json.dumps(names)
+        self.available_pub.publish(msg)
+        return names
 
     def _on_show_mission(self, msg: String):
         name = msg.data.strip()
         if not name:
             self.get_logger().info('show_mission cleared')
+            self.cycle_index = -1
             self._publish_empty()
             return
+
+        # Sync the cycle index to what the operator just asked for, so
+        # next/prev advance from the right starting point — even when
+        # the trigger came from outside our cycle services (CLI pub,
+        # bt_runner-driven set, etc.).
+        names = self._refresh_available()
+        if name in names:
+            self.cycle_index = names.index(name)
+        else:
+            # Mission isn't in our directory — proceed with overlay/
+            # selection but warn. Stale missions or property mismatches
+            # are real situations; fail-quietly is worse than load-
+            # anyway-with-warning.
+            self.cycle_index = -1
+            self.get_logger().warn(
+                f"'{name}' not in available list ({len(names)} known). "
+                'Loading anyway from missions_dir.')
 
         path = os.path.join(self.missions_dir, f'{name}.yaml')
         try:
@@ -215,6 +282,41 @@ class MissionOverlay(Node):
         # clear (empty show_mission payload).
         self._publish_empty_geojson()
         self._publish_selected('')
+
+    def _show_by_index(self, idx: int) -> str:
+        """Refresh the list, clamp idx, run the selection plumbing,
+        return the chosen name (or '' on empty list)."""
+        names = self._refresh_available()
+        if not names:
+            self.get_logger().warn(
+                'No missions in directory — cycle has nothing to advance to.')
+            return ''
+        # Wrap on either end so cycling from end → start (and vice
+        # versa) is one click rather than dead-ending the operator.
+        idx = idx % len(names)
+        self.cycle_index = idx
+        chosen = names[idx]
+        # Reuse the existing show pipeline by publishing internally —
+        # avoids duplicating the load-and-publish flow per entry point.
+        synthetic = String()
+        synthetic.data = chosen
+        self._on_show_mission(synthetic)
+        return chosen
+
+    def _on_cycle_next(self, request, response):
+        chosen = self._show_by_index(self.cycle_index + 1)
+        response.success = bool(chosen)
+        response.message = chosen or 'no missions available'
+        return response
+
+    def _on_cycle_previous(self, request, response):
+        # First-ever cycle_previous (cycle_index == -1) lands on the
+        # last mission, which feels right for "step backward from
+        # nothing-selected".
+        chosen = self._show_by_index(self.cycle_index - 1)
+        response.success = bool(chosen)
+        response.message = chosen or 'no missions available'
+        return response
 
 
 def main(args=None):
