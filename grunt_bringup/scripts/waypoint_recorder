@@ -81,6 +81,13 @@ class WaypointRecorder(Node):
         # (resets each boot). Change to grunt1/map once an AMCL/SLAM
         # pipeline is providing a durable map→odom TF.
         self.declare_parameter('pose_frame', 'grunt1/odom')
+        # On save, push the just-recorded mission name to
+        # mission_overlay/show_mission so it becomes the operator's
+        # active selection. The Home button then dispatches the new
+        # recording without an extra cycle/publish step. Absolute path
+        # because mission_overlay lives in a sibling namespace.
+        self.declare_parameter(
+            'show_mission_topic', '/grunt1/mission_overlay/show_mission')
 
         self.missions_dir = self.get_parameter('missions_dir').value
         self.record_button = self.get_parameter('record_button').value
@@ -91,6 +98,7 @@ class WaypointRecorder(Node):
         mode_topic = self.get_parameter('mode_topic').value
         self.base_frame = self.get_parameter('base_frame').value
         self.pose_frame = self.get_parameter('pose_frame').value
+        show_mission_topic = self.get_parameter('show_mission_topic').value
 
         if not self.missions_dir:
             self.get_logger().fatal(
@@ -134,6 +142,12 @@ class WaypointRecorder(Node):
         else:
             self.get_logger().warn(
                 'ublox_msgs not available — h_acc will not be recorded.')
+
+        # Publisher for the new-recording-becomes-active flow. Plain
+        # 10-deep queue is fine — we publish once per save event and
+        # mission_overlay's subscription is reliable.
+        self.show_mission_pub = self.create_publisher(
+            String, show_mission_topic, 10)
 
         # Latched mode subscription — TRANSIENT_LOCAL matches the
         # publisher in nav_mode_switcher so we see the current mode
@@ -324,6 +338,16 @@ class WaypointRecorder(Node):
             f'Saved mission "{self.current_name}" '
             f'(kind={self.recording_kind}, {len(self.waypoints)} waypoints) '
             f'to {path}')
+
+        # Promote the just-saved recording to the active selection so
+        # the operator can press Home and dispatch it without an extra
+        # cycle/publish step. mission_overlay handles GPS vs pose
+        # uniformly: GPS missions get the path on the Map panel, pose
+        # missions clear the Map overlay (3D panel is the right place
+        # for those — separate tool).
+        show_msg = String()
+        show_msg.data = self.current_name
+        self.show_mission_pub.publish(show_msg)
 
         # Reset for the next recording.
         self.current_name = None
