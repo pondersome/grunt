@@ -180,7 +180,7 @@ def generate_launch_description():
         DeclareLaunchArgument('Wifi', default_value='1', description='Start isr_wifi connected-link telemetry + pose-correlated sampler'),
         DeclareLaunchArgument('wifi_interface', default_value='wlo1', description='Linux wireless interface for the primary operational link'),
         DeclareLaunchArgument('WifiSwitcher', default_value='true', description='Enable the Phase 1.5 resiliency switcher (one-way fallback via nmcli)'),
-        DeclareLaunchArgument('property', default_value='ranchero', description='Active property name. Mission YAMLs are read/written under grunt_missions/properties/<property>/.'),
+        DeclareLaunchArgument('site', default_value='ranchero', description='Active site name. Mission YAMLs are read/written under grunt_missions/sites/<site>/.'),
         DeclareLaunchArgument('grunt_missions_root', default_value=os.path.expanduser('~/ros2_ws/grunt_missions'), description='Root of the grunt_missions repo'),
         DeclareLaunchArgument('KeyboardTeleop', default_value='0', description='Start keyboard driven teleop'),
         DeclareLaunchArgument('JoystickTeleop', default_value='1', description='Start joystick driven teleop'),
@@ -328,15 +328,15 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('Localization'))
     )
 
-    # Active property's mission directory:
-    #   <grunt_missions_root>/properties/<property>/
+    # Active site's mission directory:
+    #   <grunt_missions_root>/sites/<site>/
     # Both the BT runner (loads missions to dispatch) and the
     # waypoint_recorder (writes new ones) share this path. Operator's
     # macro button "play latest" also scans this dir.
     missions_dir = PathJoinSubstitution([
         LaunchConfiguration('grunt_missions_root'),
-        'properties',
-        LaunchConfiguration('property'),
+        'sites',
+        LaunchConfiguration('site'),
     ])
 
     # Joystick commands: e-stop, mission dispatch, cal reset. Deliberately

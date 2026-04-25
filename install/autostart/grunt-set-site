@@ -1,27 +1,28 @@
 #!/usr/bin/env bash
-# grunt-set-property — switch the active grunt property and restart the stack.
+# grunt-set-site — switch the active grunt site and restart the stack.
 #
-# Property is the per-site folder name under <grunt_missions>/properties/<name>/.
-# Switching reloads grunt.service and (via BindsTo) grunt-nav@<mode>.service,
-# so all consumers (bt_runner, waypoint_recorder, mission_overlay, joy_estop)
-# pick up the new missions_dir on the next start.
+# A site is a per-deployment folder name under
+# <grunt_missions>/sites/<name>/. Switching reloads grunt.service and
+# (via BindsTo) grunt-nav@<mode>.service, so all consumers (bt_runner,
+# waypoint_recorder, mission_overlay, joy_estop) pick up the new
+# missions_dir on the next start.
 #
 # Usage:
-#   grunt-set-property <property_name>
-#   grunt-set-property --show
+#   grunt-set-site <site_name>
+#   grunt-set-site --show
 #
 # Examples:
-#   sudo grunt-set-property dallas_makerspace
-#   grunt-set-property --show     # prints the currently-set property
+#   sudo grunt-set-site dallas_makerspace
+#   grunt-set-site --show     # prints the currently-set site
 #
-# Implementation: rewrites /etc/default/grunt with GRUNT_PROPERTY=<name>,
+# Implementation: rewrites /etc/default/grunt with GRUNT_SITE=<name>,
 # then `systemctl restart grunt.service`. ~30s of nav downtime per switch
 # is the same cost as any planned grunt restart.
 #
 # Install:
 #   sudo install -m 0755 \
-#     /home/karim/ros2_ws/src/grunt/install/autostart/grunt-set-property \
-#     /usr/local/bin/grunt-set-property
+#     /home/karim/ros2_ws/src/grunt/install/autostart/grunt-set-site \
+#     /usr/local/bin/grunt-set-site
 
 set -euo pipefail
 
@@ -30,25 +31,25 @@ SERVICE=grunt.service
 
 show_current() {
   # Single source, in precedence order:
-  #   1. /etc/default/grunt override (what grunt-set-property writes).
+  #   1. /etc/default/grunt override (what grunt-set-site writes).
   #   2. The unit's static Environment= default (used when the override
-  #      file is absent or doesn't set GRUNT_PROPERTY).
+  #      file is absent or doesn't set GRUNT_SITE).
   # Note: `systemctl show -p Environment` reports only the unit's
   # static Environment= directives, NOT the resolved value after
   # EnvironmentFile is applied. So we can't trust it as "what's
   # actually running" — we have to combine sources ourselves.
   if [[ -f "$ENV_FILE" ]]; then
     local from_file
-    from_file=$(grep -E '^GRUNT_PROPERTY=' "$ENV_FILE" \
-      | tail -1 | sed 's/^GRUNT_PROPERTY=//' || true)
+    from_file=$(grep -E '^GRUNT_SITE=' "$ENV_FILE" \
+      | tail -1 | sed 's/^GRUNT_SITE=//' || true)
     if [[ -n "$from_file" ]]; then
       echo "$from_file"
       return
     fi
   fi
   systemctl show -p Environment "$SERVICE" 2>/dev/null \
-    | tr ' ' '\n' | grep '^GRUNT_PROPERTY=' \
-    | head -1 | sed 's/^GRUNT_PROPERTY=//'
+    | tr ' ' '\n' | grep '^GRUNT_SITE=' \
+    | head -1 | sed 's/^GRUNT_SITE=//'
 }
 
 if [[ "${1:-}" == "--show" || "${1:-}" == "-s" ]]; then
@@ -58,17 +59,17 @@ if [[ "${1:-}" == "--show" || "${1:-}" == "-s" ]]; then
 fi
 
 if [[ $# -ne 1 || "${1:-}" =~ ^- ]]; then
-  echo "Usage: $0 <property_name> | --show" >&2
+  echo "Usage: $0 <site_name> | --show" >&2
   exit 2
 fi
 
-property="$1"
+site="$1"
 
-# Sanity: property must look like a directory name. No slashes, no dots
-# leading. Loose pattern — properties_root/<property> is the only path
-# that actually constrains this.
-if ! [[ "$property" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]; then
-  echo "Refusing: '$property' doesn't look like a property folder name." >&2
+# Sanity: site must look like a directory name. No slashes, no dots
+# leading. Loose pattern — sites_root/<site> is the only path that
+# actually constrains this.
+if ! [[ "$site" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]; then
+  echo "Refusing: '$site' doesn't look like a site folder name." >&2
   echo "Expected [A-Za-z0-9_][A-Za-z0-9_-]*" >&2
   exit 2
 fi
@@ -83,14 +84,14 @@ fi
 tmp=$(mktemp /etc/default/grunt.XXXXXX)
 trap 'rm -f "$tmp"' EXIT
 {
-  echo "# Managed by grunt-set-property; edits are preserved across upgrades."
-  echo "GRUNT_PROPERTY=$property"
+  echo "# Managed by grunt-set-site; edits are preserved across upgrades."
+  echo "GRUNT_SITE=$site"
 } > "$tmp"
 chmod 0644 "$tmp"
 mv "$tmp" "$ENV_FILE"
 trap - EXIT
 
-echo "Set GRUNT_PROPERTY=$property in $ENV_FILE"
+echo "Set GRUNT_SITE=$site in $ENV_FILE"
 echo "Restarting $SERVICE..."
 systemctl restart "$SERVICE"
 echo "Done. Stack restarting; allow ~30s for Nav2 to re-activate."

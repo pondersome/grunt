@@ -10,7 +10,7 @@ operator workflow:
   3. Press the macro button — this script picks that fresh recording
      and dispatches it via start_mission.
 
-Stupid by design: no schema awareness, no property concept here. The
+Stupid by design: no schema awareness, no site concept here. The
 caller chose missions_dir; the latest .yaml in it wins. Replace with
 something more functional (UI panel, mission picker) when the
 record-then-play workflow outgrows it.

@@ -159,7 +159,7 @@ class MissionOverlay(Node):
             self.cycle_index = names.index(name)
         else:
             # Mission isn't in our directory — proceed with overlay/
-            # selection but warn. Stale missions or property mismatches
+            # selection but warn. Stale missions or site mismatches
             # are real situations; fail-quietly is worse than load-
             # anyway-with-warning.
             self.cycle_index = -1
