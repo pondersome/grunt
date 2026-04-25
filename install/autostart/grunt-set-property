@@ -29,13 +29,26 @@ ENV_FILE=/etc/default/grunt
 SERVICE=grunt.service
 
 show_current() {
+  # Single source, in precedence order:
+  #   1. /etc/default/grunt override (what grunt-set-property writes).
+  #   2. The unit's static Environment= default (used when the override
+  #      file is absent or doesn't set GRUNT_PROPERTY).
+  # Note: `systemctl show -p Environment` reports only the unit's
+  # static Environment= directives, NOT the resolved value after
+  # EnvironmentFile is applied. So we can't trust it as "what's
+  # actually running" — we have to combine sources ourselves.
   if [[ -f "$ENV_FILE" ]]; then
-    grep -E '^GRUNT_PROPERTY=' "$ENV_FILE" | sed 's/^GRUNT_PROPERTY=//' || true
+    local from_file
+    from_file=$(grep -E '^GRUNT_PROPERTY=' "$ENV_FILE" \
+      | tail -1 | sed 's/^GRUNT_PROPERTY=//' || true)
+    if [[ -n "$from_file" ]]; then
+      echo "$from_file"
+      return
+    fi
   fi
-  # Fall back to whatever the running service inherited.
   systemctl show -p Environment "$SERVICE" 2>/dev/null \
-    | tr ' ' '\n' | grep '^GRUNT_PROPERTY=' | sed 's/^GRUNT_PROPERTY=//' \
-    | head -1 || true
+    | tr ' ' '\n' | grep '^GRUNT_PROPERTY=' \
+    | head -1 | sed 's/^GRUNT_PROPERTY=//'
 }
 
 if [[ "${1:-}" == "--show" || "${1:-}" == "-s" ]]; then
