@@ -182,6 +182,11 @@ def generate_launch_description():
         DeclareLaunchArgument('WifiSwitcher', default_value='true', description='Enable the Phase 1.5 resiliency switcher (one-way fallback via nmcli)'),
         DeclareLaunchArgument('site', default_value='ranchero', description='Active site name. Mission YAMLs are read/written under grunt_missions/sites/<site>/.'),
         DeclareLaunchArgument('grunt_missions_root', default_value=os.path.expanduser('~/ros2_ws/grunt_missions'), description='Root of the grunt_missions repo'),
+        # NTRIP mountpoint. Until site→mountpoint mapping ships,
+        # operator passes via launch arg or via GRUNT_NTRIP_MOUNTPOINT
+        # env var in /etc/default/grunt (grunt.service ExecStart routes
+        # the env var here).
+        DeclareLaunchArgument('mountpoint', default_value='KubotaCentral', description='NTRIP caster mountpoint to pull RTCM corrections from. Site-specific.'),
         DeclareLaunchArgument('KeyboardTeleop', default_value='0', description='Start keyboard driven teleop'),
         DeclareLaunchArgument('JoystickTeleop', default_value='1', description='Start joystick driven teleop'),
         # P2OS velocity and acceleration limits
@@ -436,7 +441,8 @@ def generate_launch_description():
                 # Alert that there is a namespace applied, so we don't duplicate it in the target launch file
                 launch_arguments={
                     'prefix':LaunchConfiguration('prefix'),
-                    'group':'rtk' #re-assert group since we'd set it to ""
+                    'group':'rtk', #re-assert group since we'd set it to ""
+                    'mountpoint': LaunchConfiguration('mountpoint'),
                 }.items()
             )
         ],

@@ -55,6 +55,10 @@ User=karim
 Group=karim
 Environment=GRUNT_PREFIX=grunt1
 Environment=GRUNT_SITE=ranchero
+# NTRIP caster mountpoint for RTCM corrections. Override per site
+# in /etc/default/grunt — eventually replaced by a site→mountpoint
+# map (PRD: ponderdocs/nav/docs/prd_ntrip_mountpoint_switching.md).
+Environment=GRUNT_NTRIP_MOUNTPOINT=KubotaCentral
 Environment=HOME=/home/karim
 WorkingDirectory=/home/karim/ros2_ws
 
@@ -70,7 +74,7 @@ EnvironmentFile=-/etc/default/grunt
 # exec replaces the bash shell so systemd tracks the ros2 launch PID
 # directly. sourcing is inline because systemd's Environment= doesn't
 # run shell expansions.
-ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/karim/ros2_ws/install/setup.bash && exec ros2 launch grunt_bringup grunt.quiet.launch.py prefix:=${GRUNT_PREFIX} site:=${GRUNT_SITE} use_sonar:=True'
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/karim/ros2_ws/install/setup.bash && exec ros2 launch grunt_bringup grunt.quiet.launch.py prefix:=${GRUNT_PREFIX} site:=${GRUNT_SITE} mountpoint:=${GRUNT_NTRIP_MOUNTPOINT} use_sonar:=True'
 
 ExecStop=/home/karim/ros2_ws/src/grunt/install/autostart/grunt_park_and_stop.sh ${GRUNT_PREFIX}
 
