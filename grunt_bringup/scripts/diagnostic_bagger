@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Mission-triggered diagnostic bag recorder.
+
+Watches /<prefix>/bt_runner/active_behavior. When it transitions into a
+mission state ("run_gps_mission" or "run_pose_mission"), spawns
+`ros2 bag record` as a subprocess capturing a curated diagnostic topic
+list. When the active behavior leaves the mission state, terminates
+the recorder cleanly.
+
+Bags land at: <bag_root>/<YYYY-MM-DD_HH-MM-SS>_<mission_kind>/
+
+For ad-hoc bagging outside missions (teleop debugging, etc.) just use
+`ros2 bag record -a` directly — this node is mission-scoped on purpose.
+"""
+import os
+import signal
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
+
+from std_msgs.msg import String
+
+
+# Curated diagnostic topic list. Prefix is substituted at startup.
+TOPIC_TEMPLATES = [
+    # GPS / RTK / localization (primary suspects under tree coverage)
+    '/{prefix}/rtk/fix',
+    '/{prefix}/rtk/fix_gated',
+    '/{prefix}/rtk/navpvt',
+    '/{prefix}/localization/status',
+    '/{prefix}/odometry/local',
+    '/{prefix}/odometry/global',
+    '/{prefix}/odometry/gps',
+    '/{prefix}/odometry/gps_map',
+
+    # TF
+    '/tf',
+    '/tf_static',
+
+    # Nav2 plans + costmap (subscribe + sparse updates)
+    '/{prefix}/plan',
+    '/{prefix}/received_global_plan',
+    '/{prefix}/local_plan',
+    '/{prefix}/global_costmap/costmap',
+    '/{prefix}/global_costmap/costmap_updates',
+    '/{prefix}/local_costmap/costmap',
+    '/{prefix}/local_costmap/costmap_updates',
+
+    # RPP observables (controller_server publishes these by default)
+    '/{prefix}/lookahead_point',         # carrot — single point ~lookahead_dist ahead
+    '/{prefix}/lookahead_collision_arc', # arc RPP would commit to at current curvature
+
+    # MPPI observable (only published indoor with MPPI controller; harmless when absent)
+    '/{prefix}/optimal_trajectory',
+
+    # Velocity chain
+    '/{prefix}/cmd_vel',
+    '/{prefix}/cmd_vel_nav',
+    '/{prefix}/cmd_vel_nav_raw',
+    '/{prefix}/cmd_vel_joy',
+
+    # Recovery + safety state
+    '/{prefix}/bt_runner/active_behavior',
+    '/{prefix}/bt_runner/armed',
+    '/{prefix}/nav/collision_monitor_state',
+    '/{prefix}/sonar/cloud',
+    '/{prefix}/nav/mode',
+
+    # Mission state
+    '/{prefix}/mission_overlay/selected_mission',
+
+    # Action lifecycle (when did Nav2 think it was done? when did it ABORT?)
+    # Including _action/goal so the bag self-documents what each action was told
+    # to do (waypoint coordinates, escape distances/angles, etc.).
+    '/{prefix}/follow_gps_waypoints/_action/goal',
+    '/{prefix}/follow_gps_waypoints/_action/status',
+    '/{prefix}/follow_gps_waypoints/_action/feedback',
+    '/{prefix}/navigate_to_pose/_action/goal',
+    '/{prefix}/navigate_to_pose/_action/status',
+    '/{prefix}/navigate_to_pose/_action/feedback',
+    '/{prefix}/backup/_action/goal',
+    '/{prefix}/backup/_action/status',
+    '/{prefix}/backup/_action/feedback',
+    '/{prefix}/spin/_action/goal',
+    '/{prefix}/spin/_action/status',
+    '/{prefix}/spin/_action/feedback',
+    '/{prefix}/drive_on_heading/_action/goal',
+    '/{prefix}/drive_on_heading/_action/status',
+    '/{prefix}/drive_on_heading/_action/feedback',
+
+    # IMU + joy
+    '/{prefix}/bno055/imu',
+    '/joy',
+]
+
+MISSION_BEHAVIORS = {'run_gps_mission', 'run_pose_mission'}
+
+
+class DiagnosticBagger(Node):
+    def __init__(self):
+        super().__init__('diagnostic_bagger')
+
+        self.declare_parameter('prefix', 'grunt1')
+        self.declare_parameter('bag_root', os.path.expanduser('~/grunt_bags'))
+
+        self.prefix = self.get_parameter('prefix').value
+        self.bag_root = Path(self.get_parameter('bag_root').value)
+        self.bag_root.mkdir(parents=True, exist_ok=True)
+
+        self.topics = [t.format(prefix=self.prefix) for t in TOPIC_TEMPLATES]
+
+        self.proc = None
+        self.current_bag = None
+        self.last_behavior = ''
+
+        # active_behavior is transient_local depth 1 in bt_runner so
+        # we'll pick up the current state on subscribe.
+        latched = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            String,
+            f'/{self.prefix}/bt_runner/active_behavior',
+            self._on_behavior, latched)
+
+        self.get_logger().info(
+            f'diagnostic_bagger ready: prefix={self.prefix}, '
+            f'bag_root={self.bag_root}')
+
+    def _on_behavior(self, msg: String):
+        behavior = msg.data
+        if behavior == self.last_behavior:
+            return
+        prev, self.last_behavior = self.last_behavior, behavior
+
+        in_mission = behavior in MISSION_BEHAVIORS
+        was_in_mission = prev in MISSION_BEHAVIORS
+
+        if in_mission and not was_in_mission:
+            self._start_bag(behavior)
+        elif was_in_mission and not in_mission:
+            self._stop_bag()
+
+    def _start_bag(self, behavior: str):
+        if self.proc is not None:
+            self.get_logger().warn('bag already running, skipping start')
+            return
+
+        ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        self.current_bag = self.bag_root / f'{ts}_{behavior}'
+        cmd = ['ros2', 'bag', 'record', '-o', str(self.current_bag)] + self.topics
+
+        self.get_logger().info(f'starting bag: {self.current_bag}')
+        # start_new_session so signals to our process group don't reach
+        # the bag — we control its lifecycle independently.
+        self.proc = subprocess.Popen(
+            cmd, start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _stop_bag(self):
+        if self.proc is None:
+            return
+        self.get_logger().info(f'stopping bag: {self.current_bag}')
+        try:
+            self.proc.send_signal(signal.SIGINT)
+            self.proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            self.get_logger().warn(
+                'bag did not stop within 10s, sending SIGTERM')
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
+        self.current_bag = None
+
+    def destroy_node(self):
+        self._stop_bag()
+        super().destroy_node()
+
+
+def main():
+    rclpy.init()
+    node = DiagnosticBagger()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

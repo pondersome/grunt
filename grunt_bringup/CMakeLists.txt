@@ -26,6 +26,7 @@ install(PROGRAMS
   scripts/play_latest_mission
   scripts/kml_import
   scripts/mission_overlay
+  scripts/diagnostic_bagger
   DESTINATION lib/${PROJECT_NAME}
 )
 
