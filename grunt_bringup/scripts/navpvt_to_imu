@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Republish u-blox NavPVT heading-of-motion as an IMU-typed yaw observation
+for fusion into the global EKF.
+
+Why: the supervisor's drive_calibration is a one-shot heading source that
+bakes whatever chord-direction it measured during cal. Property tilt makes
+the cal arc curve, and the chord under-rotates by ~10-15° vs the chassis
+tangent at the start. Without a continuous yaw correction signal, the EKF
+carries that bias for the rest of the run, manifesting as RPP wandering.
+
+NavPVT.heading_of_motion is u-blox's course-over-ground at sub-degree
+accuracy when ground speed exceeds ~0.2 m/s with RTK. Plumbing it as an
+absolute yaw observation washes out drive-cal error within a few meters
+of forward motion.
+
+Output frame: ENU (REP-103). NavPVT heading is degrees clockwise from
+true north (NED-style); converted via yaw_enu = π/2 − rad(headMot).
+
+Gates:
+  - g_speed >= min_speed_mps     (heading-of-motion noisy at low speed)
+  - heading_accuracy <= max_head_acc_deg
+  - carrier_phase >= min_carrier (FLOAT or FIXED)
+
+Spin/escape behavior: in-place rotations drive g_speed to ~0, gate
+excludes those moments, EKF falls back to gyro for the rotation. Correct.
+"""
+import math
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Imu
+from ublox_msgs.msg import NavPVT
+
+
+# u-blox NavPVT scale factors
+DEG_PER_UNIT = 1e-5  # heading and head_acc are in degrees * 1e-5
+MM_PER_M = 1e-3      # g_speed and s_acc are in mm/s
+
+# NavPVT.flags carrier_phase is bits 6-7 of the flags byte
+CARRIER_NONE = 0
+CARRIER_FLOAT = 1
+CARRIER_FIXED = 2
+
+# Roll/pitch covariance for "yaw only" — large but finite to avoid solver
+# issues with strict infinities
+BIG = 1e6
+
+
+class NavPvtToImu(Node):
+    def __init__(self):
+        super().__init__('navpvt_to_imu')
+
+        self.declare_parameter('input_topic', 'rtk/navpvt')
+        self.declare_parameter('output_topic', 'rtk/heading_imu')
+        self.declare_parameter('frame_id', 'base_link')
+        # Gates — tunable so they can chase the real operating envelope
+        # as collision avoidance and recovery are dialed in. Today's
+        # 0.2 m/s default tracks RPP's outdoor desired_linear_vel of 0.3
+        # under experimental safety caps; top speed could reach the
+        # firmware limit (1.5 m/s transveltop) later.
+        self.declare_parameter('min_speed_mps', 0.2)
+        self.declare_parameter('max_head_acc_deg', 3.0)
+        self.declare_parameter('min_carrier', CARRIER_FLOAT)
+
+        self.frame_id = self.get_parameter('frame_id').value
+        self.min_speed = float(self.get_parameter('min_speed_mps').value)
+        self.max_head_acc = float(self.get_parameter('max_head_acc_deg').value)
+        self.min_carrier = int(self.get_parameter('min_carrier').value)
+
+        self.pub = self.create_publisher(
+            Imu, self.get_parameter('output_topic').value, 10)
+        self.create_subscription(
+            NavPVT, self.get_parameter('input_topic').value,
+            self._on_navpvt, 10)
+
+        # Live re-tune
+        self.add_on_set_parameters_callback(self._on_param_change)
+
+        # Gate stats — logged every 10s for tuning from journalctl
+        self.n_published = 0
+        self.n_gated_speed = 0
+        self.n_gated_head_acc = 0
+        self.n_gated_carrier = 0
+        self.create_timer(10.0, self._log_stats)
+
+        self.get_logger().info(
+            f'navpvt_to_imu ready: gates speed≥{self.min_speed} m/s, '
+            f'head_acc≤{self.max_head_acc}°, '
+            f'carrier≥{self.min_carrier} (1=FLOAT, 2=FIXED)')
+
+    def _on_navpvt(self, m: NavPVT):
+        carrier = (int(m.flags) >> 6) & 0x03
+        speed_mps = m.g_speed * MM_PER_M
+        head_deg_ned = m.heading * DEG_PER_UNIT
+        head_acc_deg = m.head_acc * DEG_PER_UNIT
+
+        # Gate order: cheapest first
+        if carrier < self.min_carrier:
+            self.n_gated_carrier += 1
+            return
+        if speed_mps < self.min_speed:
+            self.n_gated_speed += 1
+            return
+        if head_acc_deg > self.max_head_acc or head_acc_deg <= 0.0:
+            self.n_gated_head_acc += 1
+            return
+
+        # NED → ENU. NavPVT heading is degrees CW from true north.
+        # ENU yaw is radians CCW from east. They relate via:
+        #   yaw_enu = π/2 − radians(head_ned)
+        yaw_enu = math.pi / 2.0 - math.radians(head_deg_ned)
+        # Wrap to [-π, π]
+        yaw_enu = math.atan2(math.sin(yaw_enu), math.cos(yaw_enu))
+
+        msg = Imu()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.frame_id
+
+        # Quaternion from yaw only (roll = pitch = 0)
+        msg.orientation.x = 0.0
+        msg.orientation.y = 0.0
+        msg.orientation.z = math.sin(yaw_enu / 2.0)
+        msg.orientation.w = math.cos(yaw_enu / 2.0)
+
+        # Covariance is row-major 3x3 over [roll, pitch, yaw].
+        # Roll/pitch unknown (BIG); yaw variance from u-blox head_acc.
+        yaw_var_rad2 = math.radians(head_acc_deg) ** 2
+        msg.orientation_covariance = [
+            BIG, 0.0, 0.0,
+            0.0, BIG, 0.0,
+            0.0, 0.0, yaw_var_rad2,
+        ]
+        # Convention: [0] = -1 signals "this field not provided"
+        msg.angular_velocity_covariance = [-1.0] + [0.0] * 8
+        msg.linear_acceleration_covariance = [-1.0] + [0.0] * 8
+
+        self.pub.publish(msg)
+        self.n_published += 1
+
+    def _log_stats(self):
+        total = (self.n_published + self.n_gated_speed
+                 + self.n_gated_head_acc + self.n_gated_carrier)
+        if total == 0:
+            return
+        self.get_logger().info(
+            f'navpvt_to_imu: pub={self.n_published} '
+            f'gated[speed={self.n_gated_speed} '
+            f'head_acc={self.n_gated_head_acc} '
+            f'carrier={self.n_gated_carrier}] '
+            f'over {total} navpvt msgs (~10s)')
+        self.n_published = 0
+        self.n_gated_speed = 0
+        self.n_gated_head_acc = 0
+        self.n_gated_carrier = 0
+
+    def _on_param_change(self, params):
+        from rcl_interfaces.msg import SetParametersResult
+        for p in params:
+            if p.name == 'min_speed_mps':
+                self.min_speed = float(p.value)
+                self.get_logger().info(f'min_speed_mps -> {self.min_speed}')
+            elif p.name == 'max_head_acc_deg':
+                self.max_head_acc = float(p.value)
+                self.get_logger().info(f'max_head_acc_deg -> {self.max_head_acc}')
+            elif p.name == 'min_carrier':
+                self.min_carrier = int(p.value)
+                self.get_logger().info(f'min_carrier -> {self.min_carrier}')
+        return SetParametersResult(successful=True)
+
+
+def main():
+    rclpy.init()
+    node = NavPvtToImu()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

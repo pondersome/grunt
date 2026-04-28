@@ -93,6 +93,26 @@ def create_localization_nodes(context, *args, **kwargs):
         ],
     )
 
+    # navpvt_to_imu: republishes u-blox course-over-ground heading as a
+    # yaw-only IMU observation for the global EKF to fuse. Eliminates the
+    # one-shot drive-cal heading bias that compounds into wandering when
+    # cal happens on tilted ground.
+    navpvt_heading_node = Node(
+        package='grunt_bringup',
+        executable='navpvt_to_imu',
+        name='navpvt_to_imu',
+        parameters=[{
+            'frame_id': base_link_frame,
+            'min_speed_mps': 0.2,
+            'max_head_acc_deg': 3.0,
+            'min_carrier': 1,  # 1=FLOAT, 2=FIXED
+        }],
+        remappings=[
+            ('rtk/navpvt', f'/{prefix}/rtk/navpvt'),
+            ('rtk/heading_imu', f'/{prefix}/rtk/heading_imu'),
+        ],
+    )
+
     # Localization supervisor: monitors sensor readiness, publishes status
     supervisor_node = Node(
         package='grunt_bringup',
@@ -108,6 +128,11 @@ def create_localization_nodes(context, *args, **kwargs):
             'allow_re_datum': True,
             're_datum_cooldown': 30.0,
             'map_frame': map_frame,
+            # Optional per-site config file. If present, the supervisor reads
+            # anchor_lat/anchor_lon and uses those for the /datum call instead
+            # of wherever the robot happens to be at calibration time. Stable
+            # cross-run map origin. Empty string disables.
+            'site_config': LaunchConfiguration('site_config').perform(context),
         }],
         remappings=[
             ('rtk/fix', f'/{prefix}/rtk/fix'),
@@ -117,7 +142,8 @@ def create_localization_nodes(context, *args, **kwargs):
         ],
     )
 
-    return [ekf_local_node, navsat_node, ekf_global_node, supervisor_node]
+    return [ekf_local_node, navsat_node, ekf_global_node,
+            navpvt_heading_node, supervisor_node]
 
 
 def generate_launch_description():
@@ -136,6 +162,11 @@ def generate_launch_description():
             'gps_h_acc_cal_threshold_m',
             default_value='0.5',
             description='Max horizontal accuracy (m) for heading calibration start/end'
+        ),
+        DeclareLaunchArgument(
+            'site_config',
+            default_value='',
+            description='Path to per-site site.yaml (anchor_lat/anchor_lon). Empty = use first GPS fix as datum (legacy).'
         ),
         OpaqueFunction(function=create_localization_nodes),
     ])

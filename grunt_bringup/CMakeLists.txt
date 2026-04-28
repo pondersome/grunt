@@ -27,6 +27,7 @@ install(PROGRAMS
   scripts/kml_import
   scripts/mission_overlay
   scripts/diagnostic_bagger
+  scripts/navpvt_to_imu
   DESTINATION lib/${PROJECT_NAME}
 )
 

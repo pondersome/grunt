@@ -48,7 +48,8 @@
       odom1_pose_rejection_threshold: 20.0
 
       # imu0: BNO055 IMU — absolute roll/pitch + angular velocities
-      # NO yaw — heading evolves from wheel vyaw + GPS position coupling
+      # NO yaw — heading evolves from wheel vyaw + GPS position coupling +
+      # imu1 (NavPVT-derived) absolute yaw correction below.
       imu0: imu/data
       imu0_config: [false, false, false,  # x, y, z
                      true,  true,  false,  # roll, pitch — absolute, NO yaw
@@ -59,6 +60,26 @@
       imu0_relative: false
       imu0_remove_gravitational_acceleration: false
 
+      # imu1: NavPVT-derived heading-of-motion as absolute yaw observation.
+      # Published by navpvt_to_imu when the robot's ground speed clears
+      # the gate threshold and RTK is at FLOAT or better. Eliminates the
+      # one-shot drive-cal heading bias that compounds into wandering on
+      # tilted cal locations. See ponderdocs/nav for the diagnosis.
+      imu1: rtk/heading_imu
+      imu1_config: [false, false, false,  # x, y, z
+                     false, false, true,   # roll, pitch, yaw — yaw ONLY
+                     false, false, false,  # vx, vy, vz
+                     false, false, false,  # vroll, vpitch, vyaw
+                     false, false, false]  # ax, ay, az
+      imu1_differential: false
+      imu1_relative: false
+      imu1_queue_size: 10
+      imu1_remove_gravitational_acceleration: false
+      # Mahalanobis gate: rejects observations more than this many sigma
+      # away from the EKF prior. Loose initial value; tighten after first
+      # field run if false-positive rejections aren't an issue.
+      imu1_pose_rejection_threshold: 5.0
+
       # Process noise — from canonical example
       # NOTE: x,y are 10.0 — very high process noise makes the filter strongly
       # trust GPS over dead reckoning. Matches the weihsinc config (Xsens+Garmin).
@@ -67,7 +88,7 @@
                                  0.0,  0.0,  1e-3,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                  0.0,  0.0,  0.0,  0.3,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                  0.0,  0.0,  0.0,  0.0,  0.3,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
-                                 0.0,  0.0,  0.0,  0.0,  0.0,  0.01,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                                 0.0,  0.0,  0.0,  0.0,  0.0,  0.1,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.5,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.5,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.1,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,

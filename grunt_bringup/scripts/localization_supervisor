@@ -27,6 +27,9 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geographic_msgs.msg import GeoPose, GeoPoint
 from geometry_msgs.msg import Quaternion, PoseWithCovarianceStamped
 
+import os
+import yaml
+
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
 
 # NavPVT imported with try/except in case ublox_msgs isn't sourced
@@ -104,6 +107,11 @@ class LocalizationSupervisor(Node):
         self.declare_parameter('gps_h_acc_threshold_m', 0.5)
         self.declare_parameter('gps_h_acc_cal_threshold_m', 0.5)  # max h_acc for drive cal start/end
         self.declare_parameter('map_frame', 'map')
+        # Optional path to per-site site.yaml. If present and contains
+        # anchor_lat/anchor_lon, those are used for /datum instead of the
+        # robot's current GPS — keeps map-frame origin geographically
+        # stable across runs. Empty string = legacy (current fix as datum).
+        self.declare_parameter('site_config', '')
 
         self.gps_quality_threshold = self.get_parameter('gps_quality_threshold').value
         self.heading_cal_distance = self.get_parameter('heading_calibration_distance').value
@@ -114,6 +122,13 @@ class LocalizationSupervisor(Node):
         self.gps_h_acc_threshold = self.get_parameter('gps_h_acc_threshold_m').value
         self.gps_h_acc_cal_threshold = self.get_parameter('gps_h_acc_cal_threshold_m').value
         self.map_frame = self.get_parameter('map_frame').value
+
+        # Load per-site GPS anchor (if site.yaml is present and well-formed)
+        self.anchor_lat = None
+        self.anchor_lon = None
+        site_config_path = self.get_parameter('site_config').value
+        if site_config_path:
+            self._load_site_config(site_config_path)
 
         # Allow runtime parameter changes via ros2 param set
         self.add_on_set_parameters_callback(self._on_param_change)
@@ -571,6 +586,38 @@ class LocalizationSupervisor(Node):
 
     # ── Datum Management ──
 
+    def _load_site_config(self, path):
+        """Read site.yaml and pull anchor_lat/anchor_lon if present.
+
+        Missing or malformed file → log warning and fall back to legacy
+        behavior (use first GPS fix as datum). Operator can survey the
+        anchor at a known feature once and reuse across runs.
+        """
+        if not os.path.exists(path):
+            self.get_logger().warn(
+                f'site_config={path} not found; '
+                f'falling back to first GPS fix as datum')
+            return
+        try:
+            with open(path, 'r') as f:
+                cfg = yaml.safe_load(f) or {}
+            lat = cfg.get('anchor_lat')
+            lon = cfg.get('anchor_lon')
+            if lat is None or lon is None:
+                self.get_logger().warn(
+                    f'site_config={path} missing anchor_lat/anchor_lon; '
+                    f'falling back to first GPS fix as datum')
+                return
+            self.anchor_lat = float(lat)
+            self.anchor_lon = float(lon)
+            self.get_logger().info(
+                f'site anchor loaded from {path}: '
+                f'lat={self.anchor_lat:.9f}, lon={self.anchor_lon:.9f}')
+        except Exception as e:
+            self.get_logger().error(
+                f'failed to parse site_config={path}: {e}; '
+                f'falling back to first GPS fix as datum')
+
     def _try_set_datum(self):
         if self.datum_pending:
             return
@@ -580,10 +627,21 @@ class LocalizationSupervisor(Node):
             self.get_logger().warn('Datum service not available, waiting...')
             return
 
+        # Use site anchor if configured; otherwise use current GPS fix.
+        # The anchor gives a stable map-frame origin across runs (any saved
+        # static-map content references the same physical location every
+        # session). Without anchor, datum floats with cal location.
+        if self.anchor_lat is not None and self.anchor_lon is not None:
+            datum_lat, datum_lon = self.anchor_lat, self.anchor_lon
+            datum_source = f'site anchor ({self.anchor_lat:.6f}, {self.anchor_lon:.6f})'
+        else:
+            datum_lat, datum_lon = self.current_lat, self.current_lon
+            datum_source = 'current GPS fix (no site anchor configured)'
+
         # Build GeoPose
         request = SetDatum.Request()
-        request.geo_pose.position.latitude = self.current_lat
-        request.geo_pose.position.longitude = self.current_lon
+        request.geo_pose.position.latitude = datum_lat
+        request.geo_pose.position.longitude = datum_lon
         request.geo_pose.position.altitude = self.current_alt
 
         quat = quaternion_from_euler(0.0, 0.0, self.heading_enu_rad)
@@ -595,7 +653,8 @@ class LocalizationSupervisor(Node):
         fix_level = self._gps_fix_level()
         imu_yaw_now = get_yaw_from_quaternion(self.last_imu_msg.orientation) if self.last_imu_msg else None
         self.get_logger().info(
-            f'Setting datum: lat={self.current_lat:.6f}, lon={self.current_lon:.6f}, alt={self.current_alt:.2f}, '
+            f'Setting datum: lat={datum_lat:.6f}, lon={datum_lon:.6f}, alt={self.current_alt:.2f} '
+            f'[source: {datum_source}], '
             f'heading={math.degrees(self.heading_enu_rad):.1f}° ENU ({self.heading_enu_rad:.4f} rad), '
             f'quat=[{quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f}], '
             f'GPS={fix_level}, h_acc={self.h_acc_mm/1000:.3f}m, '

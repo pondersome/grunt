@@ -329,6 +329,12 @@ def generate_launch_description():
                     'prefix': LaunchConfiguration('prefix'),
                     'gps_quality_threshold': LaunchConfiguration('gps_quality_threshold'),
                     'gps_h_acc_cal_threshold_m': LaunchConfiguration('gps_h_acc_cal_threshold_m'),
+                    'site_config': PathJoinSubstitution([
+                        LaunchConfiguration('grunt_missions_root'),
+                        'sites',
+                        LaunchConfiguration('site'),
+                        'site.yaml',
+                    ]),
                 }.items()
             )
         ],
