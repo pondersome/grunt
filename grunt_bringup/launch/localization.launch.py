@@ -97,6 +97,15 @@ def create_localization_nodes(context, *args, **kwargs):
     # yaw-only IMU observation for the global EKF to fuse. Eliminates the
     # one-shot drive-cal heading bias that compounds into wandering when
     # cal happens on tilted ground.
+    #
+    # max_head_acc_deg defaults to 15° (raised from initial 3° on
+    # 2026-04-28). Field measurement on the Ranchero driveway under tree
+    # cover showed median NavPVT head_acc ~27° on FLOAT-only RTK; a 3°
+    # gate dropped 100% of messages for an entire 9.8-min mission segment
+    # (zero corrections, heading drifted to median −72° vs ground truth).
+    # 15° catches roughly half of FLOAT-quality headings while still
+    # rejecting the obvious 60°+ garbage; the EKF's variance weighting
+    # keeps noisy observations from over-correcting.
     navpvt_heading_node = Node(
         package='grunt_bringup',
         executable='navpvt_to_imu',
@@ -104,7 +113,7 @@ def create_localization_nodes(context, *args, **kwargs):
         parameters=[{
             'frame_id': base_link_frame,
             'min_speed_mps': 0.2,
-            'max_head_acc_deg': 3.0,
+            'max_head_acc_deg': 15.0,
             'min_carrier': 1,  # 1=FLOAT, 2=FIXED
         }],
         remappings=[

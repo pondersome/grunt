@@ -59,7 +59,12 @@ class NavPvtToImu(Node):
         # under experimental safety caps; top speed could reach the
         # firmware limit (1.5 m/s transveltop) later.
         self.declare_parameter('min_speed_mps', 0.2)
-        self.declare_parameter('max_head_acc_deg', 3.0)
+        # Default raised from 3.0 → 15.0 on 2026-04-28 after field data
+        # showed median FLOAT head_acc ~27° on the Ranchero driveway under
+        # tree cover. With 3° we got zero corrections in a full mission
+        # segment; with 15° about half of FLOAT messages pass. The EKF
+        # variance weighting handles the noisier observations.
+        self.declare_parameter('max_head_acc_deg', 15.0)
         self.declare_parameter('min_carrier', CARRIER_FLOAT)
 
         self.frame_id = self.get_parameter('frame_id').value

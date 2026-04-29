@@ -76,21 +76,24 @@ TOPIC_TEMPLATES = [
     # Action lifecycle (when did Nav2 think it was done? when did it ABORT?)
     # Including _action/goal so the bag self-documents what each action was told
     # to do (waypoint coordinates, escape distances/angles, etc.).
-    '/{prefix}/follow_gps_waypoints/_action/goal',
-    '/{prefix}/follow_gps_waypoints/_action/status',
-    '/{prefix}/follow_gps_waypoints/_action/feedback',
-    '/{prefix}/navigate_to_pose/_action/goal',
-    '/{prefix}/navigate_to_pose/_action/status',
-    '/{prefix}/navigate_to_pose/_action/feedback',
-    '/{prefix}/backup/_action/goal',
-    '/{prefix}/backup/_action/status',
-    '/{prefix}/backup/_action/feedback',
-    '/{prefix}/spin/_action/goal',
-    '/{prefix}/spin/_action/status',
-    '/{prefix}/spin/_action/feedback',
-    '/{prefix}/drive_on_heading/_action/goal',
-    '/{prefix}/drive_on_heading/_action/status',
-    '/{prefix}/drive_on_heading/_action/feedback',
+    # All Nav2 action servers live under <prefix>/nav/<action>, NOT at the
+    # robot-root namespace — they're spawned by the grunt-nav@<mode>.service
+    # unit which pushes its own /nav/ sub-namespace.
+    '/{prefix}/nav/follow_gps_waypoints/_action/goal',
+    '/{prefix}/nav/follow_gps_waypoints/_action/status',
+    '/{prefix}/nav/follow_gps_waypoints/_action/feedback',
+    '/{prefix}/nav/navigate_to_pose/_action/goal',
+    '/{prefix}/nav/navigate_to_pose/_action/status',
+    '/{prefix}/nav/navigate_to_pose/_action/feedback',
+    '/{prefix}/nav/backup/_action/goal',
+    '/{prefix}/nav/backup/_action/status',
+    '/{prefix}/nav/backup/_action/feedback',
+    '/{prefix}/nav/spin/_action/goal',
+    '/{prefix}/nav/spin/_action/status',
+    '/{prefix}/nav/spin/_action/feedback',
+    '/{prefix}/nav/drive_on_heading/_action/goal',
+    '/{prefix}/nav/drive_on_heading/_action/status',
+    '/{prefix}/nav/drive_on_heading/_action/feedback',
 
     # IMU + joy
     '/{prefix}/bno055/imu',
