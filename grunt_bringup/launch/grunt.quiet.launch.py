@@ -178,7 +178,7 @@ def generate_launch_description():
         DeclareLaunchArgument('NavModeSwitcher', default_value='1', description='Start the nav_mode_switcher that drives grunt-nav@<mode>.service units'),
         DeclareLaunchArgument('Behaviors', default_value='1', description='Start grunt_behaviors BT runner + waypoint recorder (requires Nav2 for missions)'),
         DeclareLaunchArgument('DiagnosticBag', default_value='1', description='Auto-record a diagnostic rosbag while bt_runner is running a mission'),
-        DeclareLaunchArgument('diagnostic_bag_root', default_value=os.path.expanduser('~/grunt_bags'), description='Root directory for mission-triggered diagnostic bags'),
+        DeclareLaunchArgument('diagnostic_bag_root', default_value=os.path.expanduser('~/bag_files/grunt'), description='Root directory for mission-triggered diagnostic bags'),
         DeclareLaunchArgument('Wifi', default_value='1', description='Start isr_wifi connected-link telemetry + pose-correlated sampler'),
         DeclareLaunchArgument('wifi_interface', default_value='wlo1', description='Linux wireless interface for the primary operational link'),
         DeclareLaunchArgument('WifiSwitcher', default_value='true', description='Enable the Phase 1.5 resiliency switcher (one-way fallback via nmcli)'),
@@ -432,7 +432,7 @@ def generate_launch_description():
             # Mission-triggered diagnostic bag recorder. Subscribes to
             # bt_runner/active_behavior; records a curated topic list
             # while a mission is running, terminates on idle/hunker.
-            # Bags land in ~/grunt_bags/<timestamp>_<mission_kind>/.
+            # Bags land in ~/bag_files/grunt/<timestamp>_<mission_kind>/.
             Node(
                 package='grunt_bringup',
                 executable='diagnostic_bagger',

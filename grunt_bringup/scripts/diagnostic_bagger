@@ -108,7 +108,7 @@ class DiagnosticBagger(Node):
         super().__init__('diagnostic_bagger')
 
         self.declare_parameter('prefix', 'grunt1')
-        self.declare_parameter('bag_root', os.path.expanduser('~/grunt_bags'))
+        self.declare_parameter('bag_root', os.path.expanduser('~/bag_files/grunt'))
 
         self.prefix = self.get_parameter('prefix').value
         self.bag_root = Path(self.get_parameter('bag_root').value)
