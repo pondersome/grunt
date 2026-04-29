@@ -16,6 +16,17 @@
       magnetic_declination_radians: 0.0
       yaw_offset: 0.0
 
+      # Use local ENU at the datum instead of UTM. In UTM mode, navsat_transform
+      # silently adds utm_meridian_convergence (~1.1° at Dallas in zone 14) to
+      # the datum heading, leaving the map frame UTM-grid-aligned rather than
+      # true-ENU. With local_cartesian, utm_meridian_convergence is forced to 0
+      # and the map frame is true ENU at the per-site anchor — what the anchor
+      # mechanism actually wants. GPS missions are unaffected (round-trip
+      # lat/lon ↔ map xy stays consistent); the visible win is that aerial-
+      # imagery overlays line up and cross-site map frames have a single
+      # consistent definition.
+      use_local_cartesian: true
+
       # Wait for supervisor to call /datum service with accurate position + heading.
       # Do NOT add a 'datum' parameter — on Humble it causes auto-initialization.
       # Without GPS odom, the global EKF runs on wheel+IMU only (stable at origin).

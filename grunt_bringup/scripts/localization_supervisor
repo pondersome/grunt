@@ -661,9 +661,9 @@ class LocalizationSupervisor(Node):
             f'heading_source={self.heading_source}, '
             f'imu_yaw_now={math.degrees(imu_yaw_now):.1f}° ({imu_yaw_now:.4f} rad)' if imu_yaw_now is not None else '')
         self.get_logger().info(
-            f'NOTE: navsat_transform will ADD magnetic_declination ({math.degrees(0.0436):.1f}°) + '
-            f'meridian_convergence (~1.1°) to this heading. '
-            f'If heading is already true ENU, this is double-correction.')
+            'navsat_transform configured with magnetic_declination=0, '
+            'yaw_offset=0, use_local_cartesian=true — heading passes '
+            'through unrotated; map frame is true ENU at the datum.')
 
         self.datum_pending = True
         future = self.datum_client.call_async(request)
