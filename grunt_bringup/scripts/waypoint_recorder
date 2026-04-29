@@ -57,6 +57,29 @@ try:
 except ImportError:
     NavPVT = None
 
+# RTCM corrections from ntrip_client. Subscribing lets the recorder
+# stamp waypoints with rtcm_age_s and carr_phase so we can see RTK
+# degradation evolve in retrospective analysis. Optional import to
+# match the dual-package setup in ntrip_client launch (rtcm_msgs by
+# default, mavros_msgs as fallback).
+try:
+    from rtcm_msgs.msg import Message as RTCMMessage
+except ImportError:
+    RTCMMessage = None
+
+# u-blox NavPVT.flags carrier-phase bits. Mirrors the constants in
+# localization_supervisor — keep in sync there if F9P firmware
+# semantics ever change.
+CARRIER_PHASE_MASK = 0xC0
+CARRIER_PHASE_NONE = 0x00
+CARRIER_PHASE_FLOAT = 0x40
+CARRIER_PHASE_FIXED = 0x80
+_CARR_PHASE_LABEL = {
+    CARRIER_PHASE_NONE: 'none',
+    CARRIER_PHASE_FLOAT: 'float',
+    CARRIER_PHASE_FIXED: 'fixed',
+}
+
 
 def quaternion_to_yaw(q):
     """ENU yaw from a geometry_msgs/Quaternion."""
@@ -75,6 +98,17 @@ class WaypointRecorder(Node):
         self.declare_parameter('fix_topic', 'rtk/fix_gated')
         self.declare_parameter('odom_topic', 'odometry/global')
         self.declare_parameter('navpvt_topic', 'rtk/navpvt')
+        # RTCM stream out of ntrip_client. Used purely as a heartbeat —
+        # we time the gap between messages, never inspect contents.
+        self.declare_parameter('rtcm_topic', 'rtcm')
+        # Soft-warn threshold for RTCM staleness on record. Refusing to
+        # record would block legitimate edge-case exploration of
+        # autonomous nav behavior under degraded RTK; warn-only keeps
+        # the data flow open and lets retrospective analysis flag it.
+        # 5s chosen as a heuristic indicator of an NTRIP connection
+        # problem (typical RTCM rate is ~1 Hz; 5 misses is well past
+        # noise).
+        self.declare_parameter('rtcm_warn_age_s', 5.0)
         self.declare_parameter('mode_topic', 'nav/mode')
         self.declare_parameter('base_frame', 'grunt1/base_link')
         # Pose frame for indoor recording. grunt1/odom is session-local
@@ -95,6 +129,8 @@ class WaypointRecorder(Node):
         fix_topic = self.get_parameter('fix_topic').value
         odom_topic = self.get_parameter('odom_topic').value
         navpvt_topic = self.get_parameter('navpvt_topic').value
+        rtcm_topic = self.get_parameter('rtcm_topic').value
+        self.rtcm_warn_age_s = self.get_parameter('rtcm_warn_age_s').value
         mode_topic = self.get_parameter('mode_topic').value
         self.base_frame = self.get_parameter('base_frame').value
         self.pose_frame = self.get_parameter('pose_frame').value
@@ -116,6 +152,11 @@ class WaypointRecorder(Node):
         self.last_fix = None
         self.last_yaw = None
         self.last_h_acc_m = None
+        self.last_carr_phase = None  # 'none' | 'float' | 'fixed' | None
+        # rclpy.time.Time of the most recent RTCM message. None until
+        # ntrip_client first publishes — meaning either no NTRIP since
+        # boot, or rtcm_msgs isn't importable so we never subscribed.
+        self.last_rtcm_time = None
 
         # Current nav mode (latched). Set by /<prefix>/nav/mode
         # subscription; "unknown" until the first message arrives.
@@ -141,7 +182,16 @@ class WaypointRecorder(Node):
             self.create_subscription(NavPVT, navpvt_topic, self._navpvt_cb, 10)
         else:
             self.get_logger().warn(
-                'ublox_msgs not available — h_acc will not be recorded.')
+                'ublox_msgs not available — h_acc and carr_phase will '
+                'not be recorded.')
+
+        if RTCMMessage is not None:
+            self.create_subscription(
+                RTCMMessage, rtcm_topic, self._rtcm_cb, 10)
+        else:
+            self.get_logger().warn(
+                'rtcm_msgs not available — rtcm_age_s will not be recorded. '
+                '(Install ros-${ROS_DISTRO}-rtcm-msgs to enable.)')
 
         # Publisher for the new-recording-becomes-active flow. Plain
         # 10-deep queue is fine — we publish once per save event and
@@ -171,6 +221,14 @@ class WaypointRecorder(Node):
 
     def _navpvt_cb(self, msg):
         self.last_h_acc_m = msg.h_acc / 1000.0
+        self.last_carr_phase = _CARR_PHASE_LABEL.get(
+            msg.flags & CARRIER_PHASE_MASK, 'unknown')
+
+    def _rtcm_cb(self, msg):
+        # Pure heartbeat — message contents irrelevant. Use the
+        # ntrip_client-stamped header for bag-replay correctness; the
+        # rtcm_msgs/Message header is set at receive time on the robot.
+        self.last_rtcm_time = rclpy.time.Time.from_msg(msg.header.stamp)
 
     def _mode_cb(self, msg: String):
         if msg.data != self.current_mode:
@@ -249,14 +307,38 @@ class WaypointRecorder(Node):
         }
         if self.last_h_acc_m is not None:
             wp['h_acc'] = round(self.last_h_acc_m, 3)
+        if self.last_carr_phase is not None:
+            wp['carr_phase'] = self.last_carr_phase
+
+        rtcm_age = self._rtcm_age_s()
+        if rtcm_age is not None:
+            wp['rtcm_age_s'] = round(rtcm_age, 1)
 
         self.waypoints.append(wp)
         h_acc_str = f' h_acc={wp["h_acc"]:.3f}m' if 'h_acc' in wp else ''
+        carr_str = f' carr={wp["carr_phase"]}' if 'carr_phase' in wp else ''
+        rtcm_str = (
+            f' rtcm_age={wp["rtcm_age_s"]:.1f}s'
+            if 'rtcm_age_s' in wp else '')
         self.get_logger().info(
             f'Recorded GPS waypoint #{len(self.waypoints)}: '
             f'lat={wp["lat"]:.6f} lon={wp["lon"]:.6f} '
-            f'alt={wp["alt"]:.1f} yaw={wp["yaw"]:.3f}{h_acc_str} '
+            f'alt={wp["alt"]:.1f} yaw={wp["yaw"]:.3f}'
+            f'{h_acc_str}{carr_str}{rtcm_str} '
             f'@ {fix_time}')
+
+        # Soft warning. Recording continues — operator wants to be
+        # able to capture edge-case behavior under degraded RTK while
+        # autonomous nav is still maturing.
+        if rtcm_age is not None and rtcm_age > self.rtcm_warn_age_s:
+            self.get_logger().warn(
+                f'RTCM is stale ({rtcm_age:.1f}s > '
+                f'{self.rtcm_warn_age_s:.1f}s threshold) — possible '
+                f'NTRIP connection problem. Waypoint recorded anyway.')
+        elif rtcm_age is None and RTCMMessage is not None:
+            self.get_logger().warn(
+                'No RTCM messages seen since recorder start — NTRIP may '
+                'not have connected. Waypoint recorded anyway.')
 
     def _record_pose(self):
         # Look up base_frame in pose_frame to get current robot pose.
@@ -288,6 +370,13 @@ class WaypointRecorder(Node):
             f'Recorded pose waypoint #{len(self.waypoints)} in '
             f'{self.pose_frame}: x={wp["x"]:.3f} y={wp["y"]:.3f} '
             f'yaw={wp["yaw"]:.3f}')
+
+    def _rtcm_age_s(self):
+        """Seconds since the most recent RTCM message; None if never seen."""
+        if self.last_rtcm_time is None:
+            return None
+        delta = self.get_clock().now() - self.last_rtcm_time
+        return delta.nanoseconds / 1e9
 
     def _open_new_recording(self):
         self.current_name = datetime.datetime.now().strftime('%y%m%d-%H%M%S')
