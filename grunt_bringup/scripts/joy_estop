@@ -36,10 +36,18 @@ class JoyCommands(Node):
         self.declare_parameter('macro_button', 12)    # Home button
         self.declare_parameter('reset_cal_button', 11)  # Menu (small) — reset localization calibration
         self.declare_parameter('prefix', 'grunt1')   # robot namespace prefix
+        # Double-tap of estop within this window (seconds), while estop
+        # is already active, fires the bt_runner ~/reset_mission service
+        # — clears next_waypoint_idx_ and forces auto-direction on the
+        # next dispatch. First tap is the normal halt; second tap is
+        # the escalation to "abandon mission progress entirely."
+        self.declare_parameter('reset_mission_double_tap_window_s', 1.5)
         self.estop_button = self.get_parameter('estop_button').value
         self.deadman_button = self.get_parameter('deadman_button').value
         self.macro_button = self.get_parameter('macro_button').value
         self.reset_cal_button = self.get_parameter('reset_cal_button').value
+        self.reset_mission_window = float(
+            self.get_parameter('reset_mission_double_tap_window_s').value)
         prefix = self.get_parameter('prefix').value
 
         self.estop_active = False
@@ -48,6 +56,9 @@ class JoyCommands(Node):
         self.deadman_released_since_estop = False
         self.macro_button_prev = False
         self.reset_cal_button_prev = False
+        # Monotonic clock seconds of the most recent estop button rising
+        # edge. Used to detect double-tap → reset_mission.
+        self.last_estop_press_mono_s = -1e9
 
         # Home button behavior (priority order):
         #   1. macro_cmd set → run that shell command.
@@ -98,6 +109,12 @@ class JoyCommands(Node):
         # twist_mux unlock still frees the wheels.
         self.resume_client = self.create_client(Trigger, 'bt_runner/resume')
 
+        # Mission reset — bumped by a second estop press while estop is
+        # already active. Clears next_waypoint_idx_ + last_failure_reason
+        # so the next dispatch runs auto-direction fresh.
+        self.reset_mission_client = self.create_client(
+            Trigger, 'bt_runner/reset_mission')
+
         # Calibration reset — clears the localization supervisor's
         # heading/datum state so it restarts the init sequence. Triggered
         # by the Menu (small) button so an accidental press is unlikely.
@@ -122,8 +139,24 @@ class JoyCommands(Node):
         # Re-pressing while already locked re-publishes True (idempotent
         # reinforcement against a dropped first message). Release is
         # exclusively via the deadman-acknowledge path below.
+        #
+        # Double-tap escalation: a second press within
+        # `reset_mission_double_tap_window_s` of the first, while estop
+        # is already active, fires the mission-reset service. Lets the
+        # operator say "stop AND throw away mission progress" without
+        # needing a terminal.
         if estop_pressed and not self.estop_button_prev:
+            now_mono = self.get_clock().now().nanoseconds * 1e-9
+            elapsed = now_mono - self.last_estop_press_mono_s
+            was_active_before_press = self.estop_active
             self._activate_estop()
+            if (was_active_before_press
+                    and elapsed <= self.reset_mission_window):
+                self.get_logger().info(
+                    f'E-stop double-tap detected ({elapsed:.2f}s) — '
+                    f'requesting mission reset')
+                self._request_reset_mission()
+            self.last_estop_press_mono_s = now_mono
 
         # Deadman can release e-stop, but ONLY if:
         #   1. E-stop is active
@@ -268,6 +301,24 @@ class JoyCommands(Node):
                 self.get_logger().warn(f'Calibration reset refused: {response.message}')
         except Exception as e:
             self.get_logger().warn(f'Calibration reset call failed: {e}')
+
+    def _request_reset_mission(self):
+        if not self.reset_mission_client.service_is_ready():
+            self.get_logger().warn(
+                'bt_runner/reset_mission not available — ignoring')
+            return
+        future = self.reset_mission_client.call_async(Trigger.Request())
+        future.add_done_callback(self._on_reset_mission_response)
+
+    def _on_reset_mission_response(self, future):
+        try:
+            response = future.result()
+            if response.success:
+                self.get_logger().info(f'Mission reset: {response.message}')
+            else:
+                self.get_logger().warn(f'Mission reset refused: {response.message}')
+        except Exception as e:
+            self.get_logger().warn(f'Mission reset call failed: {e}')
 
     def _set_macro_cb(self, msg: String):
         """Override the Home button to run a shell command instead of
