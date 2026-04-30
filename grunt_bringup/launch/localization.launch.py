@@ -119,6 +119,7 @@ def create_localization_nodes(context, *args, **kwargs):
         remappings=[
             ('rtk/navpvt', f'/{prefix}/rtk/navpvt'),
             ('rtk/heading_imu', f'/{prefix}/rtk/heading_imu'),
+            ('odometry/local', f'/{prefix}/odometry/local'),
         ],
     )
 

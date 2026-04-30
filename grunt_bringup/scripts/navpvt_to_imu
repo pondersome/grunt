@@ -20,15 +20,28 @@ Gates:
   - g_speed >= min_speed_mps     (heading-of-motion noisy at low speed)
   - heading_accuracy <= max_head_acc_deg
   - carrier_phase >= min_carrier (FLOAT or FIXED)
+  - odometry/local twist.linear.x >= forward_vx_threshold
+                                   (NavPVT can't tell forward from backward —
+                                    when robot is backing up, heading-of-motion
+                                    = chassis_yaw + 180° and feeding it to the
+                                    EKF flips its yaw belief by π. Without this
+                                    gate, Nav2's behavior_server BackUp action
+                                    causes EKF yaw to oscillate violently
+                                    every recovery cycle.)
 
 Spin/escape behavior: in-place rotations drive g_speed to ~0, gate
 excludes those moments, EKF falls back to gyro for the rotation. Correct.
+
+Backward driving: also gated out (vx < threshold). EKF falls back to
+gyro during reverse motion; corrections resume when forward driving
+resumes.
 """
 import math
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu
+from nav_msgs.msg import Odometry
 from ublox_msgs.msg import NavPVT
 
 
@@ -52,7 +65,16 @@ class NavPvtToImu(Node):
 
         self.declare_parameter('input_topic', 'rtk/navpvt')
         self.declare_parameter('output_topic', 'rtk/heading_imu')
+        self.declare_parameter('odom_topic', 'odometry/local')
         self.declare_parameter('frame_id', 'base_link')
+        # Body-frame forward velocity threshold for the
+        # forward-driving-only gate. Below this, we either don't know
+        # which direction the robot is moving or it's actively backing
+        # up; either way NavPVT heading-of-motion can't be trusted as
+        # chassis yaw. 0.05 m/s is well above wheel-encoder noise,
+        # generous enough to ride through the deceleration tail of a
+        # forward drive without flickering.
+        self.declare_parameter('forward_vx_threshold', 0.05)
         # Gates — tunable so they can chase the real operating envelope
         # as collision avoidance and recovery are dialed in. Today's
         # 0.2 m/s default tracks RPP's outdoor desired_linear_vel of 0.3
@@ -71,12 +93,24 @@ class NavPvtToImu(Node):
         self.min_speed = float(self.get_parameter('min_speed_mps').value)
         self.max_head_acc = float(self.get_parameter('max_head_acc_deg').value)
         self.min_carrier = int(self.get_parameter('min_carrier').value)
+        self.forward_vx_threshold = float(
+            self.get_parameter('forward_vx_threshold').value)
+
+        # Latest body-frame forward velocity from local EKF. Initialized
+        # to None so the gate can distinguish "no odom seen yet" (don't
+        # gate, fail-open during startup) from "robot stopped or
+        # reversing" (gate). After first odom message, has_vx becomes
+        # True and the gate is enforced.
+        self.last_vx = None
 
         self.pub = self.create_publisher(
             Imu, self.get_parameter('output_topic').value, 10)
         self.create_subscription(
             NavPVT, self.get_parameter('input_topic').value,
             self._on_navpvt, 10)
+        self.create_subscription(
+            Odometry, self.get_parameter('odom_topic').value,
+            self._on_odom, 10)
 
         # Live re-tune
         self.add_on_set_parameters_callback(self._on_param_change)
@@ -86,12 +120,17 @@ class NavPvtToImu(Node):
         self.n_gated_speed = 0
         self.n_gated_head_acc = 0
         self.n_gated_carrier = 0
+        self.n_gated_reverse = 0
         self.create_timer(10.0, self._log_stats)
 
         self.get_logger().info(
             f'navpvt_to_imu ready: gates speed≥{self.min_speed} m/s, '
             f'head_acc≤{self.max_head_acc}°, '
-            f'carrier≥{self.min_carrier} (1=FLOAT, 2=FIXED)')
+            f'carrier≥{self.min_carrier} (1=FLOAT, 2=FIXED), '
+            f'forward_vx≥{self.forward_vx_threshold} m/s')
+
+    def _on_odom(self, msg: Odometry):
+        self.last_vx = float(msg.twist.twist.linear.x)
 
     def _on_navpvt(self, m: NavPVT):
         carrier = (int(m.flags) >> 6) & 0x03
@@ -108,6 +147,13 @@ class NavPvtToImu(Node):
             return
         if head_acc_deg > self.max_head_acc or head_acc_deg <= 0.0:
             self.n_gated_head_acc += 1
+            return
+        # Forward-only gate. Skip if we haven't seen odom yet (fail-open
+        # at startup); otherwise reject when robot is stopped or
+        # reversing — heading-of-motion under reverse is chassis_yaw +
+        # 180° and corrupts EKF yaw.
+        if self.last_vx is not None and self.last_vx < self.forward_vx_threshold:
+            self.n_gated_reverse += 1
             return
 
         # NED → ENU. NavPVT heading is degrees CW from true north.
@@ -144,19 +190,22 @@ class NavPvtToImu(Node):
 
     def _log_stats(self):
         total = (self.n_published + self.n_gated_speed
-                 + self.n_gated_head_acc + self.n_gated_carrier)
+                 + self.n_gated_head_acc + self.n_gated_carrier
+                 + self.n_gated_reverse)
         if total == 0:
             return
         self.get_logger().info(
             f'navpvt_to_imu: pub={self.n_published} '
             f'gated[speed={self.n_gated_speed} '
             f'head_acc={self.n_gated_head_acc} '
-            f'carrier={self.n_gated_carrier}] '
+            f'carrier={self.n_gated_carrier} '
+            f'reverse={self.n_gated_reverse}] '
             f'over {total} navpvt msgs (~10s)')
         self.n_published = 0
         self.n_gated_speed = 0
         self.n_gated_head_acc = 0
         self.n_gated_carrier = 0
+        self.n_gated_reverse = 0
 
     def _on_param_change(self, params):
         from rcl_interfaces.msg import SetParametersResult
@@ -170,6 +219,10 @@ class NavPvtToImu(Node):
             elif p.name == 'min_carrier':
                 self.min_carrier = int(p.value)
                 self.get_logger().info(f'min_carrier -> {self.min_carrier}')
+            elif p.name == 'forward_vx_threshold':
+                self.forward_vx_threshold = float(p.value)
+                self.get_logger().info(
+                    f'forward_vx_threshold -> {self.forward_vx_threshold}')
         return SetParametersResult(successful=True)
 
 
