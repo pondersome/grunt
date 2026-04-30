@@ -480,7 +480,8 @@ class LocalizationSupervisor(Node):
 
             self.get_logger().info(
                 f'{"Re-calibrated" if recal else "Drive calibration complete"}: '
-                f'GPS bearing={math.degrees(gps_enu_heading):.1f}°, '
+                f'GPS-derived ENU heading={math.degrees(gps_enu_heading):.1f}° '
+                f'(compass bearing={math.degrees(math.pi/2.0 - gps_enu_heading):.1f}°), '
                 f'IMU yaw={math.degrees(current_imu_yaw):.1f}°, '
                 f'offset={math.degrees(offset):.1f}°, '
                 f'distance={dist:.2f}m, direction={dir_label}, '
@@ -693,24 +694,54 @@ class LocalizationSupervisor(Node):
             self.get_logger().error(f'Datum service call failed: {e}')
 
     def _sync_global_to_local(self):
-        """Set the global EKF state to match the local EKF's current pose.
+        """Seed the global EKF's state at /datum time.
 
-        After the datum is set, the GPS-to-odom transformation defines
-        map≈odom at the datum point. The global EKF should believe the
-        robot is at the same position in map as the local EKF believes
-        it is in odom. This makes map→odom ≈ identity, preventing the
-        feedback loop where each GPS measurement adds a constant offset.
+        Position: copy from local EKF. The local EKF has been
+        integrating wheel odometry since boot; using its position keeps
+        the first GPS observation's innovation small (map ≈ odom in
+        position at the datum point), preventing a feedback loop that
+        would otherwise shove a constant offset back into map→odom on
+        every new GPS update.
+
+        Orientation: use the cal-computed `heading_enu_rad`, NOT the
+        local EKF's orientation. Both EKFs consume BNO055 vyaw (gyro
+        rate) only — neither absorbs the chip's absolute yaw — so the
+        local EKF's yaw is whatever the BNO055 has integrated to since
+        chip cold-boot, in a frame with no relation to ENU truth. The
+        cal computes the static rotation between BNO055-frame and ENU
+        and stores it in `heading_enu_rad`; pushing that into the
+        global EKF's yaw state is what closes the loop. Without this,
+        the EKF starts ~tens-of-degrees off and NavPVT yaw fusion's
+        Mahalanobis gate can reject corrections wide enough to dig out
+        of the hole, producing the wandering we saw on 2026-04-29.
         """
         if self.last_odom_msg is None:
             self.get_logger().warn('No local odom available for global EKF sync')
             return
+        if self.heading_enu_rad is None:
+            self.get_logger().warn(
+                'No cal-computed heading available for global EKF sync; '
+                'falling back to local-EKF orientation (will likely be '
+                'wrong in ENU). This indicates _sync_global_to_local was '
+                'called outside the post-cal /datum flow.')
 
         msg = PoseWithCovarianceStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.map_frame
 
-        # Copy position and orientation from local EKF
-        msg.pose.pose = self.last_odom_msg.pose.pose
+        # Position: copy from local EKF (low-innovation seeding)
+        msg.pose.pose.position = self.last_odom_msg.pose.pose.position
+
+        # Orientation: cal-computed ENU yaw (or fall back to local
+        # EKF's orientation if heading is somehow unset)
+        if self.heading_enu_rad is not None:
+            quat = quaternion_from_euler(0.0, 0.0, self.heading_enu_rad)
+            msg.pose.pose.orientation.x = quat[0]
+            msg.pose.pose.orientation.y = quat[1]
+            msg.pose.pose.orientation.z = quat[2]
+            msg.pose.pose.orientation.w = quat[3]
+        else:
+            msg.pose.pose.orientation = self.last_odom_msg.pose.pose.orientation
 
         # Loose covariance so subsequent GPS measurements can pull the state
         cov = [0.0] * 36
@@ -724,8 +755,12 @@ class LocalizationSupervisor(Node):
 
         self.global_set_pose_pub.publish(msg)
         lp = self.last_odom_msg.pose.pose.position
+        heading_str = (
+            f'{math.degrees(self.heading_enu_rad):.1f}° ENU'
+            if self.heading_enu_rad is not None else 'fallback (local-EKF)')
         self.get_logger().info(
-            f'Global EKF synced to local state: ({lp.x:.3f}, {lp.y:.3f})')
+            f'Global EKF synced: pos=({lp.x:.3f}, {lp.y:.3f}) from local, '
+            f'yaw={heading_str}')
 
     def _reset_global_ekf(self):
         """Reset the global EKF to a clean state via set_pose.
