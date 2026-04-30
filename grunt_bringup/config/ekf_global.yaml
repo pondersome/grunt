@@ -83,12 +83,24 @@
       # Process noise — from canonical example
       # NOTE: x,y are 10.0 — very high process noise makes the filter strongly
       # trust GPS over dead reckoning. Matches the weihsinc config (Xsens+Garmin).
+      # NOTE: yaw (state index 5) is 0.005, NOT the canonical 0.06. The original
+      # bump from 0.01 → 0.1 was a band-aid for the cal-yaw-not-reaching-EKF bug
+      # (innovations of ~108° couldn't pass the 5σ Mahalanobis gate without
+      # loose process noise). With supervisor commit 8bda142 pushing the
+      # cal-computed yaw into ekf_global at /datum, the EKF starts on truth and
+      # NavPVT corrections arrive as small innovations. We want a TIGHT prior
+      # so the EKF averages over noisy NavPVT observations (σ~13° at 0.3 m/s
+      # ground speed — heading-of-motion is inherently noisy at low speed)
+      # instead of chasing each one. 0.005 rad²/s ≈ 4° per minute of allowed
+      # drift, well above BNO055 gyro bias drift (~0.6°/min). Tighten further
+      # if EKF yaw still tracks NavPVT noise too closely; loosen if it lags
+      # genuine rotation.
       process_noise_covariance: [10.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                  0.0,  10.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                  0.0,  0.0,  1e-3,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                  0.0,  0.0,  0.0,  0.3,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                  0.0,  0.0,  0.0,  0.0,  0.3,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
-                                 0.0,  0.0,  0.0,  0.0,  0.0,  0.1,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                                 0.0,  0.0,  0.0,  0.0,  0.0,  0.005, 0.0, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.5,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.5,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.1,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
