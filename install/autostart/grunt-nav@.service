@@ -39,6 +39,18 @@ Description=Grunt Nav2 stack (%i mode)
 BindsTo=grunt.service
 After=grunt.service
 
+# Mutual exclusion between modes. Each instance lists both possible
+# names (including its own — systemd silently ignores self-references).
+# Starting one mode automatically stops the other, eliminating the
+# brief overlap window the nav_mode_switcher used to manage with a
+# manual stop-then-start, and protecting against the foot-gun where
+# both instance symlinks land in multi-user.target.wants (e.g., from
+# a botched `systemctl enable`). nav_mode_switcher's explicit
+# transition logic still works correctly with this — Conflicts= just
+# becomes the canonical enforcement, with the switcher as the
+# operator-facing UX.
+Conflicts=grunt-nav@indoor.service grunt-nav@outdoor.service
+
 [Service]
 Type=simple
 User=karim
