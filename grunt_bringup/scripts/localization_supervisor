@@ -645,26 +645,46 @@ class LocalizationSupervisor(Node):
         request.geo_pose.position.longitude = datum_lon
         request.geo_pose.position.altitude = self.current_alt
 
-        quat = quaternion_from_euler(0.0, 0.0, self.heading_enu_rad)
-        request.geo_pose.orientation.x = quat[0]
-        request.geo_pose.orientation.y = quat[1]
-        request.geo_pose.orientation.z = quat[2]
-        request.geo_pose.orientation.w = quat[3]
+        # /datum orientation must be IDENTITY, not the chassis heading.
+        # Conceptually two distinct things were being conflated here:
+        #   1. The orientation of the *map frame itself* relative to the
+        #      cartesian frame the GPS is converted into. For our setup
+        #      (use_local_cartesian=true, datum at site anchor), the
+        #      cartesian frame IS already the map frame (ENU at anchor),
+        #      so this rotation should be identity.
+        #   2. The robot's *chassis* orientation in the map frame at
+        #      datum time. That's `heading_enu_rad`, and it belongs in
+        #      ekf_global's state, not in navsat_transform's
+        #      cartesian_world_transform.
+        # Sending heading_enu_rad here caused navsat_transform to rotate
+        # every GPS position by -heading_enu_rad before publishing as
+        # /odometry/gps. Field measurement on 2026-04-30: GPS at
+        # (1.93, 9.51) in true map-ENU was reported as (~9.55, ~1.74),
+        # and ekf_global tracked the rotated phantom — sending RPP to
+        # plan toward positions 10-18 m from where the robot actually
+        # was. The cal-computed yaw still reaches the EKF via
+        # _sync_global_to_local, which is the right path for chassis
+        # orientation.
+        request.geo_pose.orientation.x = 0.0
+        request.geo_pose.orientation.y = 0.0
+        request.geo_pose.orientation.z = 0.0
+        request.geo_pose.orientation.w = 1.0
 
         fix_level = self._gps_fix_level()
         imu_yaw_now = get_yaw_from_quaternion(self.last_imu_msg.orientation) if self.last_imu_msg else None
         self.get_logger().info(
             f'Setting datum: lat={datum_lat:.6f}, lon={datum_lon:.6f}, alt={self.current_alt:.2f} '
             f'[source: {datum_source}], '
-            f'heading={math.degrees(self.heading_enu_rad):.1f}° ENU ({self.heading_enu_rad:.4f} rad), '
-            f'quat=[{quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f}], '
+            f'orientation=identity (map frame = true ENU at anchor), '
             f'GPS={fix_level}, h_acc={self.h_acc_mm/1000:.3f}m, '
-            f'heading_source={self.heading_source}, '
-            f'imu_yaw_now={math.degrees(imu_yaw_now):.1f}° ({imu_yaw_now:.4f} rad)' if imu_yaw_now is not None else '')
+            f'heading_source={self.heading_source} '
+            f'(chassis heading {math.degrees(self.heading_enu_rad):.1f}° ENU '
+            f'goes to ekf_global via _sync_global_to_local, '
+            f'imu_yaw_now={math.degrees(imu_yaw_now):.1f}°)' if imu_yaw_now is not None else '')
         self.get_logger().info(
             'navsat_transform configured with magnetic_declination=0, '
-            'yaw_offset=0, use_local_cartesian=true — heading passes '
-            'through unrotated; map frame is true ENU at the datum.')
+            'yaw_offset=0, use_local_cartesian=true — GPS positions '
+            'pass through unrotated; map frame is true ENU at the datum.')
 
         self.datum_pending = True
         future = self.datum_client.call_async(request)
