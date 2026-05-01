@@ -50,6 +50,8 @@ def accuracy_tube(parsed_by_label: dict[str, dict],
         nav = parsed.get("/grunt1/rtk/navpvt", [])
         odom = parsed.get("/grunt1/odometry/global", [])
         joy = parsed.get("/grunt1/cmd_vel_joy", [])
+        carrots = parsed.get("/grunt1/nav/lookahead_point", [])
+        rotating = parsed.get("/grunt1/nav/is_rotating_to_heading", [])
 
         # Pair fix samples with nearest navpvt for h_acc/carrier
         nav_t = [r[0] for r in nav]
@@ -83,6 +85,40 @@ def accuracy_tube(parsed_by_label: dict[str, dict],
         ekf_y = [r[2] for r in odom[::5]]
         ax.plot(ekf_x, ekf_y, color="#666", linewidth=0.4, alpha=0.5,
                 zorder=3, label="EKF /odometry/global")
+
+        # Carrot stream — sequence of points the controller was steering
+        # toward. Carrots lie on the planned path by construction; this
+        # effectively traces the planner's output along the actual mission
+        # window. Thinned to keep visual density manageable on long bags.
+        if carrots:
+            cstep = max(1, len(carrots) // 400)
+            cx = [c[1] for c in carrots[::cstep]]
+            cy = [c[2] for c in carrots[::cstep]]
+            ax.scatter(cx, cy, s=4, color="#9333ea", marker=".",
+                       alpha=0.6, zorder=5,
+                       label=f"carrot ({len(carrots)} pts, every {cstep}th shown)")
+
+        # Rotation-mode highlight: where in space was the robot when RPP
+        # was in rotate-to-heading mode? Plot EKF positions during those
+        # episodes with a distinctive marker. Useful for "did RPP rotate
+        # in place at every waypoint, or only the sharp ones?"
+        if rotating and odom:
+            odom_t_full = [r[0] for r in odom]
+            rot_xs, rot_ys = [], []
+            in_rot = False
+            for (t, flag) in rotating:
+                if flag and not in_rot:
+                    in_rot = True
+                    j = bisect.bisect_left(odom_t_full, t)
+                    if j < len(odom):
+                        rot_xs.append(odom[j][1]); rot_ys.append(odom[j][2])
+                elif not flag and in_rot:
+                    in_rot = False
+            if rot_xs:
+                ax.scatter(rot_xs, rot_ys, s=80, marker="P",
+                           facecolor="#fbbf24", edgecolor="black",
+                           linewidth=0.7, zorder=14,
+                           label=f"rotate-to-heading start ({len(rot_xs)}×)")
 
         # Waypoints
         wp_lla = waypoints_by_label.get(label, [])
