@@ -1,0 +1,20 @@
+[project]
+name = "grunt_analysis"
+version = "0.1.0"
+description = "Post-mission analysis tooling for grunt outdoor/indoor runs."
+requires-python = ">=3.10"
+dependencies = [
+    "mcap-ros2-support",
+    "matplotlib",
+    "pyyaml",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["grunt_analysis*"]
+
+[project.scripts]
+grunt-analyze-mission = "grunt_analysis.cli:main"
