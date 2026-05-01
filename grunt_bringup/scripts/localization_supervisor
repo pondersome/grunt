@@ -693,55 +693,99 @@ class LocalizationSupervisor(Node):
         except Exception as e:
             self.get_logger().error(f'Datum service call failed: {e}')
 
+    def _lla_to_local_enu(self, lat, lon):
+        """Convert (lat, lon) to local ENU meters at the active datum.
+
+        Mirrors GeographicLib::LocalCartesian to the precision the
+        flat-earth approximation gives (sub-cm at hundreds of meters,
+        which is the property scale here). Used for seeding the global
+        EKF's position at /datum time.
+
+        Datum picks the anchor when configured, otherwise current GPS
+        fix — same priority order as `_try_set_datum`. Returns (0, 0)
+        when datum is at current_lla (which is the legacy no-anchor
+        case, where map origin = current robot pose).
+        """
+        if self.anchor_lat is not None and self.anchor_lon is not None:
+            ref_lat, ref_lon = self.anchor_lat, self.anchor_lon
+        else:
+            ref_lat, ref_lon = self.current_lat, self.current_lon
+        if (lat is None or lon is None or
+                ref_lat is None or ref_lon is None):
+            return 0.0, 0.0
+        # WGS84 equatorial radius — matches GeographicLib's default.
+        R = 6378137.0
+        cos_ref = math.cos(math.radians(ref_lat))
+        east  = math.radians(lon - ref_lon) * R * cos_ref
+        north = math.radians(lat - ref_lat) * R
+        return east, north
+
     def _sync_global_to_local(self):
         """Seed the global EKF's state at /datum time.
 
-        Position: copy from local EKF. The local EKF has been
-        integrating wheel odometry since boot; using its position keeps
-        the first GPS observation's innovation small (map ≈ odom in
-        position at the datum point), preventing a feedback loop that
-        would otherwise shove a constant offset back into map→odom on
-        every new GPS update.
+        Position: derive from current GPS fix relative to the configured
+        datum (anchor or current_lla). DO NOT copy from local EKF —
+        local EKF integrates wheel odometry since boot, in an "odom"
+        frame whose origin is wherever the robot was when ekf_local
+        started. That position is *not* the map-frame position. Pushing
+        local-EKF coords to ekf_global as if they were map coords gave
+        the EKF a position belief shifted by however far the robot had
+        wandered before cal — observed 2026-04-30 as a 17 m y-axis
+        offset between EKF and GPS at mission start, which combined
+        with the wandering yaw to make RPP plan toward phantom
+        positions.
 
-        Orientation: use the cal-computed `heading_enu_rad`, NOT the
-        local EKF's orientation. Both EKFs consume BNO055 vyaw (gyro
-        rate) only — neither absorbs the chip's absolute yaw — so the
-        local EKF's yaw is whatever the BNO055 has integrated to since
-        chip cold-boot, in a frame with no relation to ENU truth. The
-        cal computes the static rotation between BNO055-frame and ENU
-        and stores it in `heading_enu_rad`; pushing that into the
-        global EKF's yaw state is what closes the loop. Without this,
-        the EKF starts ~tens-of-degrees off and NavPVT yaw fusion's
+        Orientation: use the cal-computed `heading_enu_rad`. Both EKFs
+        consume BNO055 vyaw (gyro rate) only — neither absorbs the
+        chip's absolute yaw — so the local EKF's yaw is whatever the
+        BNO055 has integrated to since chip cold-boot, in a frame with
+        no relation to ENU truth. The cal computes the static rotation
+        between BNO055-frame and ENU and stores it in
+        `heading_enu_rad`; pushing that here closes the loop. Without
+        it, the EKF starts ~tens-of-degrees off and NavPVT yaw fusion's
         Mahalanobis gate can reject corrections wide enough to dig out
-        of the hole, producing the wandering we saw on 2026-04-29.
+        of the hole.
         """
-        if self.last_odom_msg is None:
-            self.get_logger().warn('No local odom available for global EKF sync')
-            return
         if self.heading_enu_rad is None:
             self.get_logger().warn(
                 'No cal-computed heading available for global EKF sync; '
                 'falling back to local-EKF orientation (will likely be '
                 'wrong in ENU). This indicates _sync_global_to_local was '
                 'called outside the post-cal /datum flow.')
+        if self.current_lat is None or self.current_lon is None:
+            self.get_logger().warn(
+                'No GPS fix available for global EKF position sync — '
+                'falling back to (0, 0) in map frame; first GPS '
+                'observation will have to absorb the offset.')
 
         msg = PoseWithCovarianceStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.map_frame
 
-        # Position: copy from local EKF (low-innovation seeding)
-        msg.pose.pose.position = self.last_odom_msg.pose.pose.position
+        # Position: current GPS lla → local ENU at the datum.
+        # When the datum *is* the current fix (no anchor configured),
+        # this naturally lands at (0, 0) — first GPS obs after datum
+        # will also be near (0, 0), so innovation is tiny. When the
+        # datum is a fixed anchor, this is the robot's true map-frame
+        # position relative to that anchor.
+        map_x, map_y = self._lla_to_local_enu(
+            self.current_lat, self.current_lon)
+        msg.pose.pose.position.x = map_x
+        msg.pose.pose.position.y = map_y
+        msg.pose.pose.position.z = 0.0
 
         # Orientation: cal-computed ENU yaw (or fall back to local
-        # EKF's orientation if heading is somehow unset)
+        # EKF's orientation if heading is somehow unset).
         if self.heading_enu_rad is not None:
             quat = quaternion_from_euler(0.0, 0.0, self.heading_enu_rad)
             msg.pose.pose.orientation.x = quat[0]
             msg.pose.pose.orientation.y = quat[1]
             msg.pose.pose.orientation.z = quat[2]
             msg.pose.pose.orientation.w = quat[3]
-        else:
+        elif self.last_odom_msg is not None:
             msg.pose.pose.orientation = self.last_odom_msg.pose.pose.orientation
+        else:
+            msg.pose.pose.orientation.w = 1.0  # identity
 
         # Loose covariance so subsequent GPS measurements can pull the state
         cov = [0.0] * 36
@@ -754,13 +798,14 @@ class LocalizationSupervisor(Node):
         msg.pose.covariance = cov
 
         self.global_set_pose_pub.publish(msg)
-        lp = self.last_odom_msg.pose.pose.position
         heading_str = (
             f'{math.degrees(self.heading_enu_rad):.1f}° ENU'
             if self.heading_enu_rad is not None else 'fallback (local-EKF)')
+        anchor_str = (
+            'anchor' if self.anchor_lat is not None else 'current-fix')
         self.get_logger().info(
-            f'Global EKF synced: pos=({lp.x:.3f}, {lp.y:.3f}) from local, '
-            f'yaw={heading_str}')
+            f'Global EKF synced: pos=({map_x:.3f}, {map_y:.3f}) '
+            f'from GPS lla relative to {anchor_str} datum, yaw={heading_str}')
 
     def _reset_global_ekf(self):
         """Reset the global EKF to a clean state via set_pose.
