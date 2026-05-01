@@ -321,6 +321,121 @@ def interventions(parsed, min_burst_s: float = 0.5) -> dict:
     }
 
 
+def rotation_mode_fraction(parsed) -> dict:
+    """How much of the mission was spent in RPP's in-place rotation mode.
+
+    Reads /grunt1/nav/is_rotating_to_heading (bool). High fraction
+    suggests a path with a lot of sharp angles, or RPP's
+    rotate_to_heading_min_angle threshold being too tight.
+    """
+    samples = parsed.get("/grunt1/nav/is_rotating_to_heading", [])
+    if not samples:
+        return {"name": "rotation_mode_fraction", "n": 0,
+                "note": "no is_rotating_to_heading topic in bag"}
+    if len(samples) < 2:
+        return {"name": "rotation_mode_fraction", "n": len(samples),
+                "note": "insufficient samples"}
+    # Integrate time-in-rotating-state by treating each sample as
+    # holding its value until the next sample.
+    total_dur = samples[-1][0] - samples[0][0]
+    rotating_dur = 0.0
+    n_episodes = 0
+    in_rot = False
+    rot_start = None
+    for i in range(1, len(samples)):
+        if samples[i-1][1]:
+            rotating_dur += samples[i][0] - samples[i-1][0]
+        if samples[i-1][1] and not in_rot:
+            in_rot = True
+            rot_start = samples[i-1][0]
+            n_episodes += 1
+        elif not samples[i-1][1] and in_rot:
+            in_rot = False
+    return {
+        "name": "rotation_mode_fraction",
+        "n": len(samples),
+        "rotating_pct": round(100 * rotating_dur / total_dur, 1) if total_dur else 0,
+        "rotating_dur_s": round(rotating_dur, 1),
+        "total_dur_s": round(total_dur, 1),
+        "n_rotation_episodes": n_episodes,
+    }
+
+
+def carrot_tracking(parsed) -> dict:
+    """Distance from EKF position to the carrot when each carrot is published.
+
+    Reads /grunt1/nav/lookahead_point and /grunt1/odometry/global. The
+    distance should be approximately `lookahead_dist` (or its
+    velocity-scaled equivalent) when RPP is operating normally; large
+    deviations indicate something wrong with the carrot computation
+    or the path being received.
+    """
+    carrots = parsed.get("/grunt1/nav/lookahead_point", [])
+    odom = parsed.get("/grunt1/odometry/global", [])
+    if not carrots or not odom:
+        return {"name": "carrot_tracking", "n": 0,
+                "note": "missing carrot or odometry"}
+    odom_t = [r[0] for r in odom]
+    dists = []
+    for (t, cx, cy) in carrots:
+        i = bisect.bisect_left(odom_t, t)
+        if i >= len(odom) or abs(odom[i][0] - t) > 0.5:
+            continue
+        ex, ey = odom[i][1], odom[i][2]
+        dists.append(math.hypot(cx - ex, cy - ey))
+    if not dists:
+        return {"name": "carrot_tracking", "n": 0}
+    sd = sorted(dists)
+    return {
+        "name": "carrot_tracking",
+        "n": len(dists),
+        "median_dist_to_carrot_m": round(s.median(dists), 3),
+        "p10_dist_m": round(sd[len(sd) // 10], 3),
+        "p90_dist_m": round(sd[int(len(sd) * 0.9)], 3),
+        "stdev_dist_m": round(s.stdev(dists), 3) if len(dists) > 1 else 0,
+    }
+
+
+def heading_obs_acceptance(parsed) -> dict:
+    """How NavPVT-derived yaw observations compare to the EKF's belief.
+
+    /grunt1/rtk/heading_imu carries the gated NavPVT heading_of_motion
+    that ekf_global consumes as imu1. Compare each one against the
+    nearest ekf_global yaw to compute innovation magnitude — large
+    innovations may be rejected by the Mahalanobis gate, while small
+    innovations indicate the EKF is tracking the truth NavPVT reports.
+    """
+    hi = parsed.get("/grunt1/rtk/heading_imu", [])
+    odom = parsed.get("/grunt1/odometry/global", [])
+    if not hi or not odom:
+        return {"name": "heading_obs_acceptance", "n": 0,
+                "note": "missing heading_imu or odometry/global"}
+    odom_t = [r[0] for r in odom]
+    innovations = []
+    head_accs = []
+    for (t, yaw_rad, ha_deg) in hi:
+        i = bisect.bisect_left(odom_t, t)
+        if i >= len(odom) or abs(odom[i][0] - t) > 0.5:
+            continue
+        ekf_yaw = odom[i][3]
+        innov = (yaw_rad - ekf_yaw + math.pi) % (2 * math.pi) - math.pi
+        innovations.append(math.degrees(innov))
+        head_accs.append(ha_deg)
+    if not innovations:
+        return {"name": "heading_obs_acceptance", "n": 0}
+    abs_innov = [abs(x) for x in innovations]
+    si = sorted(abs_innov)
+    return {
+        "name": "heading_obs_acceptance",
+        "n": len(innovations),
+        "median_innovation_deg": round(s.median(innovations), 2),
+        "median_abs_innovation_deg": round(s.median(abs_innov), 2),
+        "p90_abs_innovation_deg": round(si[int(len(si) * 0.9)], 2),
+        "max_abs_innovation_deg": round(max(abs_innov), 2),
+        "median_head_acc_deg": round(s.median(head_accs), 2),
+    }
+
+
 def collision_events(parsed) -> dict:
     """Distinct STATE transitions of collision_monitor — STOP / SLOWDOWN / etc."""
     cm = parsed.get("/grunt1/nav/collision_monitor_state", [])
@@ -352,6 +467,9 @@ DEFAULT_METRICS = (
     rtk_continuity,
     cmd_vel_breakdown,
     control_oscillation,
+    rotation_mode_fraction,
+    carrot_tracking,
+    heading_obs_acceptance,
     interventions,
     collision_events,
 )

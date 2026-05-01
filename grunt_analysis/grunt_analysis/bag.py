@@ -44,6 +44,12 @@ TOPIC_SCHEMA = {
     "/grunt1/nav/collision_monitor_state": "(t, action_type)",
     "/grunt1/localization/status": "(t, status_dict)",
     "/grunt1/pose":              "(t, vx, vyaw)",  # p2os wheel odometry twist
+    # RPP observables — added 2026-05-01 once the bagger started
+    # capturing /nav/-namespaced topics correctly.
+    "/grunt1/nav/lookahead_point":          "(t, x, y)",   # the carrot
+    "/grunt1/nav/is_rotating_to_heading":   "(t, flag)",   # bool: in-place rotation
+    "/grunt1/nav/received_global_plan":     "(t, n_poses, length_m)",  # path summary
+    "/grunt1/nav/local_plan":               "(t, n_poses, length_m)",
 }
 
 
@@ -91,6 +97,22 @@ def _decode_message(topic: str, msg, t: float) -> Optional[tuple]:
             return (t, json.loads(msg.data))
         except Exception:
             return None
+    if topic == "/grunt1/nav/lookahead_point":
+        # geometry_msgs/PointStamped — the carrot
+        return (t, msg.point.x, msg.point.y)
+    if topic == "/grunt1/nav/is_rotating_to_heading":
+        return (t, bool(msg.data))
+    if topic in ("/grunt1/nav/received_global_plan", "/grunt1/nav/local_plan"):
+        # nav_msgs/Path — reduce to (count, total_arc_length)
+        n = len(msg.poses)
+        if n < 2:
+            return (t, n, 0.0)
+        L = 0.0
+        for i in range(1, n):
+            a = msg.poses[i-1].pose.position
+            b = msg.poses[i].pose.position
+            L += math.hypot(b.x - a.x, b.y - a.y)
+        return (t, n, L)
     return None
 
 
