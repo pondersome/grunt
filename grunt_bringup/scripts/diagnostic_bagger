@@ -26,11 +26,23 @@ from std_msgs.msg import String
 
 
 # Curated diagnostic topic list. Prefix is substituted at startup.
+#
+# Namespace note: every topic published by the Nav2 stack lives under
+# `/{prefix}/nav/...` (the controller_server, planner_server, etc.
+# all run inside the grunt-nav@<mode>.service unit which adds a `/nav`
+# sub-namespace). Topics that DON'T have `/nav/` are produced by nodes
+# in the main grunt.service unit (p2os, EKFs, supervisor, bt_runner).
+# Bagger had a 2026-04-30-vintage bug where several `/nav/` topics
+# were specified without the prefix and silently captured nothing.
 TOPIC_TEMPLATES = [
     # GPS / RTK / localization (primary suspects under tree coverage)
     '/{prefix}/rtk/fix',
     '/{prefix}/rtk/fix_gated',
     '/{prefix}/rtk/navpvt',
+    '/{prefix}/rtk/heading_imu',          # NavPVT-derived yaw observation
+                                          # consumed by ekf_global; lets us
+                                          # verify which corrections actually
+                                          # landed.
     '/{prefix}/localization/status',
     '/{prefix}/odometry/local',
     '/{prefix}/odometry/global',
@@ -41,21 +53,26 @@ TOPIC_TEMPLATES = [
     '/tf',
     '/tf_static',
 
-    # Nav2 plans + costmap (subscribe + sparse updates)
-    '/{prefix}/plan',
-    '/{prefix}/received_global_plan',
-    '/{prefix}/local_plan',
-    '/{prefix}/global_costmap/costmap',
-    '/{prefix}/global_costmap/costmap_updates',
-    '/{prefix}/local_costmap/costmap',
-    '/{prefix}/local_costmap/costmap_updates',
+    # Nav2 plans + costmap — all under /nav/ namespace
+    '/{prefix}/nav/plan',                 # planner's published path
+    '/{prefix}/nav/received_global_plan', # path RPP actually received
+    '/{prefix}/nav/local_plan',           # the controller's local trajectory
+    '/{prefix}/nav/global_costmap/costmap',
+    '/{prefix}/nav/global_costmap/costmap_updates',
+    '/{prefix}/nav/local_costmap/costmap',
+    '/{prefix}/nav/local_costmap/costmap_updates',
 
-    # RPP observables (controller_server publishes these by default)
-    '/{prefix}/lookahead_point',         # carrot — single point ~lookahead_dist ahead
-    '/{prefix}/lookahead_collision_arc', # arc RPP would commit to at current curvature
+    # RPP observables — also under /nav/. The carrot and rotation-mode
+    # flag are essential for diagnosing controller behavior; without
+    # them we can't tell whether the robot is following the carrot
+    # correctly or whether it's in a rotate-in-place vs forward-driving
+    # mode.
+    '/{prefix}/nav/lookahead_point',         # carrot — single point ~L ahead
+    '/{prefix}/nav/lookahead_collision_arc', # commanded arc
+    '/{prefix}/nav/is_rotating_to_heading',  # std_msgs/Bool — RPP mode flag
 
     # MPPI observable (only published indoor with MPPI controller; harmless when absent)
-    '/{prefix}/optimal_trajectory',
+    '/{prefix}/nav/optimal_trajectory',
 
     # Velocity chain
     '/{prefix}/cmd_vel',
