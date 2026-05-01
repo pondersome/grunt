@@ -98,31 +98,75 @@ controller_server:
     general_goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.6    # Must be < lookahead_dist (0.8) to avoid RPP's
-                                # carrot-within-tolerance rotate trap. At 0.6m this
-                                # is ~1.5x our F9P non-RTK h_acc (~0.3-0.4m). See
-                                # project_supervisor_threshold_refactor.md for the
-                                # auto-derivation backlog.
+      xy_goal_tolerance: 0.6    # Must be < min_lookahead_dist (0.8) to avoid
+                                # RPP's carrot-within-tolerance rotate trap. At
+                                # 0.6m this is ~1.5x our F9P non-RTK h_acc
+                                # (~0.3-0.4m). See
+                                # project_supervisor_threshold_refactor.md for
+                                # the auto-derivation backlog.
       yaw_goal_tolerance: 0.25  # ~14 degrees
     # Using Regulated Pure Pursuit instead of MPPI for Phase 1.
     # RPP is much lighter on CPU — critical for the quad-core NUC
     # which is already loaded with EKFs, GPS, IMU, and teleop.
     # MPPI can be revisited when running rviz on the desktop.
+    #
+    # Tuning round 2026-05-01 — bumped operating envelope to 1.0 m/s
+    # forward and π rad/s in-place rotation; turned on velocity-scaled
+    # lookahead. See ponderdocs/nav/docs/rpp_controller_explained.md
+    # for the geometric rationale and the 2026-05-01 mission analysis
+    # for the data driving these changes.
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.3
-      lookahead_dist: 0.8
-      min_lookahead_dist: 0.7
-      max_lookahead_dist: 1.2
+      # ─── speed envelope ────────────────────────────────────────────
+      # 0.3 → 1.0 m/s. The 0.3 cap was a Phase 1 safety throttle while
+      # we shook out localization and recovery. With the 2026-05-01
+      # missions clean (datum aligned, EKF tracking GPS to ~25cm
+      # median), we can lift toward operational speed. Pioneer 3-AT
+      # firmware ceiling is 1.5 m/s; 1.0 leaves margin for the
+      # regulated scaling to slow on tight curves.
+      desired_linear_vel: 1.0
+      # ─── lookahead — now velocity-scaled ───────────────────────────
+      # use_velocity_scaled_lookahead_dist=true makes
+      #   L = clamp(v * lookahead_time, min, max)
+      # which keeps time-to-carrot ≈ constant across speeds. This is
+      # essential at higher speeds: with fixed lookahead, K=2v/L grows
+      # linearly with v, so S-turn oscillation gets WORSE faster than
+      # speed grows. Velocity-scaling holds K nearly constant.
+      use_velocity_scaled_lookahead_dist: true
       lookahead_time: 1.5
-      rotate_to_heading_angular_vel: 0.6
-      # RPP's "rotate to goal heading" uses the CARROT (lookahead) pose
-      # distance as its "at goal?" check — xy_goal_tolerance MUST be <
-      # lookahead_dist or RPP locks into rotate-only mode. Currently
-      # 0.6 < 0.8. See bag 260415-200304-mission for the diagnosis.
+      # When velocity-scaled, lookahead_dist is the fallback used only
+      # if scaling somehow can't compute. Set close to the nominal
+      # operating value (v=1.0 → L=1.5).
+      lookahead_dist: 1.5
+      # min/max bracket the velocity-scaled lookahead. At low speed
+      # (e.g., during regulated curvature scaling that slows v), L
+      # clamps to min_lookahead_dist=0.8m. xy_goal_tolerance MUST stay
+      # below this floor to avoid RPP's "carrot inside tolerance ring
+      # → rotate-only" trap (was the 260415-200304 bug).
+      # At high speed (1.5 m/s), velocity-scaled L=2.25m clamps to
+      # max=2.5m — leaves headroom if we lift further toward firmware
+      # max in future tuning rounds.
+      min_lookahead_dist: 0.8
+      max_lookahead_dist: 2.5
+      # ─── in-place rotation ─────────────────────────────────────────
+      # 0.6 → π rad/s top angular velocity during rotate-to-heading.
+      # The kinematic decel formula in rotateToHeading() ensures we
+      # ramp down to zero at the target angle, so π is only achieved
+      # when the angle to turn is large enough (> ~88° at the new
+      # max_angular_accel). For smaller turns, the sqrt(2·α·|θ|)
+      # ceiling kicks in first.
+      rotate_to_heading_angular_vel: 3.14159
       use_rotate_to_heading: true
+      # ─── slew-rate limit on omega ──────────────────────────────────
+      # Was 1.5 (chosen earlier as a damping aid for S-turns). With
+      # rotate_to_heading_angular_vel=π, we need higher max_angular_
+      # accel so the in-place rotation can ramp to π in ~1s instead of
+      # ~2s. 3.2 (Nav2 default) gives π/3.2 ≈ 0.98s ramp. Forward
+      # driving's S-turn damping now relies on the longer lookahead
+      # (smaller K) rather than slew limiting.
+      max_angular_accel: 3.2
+      # ─── unchanged below ───────────────────────────────────────────
       transform_tolerance: 0.1
-      use_velocity_scaled_lookahead_dist: false
       min_approach_linear_velocity: 0.05
       approach_velocity_scaling_dist: 0.6
       use_collision_detection: false
@@ -136,7 +180,6 @@ controller_server:
       regulated_linear_scaling_min_radius: 0.9
       regulated_linear_scaling_min_speed: 0.25
       allow_reversing: false
-      max_angular_accel: 1.5
       max_robot_pose_search_dist: 10.0
 
 behavior_server:
