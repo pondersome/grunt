@@ -198,7 +198,7 @@ def generate_launch_description():
         #   rotacctop=5.24 rad/s² / 300 deg/s² (applies to both accel and decel)
         DeclareLaunchArgument('max_xspeed', default_value='1.5', description='Max translational velocity (m/s). Firmware ceiling: 1.5 m/s'),
         DeclareLaunchArgument('max_yawspeed', default_value='5', description='Max rotational velocity (rad/s). Firmware default: ~1.75 rad/s (100 deg/s). Ceiling: 6.28 rad/s (360 deg/s)'),
-        DeclareLaunchArgument('max_xaccel', default_value='1.5', description='Translational acceleration (m/s²). 0.0 = firmware default. Ceiling: 2.0 m/s²'),
+        DeclareLaunchArgument('max_xaccel', default_value='2.0', description='Translational acceleration (m/s²). 0.0 = firmware default. Ceiling: 2.0 m/s² (now at ceiling — bumped 2026-05-01 from 1.5 after the cmd-vs-actual analysis showed ~250ms linear actuation lag at the 1.0 m/s operating speed; rotational accel was already at 5.0 rad/s² ceiling, so this is the only physical accel handle left to tighten).'),
         DeclareLaunchArgument('max_xdecel', default_value='2.0', description='Translational deceleration (m/s²). 0.0 = firmware default. Ceiling: 2.0 m/s²'),
         DeclareLaunchArgument('max_yawaccel', default_value='5.0', description='Rotational acceleration (rad/s²). 0.0 = firmware default (~1.75 rad/s²). Ceiling: 5.24 rad/s²'),
         DeclareLaunchArgument('max_yawdecel', default_value='5.0', description='Rotational deceleration (rad/s²). 0.0 = firmware default (~1.75 rad/s²). Ceiling: 5.24 rad/s²'),

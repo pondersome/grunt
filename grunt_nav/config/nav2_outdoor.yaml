@@ -133,21 +133,33 @@ controller_server:
       # linearly with v, so S-turn oscillation gets WORSE faster than
       # speed grows. Velocity-scaling holds K nearly constant.
       use_velocity_scaled_lookahead_dist: true
-      lookahead_time: 1.5
+      # 1.5 → 3.0s. The 2026-05-01 missions revealed actuation lag of
+      # 250-300ms (cmd_vel_response.angular_xcorr_lag), driven by
+      # skid-steer slip + ARCOS firmware ramping at the 5 rad/s²
+      # ceiling we're already at. Closed-loop oscillation period =
+      # lookahead_time + actuation_lag was 1.5 + 0.3 = 1.8s, with the
+      # lag at 17% of the period — too large for clean damping. With
+      # lookahead_time=3.0, period becomes 3.3s and lag drops to 9%
+      # — the geometric loop dominates, the lag is a small perturbation
+      # rather than a phase-shifted resonance driver. Side effect: more
+      # corner-cutting, but driveway curves are gentle and waypoint
+      # spacing is wide enough that this won't drop us off-path.
+      lookahead_time: 3.0
       # When velocity-scaled, lookahead_dist is the fallback used only
-      # if scaling somehow can't compute. Set close to the nominal
-      # operating value (v=1.0 → L=1.5).
-      lookahead_dist: 1.5
+      # if scaling somehow can't compute.
+      lookahead_dist: 2.0
       # min/max bracket the velocity-scaled lookahead. At low speed
       # (e.g., during regulated curvature scaling that slows v), L
-      # clamps to min_lookahead_dist=0.8m. xy_goal_tolerance MUST stay
+      # clamps to min_lookahead_dist. xy_goal_tolerance MUST stay
       # below this floor to avoid RPP's "carrot inside tolerance ring
-      # → rotate-only" trap (was the 260415-200304 bug).
-      # At high speed (1.5 m/s), velocity-scaled L=2.25m clamps to
-      # max=2.5m — leaves headroom if we lift further toward firmware
-      # max in future tuning rounds.
-      min_lookahead_dist: 0.8
-      max_lookahead_dist: 2.5
+      # → rotate-only" trap (was the 260415-200304 bug). Bumped to
+      # 1.0 to widen the floor headroom over xy_goal_tolerance=0.6 and
+      # to keep the geometric loop time-constant from collapsing at
+      # the lowest commanded speeds.
+      # At high speed (v=1.0), velocity-scaled L = 1.0×3.0 = 3.0m, so
+      # raised max_lookahead_dist to 3.5 to leave headroom.
+      min_lookahead_dist: 1.0
+      max_lookahead_dist: 3.5
       # ─── in-place rotation ─────────────────────────────────────────
       # 0.6 → π rad/s top angular velocity during rotate-to-heading.
       # The kinematic decel formula in rotateToHeading() ensures we
