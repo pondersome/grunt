@@ -98,12 +98,17 @@ controller_server:
     general_goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.6    # Must be < min_lookahead_dist (0.8) to avoid
-                                # RPP's carrot-within-tolerance rotate trap. At
-                                # 0.6m this is ~1.5x our F9P non-RTK h_acc
-                                # (~0.3-0.4m). See
-                                # project_supervisor_threshold_refactor.md for
-                                # the auto-derivation backlog.
+      xy_goal_tolerance: 1.0    # Must be < min_lookahead_dist (now 1.2) to
+                                # avoid RPP's carrot-within-tolerance rotate
+                                # trap. Bumped 2026-05-01 from 0.6 → 1.0 to
+                                # reduce per-waypoint rotate-to-goal-heading
+                                # episodes; the captured-driveway path's
+                                # waypoints are spaced wider than 1m apart, so
+                                # this stays well within "passing through"
+                                # tolerance for normal traversal. End-of-
+                                # mission positioning may be looser as a
+                                # result; per-waypoint tolerance (deferred
+                                # backlog) is the principled solution.
       yaw_goal_tolerance: 0.25  # ~14 degrees
     # Using Regulated Pure Pursuit instead of MPPI for Phase 1.
     # RPP is much lighter on CPU — critical for the quad-core NUC
@@ -133,33 +138,26 @@ controller_server:
       # linearly with v, so S-turn oscillation gets WORSE faster than
       # speed grows. Velocity-scaling holds K nearly constant.
       use_velocity_scaled_lookahead_dist: true
-      # 1.5 → 3.0s. The 2026-05-01 missions revealed actuation lag of
-      # 250-300ms (cmd_vel_response.angular_xcorr_lag), driven by
-      # skid-steer slip + ARCOS firmware ramping at the 5 rad/s²
-      # ceiling we're already at. Closed-loop oscillation period =
-      # lookahead_time + actuation_lag was 1.5 + 0.3 = 1.8s, with the
-      # lag at 17% of the period — too large for clean damping. With
-      # lookahead_time=3.0, period becomes 3.3s and lag drops to 9%
-      # — the geometric loop dominates, the lag is a small perturbation
-      # rather than a phase-shifted resonance driver. Side effect: more
-      # corner-cutting, but driveway curves are gentle and waypoint
-      # spacing is wide enough that this won't drop us off-path.
-      lookahead_time: 3.0
-      # When velocity-scaled, lookahead_dist is the fallback used only
-      # if scaling somehow can't compute.
-      lookahead_dist: 2.0
-      # min/max bracket the velocity-scaled lookahead. At low speed
-      # (e.g., during regulated curvature scaling that slows v), L
-      # clamps to min_lookahead_dist. xy_goal_tolerance MUST stay
-      # below this floor to avoid RPP's "carrot inside tolerance ring
-      # → rotate-only" trap (was the 260415-200304 bug). Bumped to
-      # 1.0 to widen the floor headroom over xy_goal_tolerance=0.6 and
-      # to keep the geometric loop time-constant from collapsing at
-      # the lowest commanded speeds.
-      # At high speed (v=1.0), velocity-scaled L = 1.0×3.0 = 3.0m, so
-      # raised max_lookahead_dist to 3.5 to leave headroom.
-      min_lookahead_dist: 1.0
-      max_lookahead_dist: 3.5
+      # Round 3 (2026-05-01 evening): bumped 3.0 → 4.5s. The previous
+      # round dropped abs_median(ω) from 0.46 → 0.12 rad/s and stdev
+      # from 0.65 → 0.32 — large win — but visible meandering in N1/N2
+      # missions still showed the chassis settling parallel to the path
+      # but offset, with rotations at the waypoint transitions. Bumping
+      # lookahead_time further softens K = 2v/L (gain inversely
+      # proportional to L) so per-cycle correction commands shrink and
+      # the chassis under-delivery (slope ~0.5) becomes a smaller
+      # absolute error. Closed-loop period now ≈ 4.5 + 0.3 = 4.8s.
+      lookahead_time: 4.5
+      # Fallback when velocity-scaling can't compute.
+      lookahead_dist: 3.0
+      # min/max clamps. Floor bumped 1.0 → 1.2 because xy_goal_tolerance
+      # rose 0.6 → 1.0 (per-mission-2026-05-01-N1-and-N2 config) — must
+      # keep min_lookahead_dist > xy_goal_tolerance.
+      # Ceiling bumped 3.5 → 5.0 to accommodate v=1.0 × 4.5s = 4.5m,
+      # plus headroom for the 1.5 m/s firmware ceiling if speed lifts
+      # again later.
+      min_lookahead_dist: 1.2
+      max_lookahead_dist: 5.0
       # ─── in-place rotation ─────────────────────────────────────────
       # 0.6 → π rad/s top angular velocity during rotate-to-heading.
       # The kinematic decel formula in rotateToHeading() ensures we
@@ -169,6 +167,16 @@ controller_server:
       # ceiling kicks in first.
       rotate_to_heading_angular_vel: 3.14159
       use_rotate_to_heading: true
+      # Lowered 0.785 (45°) → 0.5 (~28.6°). Operator philosophy: prefer
+      # earlier, smaller in-place corrections over rare large ones.
+      # At α=28.6°, the kinematic-decel ceiling is sqrt(2·3.2·0.5) =
+      # 1.79 rad/s — 56% of the rotate_to_heading_angular_vel cap, so
+      # rotations stay well below π and execute in ~0.5s. Side effect:
+      # more rotation episodes per mission (the 2026-05-01 N1/N2
+      # missions had 36-46 episodes at the old threshold; expect
+      # roughly double at the lower one). Trade-off accepted: small
+      # frequent corrections > rare drastic ones.
+      rotate_to_heading_min_angle: 0.5
       # ─── slew-rate limit on omega ──────────────────────────────────
       # Was 1.5 (chosen earlier as a damping aid for S-turns). With
       # rotate_to_heading_angular_vel=π, we need higher max_angular_
