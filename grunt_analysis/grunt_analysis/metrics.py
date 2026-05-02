@@ -362,38 +362,192 @@ def rotation_mode_fraction(parsed) -> dict:
 
 
 def carrot_tracking(parsed) -> dict:
-    """Distance from EKF position to the carrot when each carrot is published.
+    """Distance from robot to the carrot.
 
-    Reads /grunt1/nav/lookahead_point and /grunt1/odometry/global. The
-    distance should be approximately `lookahead_dist` (or its
-    velocity-scaled equivalent) when RPP is operating normally; large
-    deviations indicate something wrong with the carrot computation
-    or the path being received.
+    The carrot is published in `base_link` frame — the robot's body
+    frame — so the carrot point's (x, y) is *already* the displacement
+    from robot to carrot. Just take the magnitude. No EKF reference
+    needed.
+
+    Distance should be approximately `lookahead_dist` when RPP is
+    operating normally (or velocity-scaled equivalent — at v≈1.0 m/s
+    with lookahead_time=1.5 s and clamp [0.8, 2.5], expect ~1.5 m).
+    Deviations from expected indicate either RPP is in a non-standard
+    mode (e.g., rotating in place, where the carrot may be near zero)
+    or something is wrong upstream.
     """
     carrots = parsed.get("/grunt1/nav/lookahead_point", [])
-    odom = parsed.get("/grunt1/odometry/global", [])
-    if not carrots or not odom:
+    if not carrots:
         return {"name": "carrot_tracking", "n": 0,
-                "note": "missing carrot or odometry"}
-    odom_t = [r[0] for r in odom]
-    dists = []
-    for (t, cx, cy) in carrots:
-        i = bisect.bisect_left(odom_t, t)
-        if i >= len(odom) or abs(odom[i][0] - t) > 0.5:
-            continue
-        ex, ey = odom[i][1], odom[i][2]
-        dists.append(math.hypot(cx - ex, cy - ey))
-    if not dists:
-        return {"name": "carrot_tracking", "n": 0}
+                "note": "missing carrot"}
+    dists = [math.hypot(cx, cy) for (_, cx, cy) in carrots]
     sd = sorted(dists)
+    # Also report angle to carrot in body frame — sin(α) is the
+    # error signal in the geometric formula. Median |α| close to 0
+    # = robot pointing at the carrot; large |α| = robot offset.
+    angles_deg = [math.degrees(math.atan2(cy, cx)) for (_, cx, cy) in carrots]
+    abs_angles = [abs(a) for a in angles_deg]
+    sa = sorted(abs_angles)
     return {
         "name": "carrot_tracking",
         "n": len(dists),
         "median_dist_to_carrot_m": round(s.median(dists), 3),
         "p10_dist_m": round(sd[len(sd) // 10], 3),
         "p90_dist_m": round(sd[int(len(sd) * 0.9)], 3),
-        "stdev_dist_m": round(s.stdev(dists), 3) if len(dists) > 1 else 0,
+        "max_dist_m": round(max(dists), 3),
+        "median_abs_alpha_deg": round(s.median(abs_angles), 2),
+        "p90_abs_alpha_deg": round(sa[int(len(sa) * 0.9)], 2),
+        "max_abs_alpha_deg": round(max(abs_angles), 2),
     }
+
+
+def cmd_vel_response(parsed) -> dict:
+    """Compare commanded velocity to actual chassis velocity.
+
+    The 2026-05-01-evening missions revealed that at higher operating
+    speeds the chassis was delivering only ~half the commanded angular
+    velocity (actual_ω / cmd_ω = 0.47-0.49). This metric isolates the
+    problem by computing:
+
+      - linear regression slope of (cmd, actual) — the "ratio"
+      - cross-correlation lag at peak (controller-vs-actuation delay)
+      - saturation point (if any) where actual stops growing with cmd
+
+    Inputs: /grunt1/cmd_vel (commanded, after twist_mux) and
+    /grunt1/odometry/local (chassis-reported actual velocity from
+    wheel + IMU fusion). We use cmd_vel rather than cmd_vel_nav_raw
+    because cmd_vel is what reaches p2os, after collision_monitor and
+    twist_mux gating.
+
+    Linear and angular reported separately.
+    """
+    cmd = parsed.get("/grunt1/cmd_vel", [])
+    local = parsed.get("/grunt1/odometry/local", [])
+    if not cmd or not local or len(local[0]) < 4:
+        return {"name": "cmd_vel_response", "n": 0,
+                "note": "missing cmd_vel or odometry/local twist"}
+    odom_t = [r[0] for r in local]
+
+    # Build matched-time series: for each cmd_vel sample, find the
+    # nearest local-odom sample within +/-50ms; pair if matched.
+    pairs_lin, pairs_ang = [], []
+    for (t, vx, vyaw) in cmd:
+        i = bisect.bisect_left(odom_t, t)
+        if i >= len(local) or abs(local[i][0] - t) > 0.05:
+            continue
+        # local: (t, yaw_rad, vx, vyaw, x, y)
+        actual_vx = local[i][2]
+        actual_vyaw = local[i][3]
+        pairs_lin.append((vx, actual_vx))
+        pairs_ang.append((vyaw, actual_vyaw))
+
+    if not pairs_ang:
+        return {"name": "cmd_vel_response", "n": 0,
+                "note": "no time-aligned cmd vs actual pairs"}
+
+    def _regress(pairs, abs_threshold):
+        """Linear regression actual = slope * cmd + intercept, restricted
+        to |cmd| > threshold (avoids dominating by stationary noise)."""
+        filtered = [(c, a) for (c, a) in pairs if abs(c) > abs_threshold]
+        if len(filtered) < 30:
+            return None
+        n = len(filtered)
+        cs = [c for c, _ in filtered]
+        as_ = [a for _, a in filtered]
+        cm = sum(cs) / n; am = sum(as_) / n
+        num = sum((cs[i] - cm) * (as_[i] - am) for i in range(n))
+        den = sum((cs[i] - cm) ** 2 for i in range(n))
+        if den < 1e-9:
+            return None
+        slope = num / den
+        intercept = am - slope * cm
+        # R²
+        ss_tot = sum((a - am) ** 2 for a in as_)
+        if ss_tot < 1e-9:
+            return None
+        ss_res = sum(
+            (as_[i] - (slope * cs[i] + intercept)) ** 2
+            for i in range(n))
+        r2 = 1 - ss_res / ss_tot
+        return {
+            "n_pairs": n,
+            "slope": slope,
+            "intercept": intercept,
+            "r_squared": r2,
+        }
+
+    # Cross-correlation lag: shift the actual series in time, find the
+    # lag where correlation peaks. Sample to a uniform grid first.
+    def _xcorr_lag(pairs_t_a_c, dt=0.05, max_lag_s=1.0):
+        """pairs_t_a_c: list of (t, cmd, actual). Returns lag in seconds
+        where cmd→actual cross-correlation peaks."""
+        if len(pairs_t_a_c) < 100:
+            return None
+        # Already sorted by time
+        ts = [r[0] for r in pairs_t_a_c]
+        cs = [r[1] for r in pairs_t_a_c]
+        as_ = [r[2] for r in pairs_t_a_c]
+        # Resample to uniform dt grid via nearest-neighbor — bag's
+        # pairing already approximates this within 50 ms.
+        max_lag_steps = int(max_lag_s / dt)
+        best_lag = 0; best_corr = -2.0
+        n = len(cs)
+        for lag in range(-max_lag_steps, max_lag_steps + 1):
+            # Compare cs[i] to as_[i+lag]
+            if lag >= 0:
+                cs_w = cs[: n - lag]; as_w = as_[lag:]
+            else:
+                cs_w = cs[-lag:]; as_w = as_[: n + lag]
+            if len(cs_w) < 30:
+                continue
+            cm = sum(cs_w) / len(cs_w); am = sum(as_w) / len(as_w)
+            num = sum((cs_w[i] - cm) * (as_w[i] - am)
+                      for i in range(len(cs_w)))
+            den_c = sum((c - cm) ** 2 for c in cs_w) ** 0.5
+            den_a = sum((a - am) ** 2 for a in as_w) ** 0.5
+            if den_c * den_a < 1e-9:
+                continue
+            corr = num / (den_c * den_a)
+            if corr > best_corr:
+                best_corr = corr
+                best_lag = lag
+        return {"lag_s": best_lag * dt, "peak_corr": best_corr}
+
+    # Build (t, cmd, actual) for cross-correlation
+    matched_ang = []
+    matched_lin = []
+    for (t, vx, vyaw) in cmd:
+        i = bisect.bisect_left(odom_t, t)
+        if i >= len(local) or abs(local[i][0] - t) > 0.05:
+            continue
+        matched_ang.append((t, vyaw, local[i][3]))
+        matched_lin.append((t, vx, local[i][2]))
+
+    out = {
+        "name": "cmd_vel_response",
+        "n_pairs": len(pairs_ang),
+        "linear_regression": _regress(pairs_lin, abs_threshold=0.10),
+        "angular_regression": _regress(pairs_ang, abs_threshold=0.10),
+        "linear_xcorr_lag": _xcorr_lag(matched_lin),
+        "angular_xcorr_lag": _xcorr_lag(matched_ang),
+    }
+    # Quick saturation check: bin |cmd| and report median |actual|
+    # in each bin. If actual flatlines while cmd grows, that's saturation.
+    if pairs_ang:
+        bins = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8),
+                (0.8, 1.0), (1.0, 1.5), (1.5, 3.0)]
+        sat = []
+        for lo, hi in bins:
+            in_bin = [abs(a) for c, a in pairs_ang if lo <= abs(c) < hi]
+            if in_bin:
+                sat.append({
+                    "cmd_bin": f"[{lo:.1f}, {hi:.1f})",
+                    "n": len(in_bin),
+                    "median_abs_actual": round(s.median(in_bin), 3),
+                })
+        out["angular_saturation_curve"] = sat
+
+    return out
 
 
 def heading_obs_acceptance(parsed) -> dict:
@@ -467,6 +621,7 @@ DEFAULT_METRICS = (
     rtk_continuity,
     cmd_vel_breakdown,
     control_oscillation,
+    cmd_vel_response,
     rotation_mode_fraction,
     carrot_tracking,
     heading_obs_acceptance,

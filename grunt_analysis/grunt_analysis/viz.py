@@ -15,6 +15,7 @@ import matplotlib
 matplotlib.use("SVG")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
+from matplotlib.lines import Line2D
 
 from .geo import GeoAnchor, lla_to_local_enu
 
@@ -86,17 +87,30 @@ def accuracy_tube(parsed_by_label: dict[str, dict],
         ax.plot(ekf_x, ekf_y, color="#666", linewidth=0.4, alpha=0.5,
                 zorder=3, label="EKF /odometry/global")
 
-        # Carrot stream — sequence of points the controller was steering
-        # toward. Carrots lie on the planned path by construction; this
-        # effectively traces the planner's output along the actual mission
-        # window. Thinned to keep visual density manageable on long bags.
-        if carrots:
+        # Carrot stream — published in base_link frame (robot body frame).
+        # To overlay on the map-frame plot we rotate by the robot's yaw
+        # and translate by the robot's map-frame position, both at the
+        # carrot's timestamp. Source: /grunt1/odometry/global at the
+        # matching time gives both yaw and position.
+        if carrots and odom:
+            odom_t_full = [r[0] for r in odom]
             cstep = max(1, len(carrots) // 400)
-            cx = [c[1] for c in carrots[::cstep]]
-            cy = [c[2] for c in carrots[::cstep]]
-            ax.scatter(cx, cy, s=4, color="#9333ea", marker=".",
-                       alpha=0.6, zorder=5,
-                       label=f"carrot ({len(carrots)} pts, every {cstep}th shown)")
+            cx, cy = [], []
+            for (ct, ccx, ccy) in carrots[::cstep]:
+                j = bisect.bisect_left(odom_t_full, ct)
+                if j >= len(odom) or abs(odom[j][0] - ct) > 0.5:
+                    continue
+                # odom: (t, x, y, yaw_rad) — yaw already in radians.
+                _, rx, ry, ryaw = odom[j]
+                cos_y = math.cos(ryaw); sin_y = math.sin(ryaw)
+                cx_w = rx + ccx * cos_y - ccy * sin_y
+                cy_w = ry + ccx * sin_y + ccy * cos_y
+                cx.append(cx_w); cy.append(cy_w)
+            if cx:
+                ax.scatter(cx, cy, s=4, color="#9333ea", marker=".",
+                           alpha=0.6, zorder=5,
+                           label=f"carrot ({len(carrots)} pts → map, "
+                                 f"every {cstep}th shown)")
 
         # Rotation-mode highlight: where in space was the robot when RPP
         # was in rotate-to-heading mode? Plot EKF positions during those
@@ -185,3 +199,125 @@ def _detect_joy_bursts(joy_samples: list[tuple],
                 bursts.append((bs, t - bs))
             in_burst = False
     return bursts
+
+
+def cmd_vs_actual(parsed: dict, out_path: str | Path,
+                  title: str = "Cmd vs actual chassis velocity") -> Path:
+    """Three-panel diagnostic for cmd-vel response health:
+
+      Left  — angular velocity time series: cmd vs actual
+      Mid   — angular cmd vs actual scatter, with y=x and regression line
+      Right — linear cmd vs actual scatter
+
+    Reveals lag (offset between traces in time series), gain reduction
+    (regression slope < 1), and saturation (actual flatlines while cmd
+    grows).
+    """
+    import bisect
+    cmd = parsed.get("/grunt1/cmd_vel", [])
+    local = parsed.get("/grunt1/odometry/local", [])
+    if not cmd or not local or len(local[0]) < 4:
+        raise ValueError("cmd_vs_actual: missing cmd_vel or odometry/local")
+
+    odom_t = [r[0] for r in local]
+    matched = []
+    for (t, vx, vyaw) in cmd:
+        i = bisect.bisect_left(odom_t, t)
+        if i >= len(local) or abs(local[i][0] - t) > 0.05:
+            continue
+        # local: (t, yaw_rad, vx, vyaw, x, y)
+        matched.append((t, vx, vyaw, local[i][2], local[i][3]))
+    if not matched:
+        raise ValueError("cmd_vs_actual: no time-aligned cmd/actual pairs")
+
+    t0 = matched[0][0]
+    ts = [r[0] - t0 for r in matched]
+    cmd_lin = [r[1] for r in matched]
+    cmd_ang = [r[2] for r in matched]
+    actual_lin = [r[3] for r in matched]
+    actual_ang = [r[4] for r in matched]
+
+    fig = plt.figure(figsize=(18, 6))
+    gs = fig.add_gridspec(1, 3, width_ratios=[2, 1, 1], wspace=0.25)
+    fig.suptitle(title, fontsize=12)
+
+    # ── Panel 1: angular time series ──
+    ax1 = fig.add_subplot(gs[0, 0])
+    # Plot a window of the middle-most third — full series at 10 Hz over
+    # 5 minutes is too dense to see lag visually.
+    n = len(ts)
+    a, b = n // 3, n // 3 + min(n // 3, 600)  # ~60 s window
+    ax1.plot(ts[a:b], cmd_ang[a:b], color="#dc2626", linewidth=1.0,
+             label="commanded ω", alpha=0.9)
+    ax1.plot(ts[a:b], actual_ang[a:b], color="#0891b2", linewidth=1.0,
+             label="actual ω (odom)", alpha=0.9)
+    ax1.set_xlabel("t (s)")
+    ax1.set_ylabel("angular velocity (rad/s)")
+    ax1.set_title(f"angular cmd vs actual — middle 60s window "
+                  f"(t={ts[a]:.0f}…{ts[b-1]:.0f}s)", fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc="upper right", fontsize=9)
+    ax1.axhline(0, color="black", linewidth=0.5, alpha=0.5)
+
+    # ── Panel 2: angular scatter ──
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.scatter(cmd_ang, actual_ang, s=4, alpha=0.15, color="#0891b2")
+    lim = max(abs(min(cmd_ang + actual_ang)),
+              abs(max(cmd_ang + actual_ang))) * 1.05
+    ax2.plot([-lim, lim], [-lim, lim], color="black",
+             linewidth=1, linestyle="--", label="actual = cmd", alpha=0.6)
+    # Regression on |cmd| > 0.1
+    f = [(c, a) for c, a in zip(cmd_ang, actual_ang) if abs(c) > 0.1]
+    if len(f) > 30:
+        cs, as_ = zip(*f)
+        cm = sum(cs) / len(cs); am = sum(as_) / len(as_)
+        num = sum((cs[i] - cm) * (as_[i] - am) for i in range(len(cs)))
+        den = sum((c - cm) ** 2 for c in cs)
+        if den > 1e-9:
+            slope = num / den
+            intercept = am - slope * cm
+            ax2.plot([-lim, lim],
+                     [slope * -lim + intercept, slope * lim + intercept],
+                     color="#dc2626", linewidth=1.5,
+                     label=f"fit: slope={slope:.2f}")
+    ax2.set_xlabel("commanded ω (rad/s)")
+    ax2.set_ylabel("actual ω (rad/s)")
+    ax2.set_xlim(-lim, lim); ax2.set_ylim(-lim, lim)
+    ax2.set_title("angular cmd → actual", fontsize=10)
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc="upper left", fontsize=9)
+    ax2.set_aspect("equal")
+
+    # ── Panel 3: linear scatter ──
+    ax3 = fig.add_subplot(gs[0, 2])
+    ax3.scatter(cmd_lin, actual_lin, s=4, alpha=0.15, color="#0891b2")
+    lim_l = max(abs(min(cmd_lin + actual_lin)),
+                abs(max(cmd_lin + actual_lin))) * 1.05
+    ax3.plot([-lim_l, lim_l], [-lim_l, lim_l], color="black",
+             linewidth=1, linestyle="--", label="actual = cmd", alpha=0.6)
+    f = [(c, a) for c, a in zip(cmd_lin, actual_lin) if abs(c) > 0.05]
+    if len(f) > 30:
+        cs, as_ = zip(*f)
+        cm = sum(cs) / len(cs); am = sum(as_) / len(as_)
+        num = sum((cs[i] - cm) * (as_[i] - am) for i in range(len(cs)))
+        den = sum((c - cm) ** 2 for c in cs)
+        if den > 1e-9:
+            slope = num / den
+            intercept = am - slope * cm
+            ax3.plot([-lim_l, lim_l],
+                     [slope * -lim_l + intercept, slope * lim_l + intercept],
+                     color="#dc2626", linewidth=1.5,
+                     label=f"fit: slope={slope:.2f}")
+    ax3.set_xlabel("commanded vx (m/s)")
+    ax3.set_ylabel("actual vx (m/s)")
+    ax3.set_xlim(-lim_l, lim_l); ax3.set_ylim(-lim_l, lim_l)
+    ax3.set_title("linear cmd → actual", fontsize=10)
+    ax3.grid(True, alpha=0.3)
+    ax3.legend(loc="upper left", fontsize=9)
+    ax3.set_aspect("equal")
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out, format="svg", bbox_inches="tight")
+    plt.close(fig)
+    return out

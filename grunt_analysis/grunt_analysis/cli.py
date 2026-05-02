@@ -111,6 +111,15 @@ def main(argv: list[str] | None = None) -> int:
                        title=f"Accuracy tube — {label}")
     print(f"wrote {svg_path}")
 
+    # cmd_vel response SVG (best-effort — needs both cmd_vel and odometry/local)
+    try:
+        cva_path = out_dir / "cmd_vs_actual.svg"
+        viz.cmd_vs_actual(parsed, cva_path,
+                           title=f"cmd→actual — {label}")
+        print(f"wrote {cva_path}")
+    except Exception as e:
+        print(f"(skipped cmd_vs_actual: {e})")
+
     return 0
 
 

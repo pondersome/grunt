@@ -28,7 +28,7 @@ from .geo import quat_yaw
 # Tuple schemas — what each parsed message gets reduced to:
 TOPIC_SCHEMA = {
     "/grunt1/odometry/global":   "(t, x, y, yaw_rad)",
-    "/grunt1/odometry/local":    "(t, yaw_rad, vx, vyaw)",
+    "/grunt1/odometry/local":    "(t, yaw_rad, vx, vyaw, x, y)",
     "/grunt1/odometry/gps_map":  "(t, x, y)",
     "/grunt1/odometry/gps":      "(t, x, y)",
     "/grunt1/rtk/fix":           "(t, lat, lon, alt)",
@@ -59,8 +59,11 @@ def _decode_message(topic: str, msg, t: float) -> Optional[tuple]:
         p = msg.pose.pose
         return (t, p.position.x, p.position.y, quat_yaw(p.orientation))
     if topic == "/grunt1/odometry/local":
-        return (t, quat_yaw(msg.pose.pose.orientation),
-                msg.twist.twist.linear.x, msg.twist.twist.angular.z)
+        # Position included for carrot-tracking (carrot is in odom frame).
+        p = msg.pose.pose
+        return (t, quat_yaw(p.orientation),
+                msg.twist.twist.linear.x, msg.twist.twist.angular.z,
+                p.position.x, p.position.y)
     if topic in ("/grunt1/odometry/gps_map", "/grunt1/odometry/gps"):
         p = msg.pose.pose.position
         return (t, p.x, p.y)
