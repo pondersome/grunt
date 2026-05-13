@@ -314,23 +314,67 @@ collision_monitor:
     # obstacle is directly in front and close enough that predictive
     # scaling (FootprintApproach below) would still let the robot
     # coast into it before sensors go dead (~0.15m min_range).
+    #
+    # Velocity-aware split (added 2026-05-02): the bumper polygon is
+    # selected by commanded velocity. This unblocks BackUp recovery,
+    # which had been silently failing under the original full-envelope
+    # polygon: side foliage near a stuck robot would land in the rear
+    # half of the polygon, gating reverse cmd_vel to zero, and the BT's
+    # EscapeSequence couldn't make progress. See
+    # ponderdocs/nav/docs/segment_deviation_2026-05-02.md for the bag
+    # evidence (19.5s standstill at t=329s in bag 00-12).
+    #
+    # Three sub-polygons:
+    #   stop_zero      vx ∈ [-0.05, 0.05]   FULL chassis envelope.
+    #                                        Used at rest and during
+    #                                        in-place rotation. Sweeps
+    #                                        whole chassis as the spin
+    #                                        envelope.
+    #   stop_forward   vx >  0.05           FRONT half (x ∈ [0, 0.55]).
+    #                                        RPP's normal forward
+    #                                        bumper. Front edge math
+    #                                        is unchanged from the
+    #                                        original polygon: at 0.3
+    #                                        m/s commanded, regulated
+    #                                        approach reaches ~0.15
+    #                                        m/s, ~0.15m of stopping
+    #                                        distance puts robot at
+    #                                        ~0.40m (just inside
+    #                                        sensor 4's 0.15m
+    #                                        deadzone reach in
+    #                                        base_link).
+    #   stop_backward  vx <  -0.05          REAR half (x ∈ [-0.32, 0]).
+    #                                        Side foliage off the
+    #                                        front no longer blocks
+    #                                        BackUp; only physical
+    #                                        rear obstacles do.
+    # Side edges inflate chassis by ~7cm for clearance margin.
     FootprintStop:
-      type: "polygon"
+      type: "velocity_polygon"
       action_type: "stop"
-      # Forward edge at 0.55m — pushes the stop trigger out past the
-      # deceleration envelope. At 0.3 m/s commanded, RPP's regulated
-      # approach brings us to ~0.15 m/s near the polygon edge; allowing
-      # ~0.15m of stopping distance from that speed means forward hit
-      # detected at 0.55m, robot comes to rest at ~0.40m. That's where
-      # sensor 4's min_range (0.15m) starts being a problem in base_link
-      # frame (0.24 + 0.15 = 0.39m) — so stopping at ~0.40m keeps the
-      # obstacle *just* inside sensor reach where persistence can
-      # continue to refresh if it does show up again.
-      # Side/rear edges inflate chassis by ~7cm for clearance margin.
-      points: "[[0.55, 0.32], [0.55, -0.32], [-0.32, -0.32], [-0.32, 0.32]]"
       min_points: 1
       visualize: true
       enabled: true
+      holonomic: false
+      velocity_polygons: ["stop_zero", "stop_forward", "stop_backward"]
+      stop_zero:
+        points: "[[0.55, 0.32], [0.55, -0.32], [-0.32, -0.32], [-0.32, 0.32]]"
+        linear_min: -0.05
+        linear_max: 0.05
+        theta_min: -999.0
+        theta_max: 999.0
+      stop_forward:
+        points: "[[0.55, 0.32], [0.55, -0.32], [0.0, -0.32], [0.0, 0.32]]"
+        linear_min: 0.05
+        linear_max: 999.0
+        theta_min: -999.0
+        theta_max: 999.0
+      stop_backward:
+        points: "[[0.0, 0.32], [0.0, -0.32], [-0.32, -0.32], [-0.32, 0.32]]"
+        linear_min: -999.0
+        linear_max: -0.05
+        theta_min: -999.0
+        theta_max: 999.0
     # Predictive slowdown zone: scale cmd_vel down as time-to-collision
     # shortens, along the projected footprint path. This catches
     # obstacles that are further out but on-course, giving the robot
