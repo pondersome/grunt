@@ -1,0 +1,57 @@
+# l2lidar_node parameters tuned for Grunt — non-frame, non-topic settings only.
+#
+# Frame IDs and the orphan-parent robot_id are composed at launch time from the
+# `prefix` launch argument (so multiple sibling bots on the same network don't
+# collide), and topic namespacing comes from PushRosNamespace. See
+# grunt_l2.launch.py for that wiring.
+#
+# What's set here that differs from markgol's stock defaults:
+#   • Network: post-migration 10.42.0.0/24 (not factory 192.168.1.0/24)
+#   • imu_adjust: false  — don't use the L2's fused quaternion to deskew the
+#                          cloud. Our characterization showed yaw drifts at
+#                          gyro-bias rate (~16°/min) since the IMU is 6-axis;
+#                          letting it deskew clouds would inject that drift.
+#                          We'll do our own motion compensation downstream
+#                          when we wire the L2 IMU into Grunt's EKF.
+#   • enable_IMU_publishing: true — the IMU empirical analysis showed it's
+#                          high-grade (BMI088 / ICM-42688-class), good for
+#                          tight pitch/roll fusion. Publish it; consumers
+#                          can choose to use it.
+#   • watchdog_timeout_ms: 60000 — generous; lets the L2 fully cold-boot
+#                          (~20 s) before the watchdog complains.
+#   • aggregateNframes: 38 — one full hemisphere scan per cloud, ~5.5 Hz
+#                          publish rate, suits Nav2's obstacle layer.
+
+# Top-level key must be `/**:` (not `l2lidar_node:`) because the node runs
+# under a launch-pushed namespace (e.g. /grunt1/l2/l2lidar_node). The bare
+# name wouldn't match and params would silently not load. Same trap as
+# twist_mux's YAML on this platform.
+/**:
+  ros__parameters:
+    # ---------------- Network (post-IP-migration) ----------------
+    l2_ip: "10.42.0.62"
+    l2_port: 6101
+    host_ip: "10.42.0.2"
+    host_port: 6201
+
+    # ---------------- Time sync ----------------
+    enable_l2_time_correction: true
+    enable_l2_host_sync: true
+    l2_sync_rate_ms: 50
+    enable_latency_measure: false
+
+    # ---------------- Point cloud ----------------
+    frame3d: true
+    imu_adjust: false                   # see header comment
+    aggregateNframes: 38                # ~5.5 Hz at hemisphere granularity
+
+    # ---------------- Range calibration ----------------
+    EnableCalRangeOVR: false
+    calRangeScale: 0.000978
+    calRangeBias: -365.625
+
+    # ---------------- Watchdog ----------------
+    watchdog_timeout_ms: 60000
+
+    # ---------------- IMU publishing ----------------
+    enable_IMU_publishing: true

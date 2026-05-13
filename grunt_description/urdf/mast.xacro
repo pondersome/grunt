@@ -100,8 +100,13 @@
     </collision>
   </link>
 
-  <!-- Unitree L2 4D LiDAR -->
-  <link name="$(arg prefix)lidar_3d_link">
+  <!-- Unitree L2 4D LiDAR — mounting frame.
+       This URDF link carries the L2's physical mounting position + rotation.
+       The driver (markgol's l2lidar_node) publishes one more child below this:
+       $(arg prefix)l2 (the cloud frame), as an identity transform relative
+       to this mount frame. We can't avoid that extra hop without patching the
+       node — its publishStaticTransform() always emits robot_id → frame_id. -->
+  <link name="$(arg prefix)l2_mount">
     <inertial>
       <mass value="0.195"/>
       <origin xyz="0 0 0.02"/>
@@ -141,13 +146,25 @@
     <child link="$(arg prefix)imu_link"/>
   </joint>
 
-  <!-- Unitree L2 LiDAR: on shelf angled 20deg forward-down,
-       4cm forward (+X) of mast center, 34cm above mast base.
-       Pitch = -0.3491 rad tilts front of LiDAR downward. -->
-  <joint name="$(arg prefix)lidar_3d_joint" type="fixed">
-    <origin xyz="0.04 0 0.34" rpy="0 -0.3491 0"/>
+  <!-- Unitree L2 LiDAR: mounted forward-facing on the mast's front
+       vertical face. Mast trapezoid is 50mm deep, so front face is at
+       +X = 0.025m in mast base_link. L2 base center on that face at
+       Y = 0, Z = 0.34m above mast base. Cable points straight down.
+
+       Rotation rpy=(pi, -pi/2, 0) maps the L2's coordinate system into
+       the robot frame:
+         L2 +Z (out of mounting surface) → robot +X (forward)
+         L2 +X (opposite the cable exit) → robot +Z (up, since cable is down)
+         L2 +Y                            → robot -Y
+       So the L2's hemispherical FOV is centered on robot +X (forward-looking).
+
+       Note: there's a ~few-degree CCW (viewed from behind) yaw error from
+       hand-drilled mounting holes; will be eliminated by a CNC'd plate.
+       Ignored here. -->
+  <joint name="$(arg prefix)l2_mount_joint" type="fixed">
+    <origin xyz="0.025 0 0.34" rpy="${pi} ${-pi/2} 0"/>
     <parent link="$(arg prefix)base_link"/>
-    <child link="$(arg prefix)lidar_3d_link"/>
+    <child link="$(arg prefix)l2_mount"/>
   </joint>
 
 </robot>
