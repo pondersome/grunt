@@ -87,6 +87,17 @@ TOPIC_TEMPLATES = [
     '/{prefix}/sonar/cloud',
     '/{prefix}/nav/mode',
 
+    # L2 LiDAR — captured for verification and cross-reference even
+    # before integration into the costmap (Phase 2 of the sensor-fusion
+    # roadmap, ~/.claude/plans/sharded-mapping-sonnet.md). Bandwidth
+    # note: cloud is ~11K pts × 5 Hz ≈ 1.7 MB/s on disk. IMU at 1 kHz
+    # is ~140 KB/s. For a 7-min mission that's roughly +750 MB on bag
+    # size — well within available storage, but the IMU can be dropped
+    # if bags grow too large in practice (cloud is the primary signal
+    # for nav analysis; IMU is for motion-correlated diagnostics).
+    '/{prefix}/l2/points',
+    '/{prefix}/l2/imu',
+
     # Mission state
     '/{prefix}/mission_overlay/selected_mission',
 

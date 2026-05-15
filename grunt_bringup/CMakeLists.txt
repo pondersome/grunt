@@ -28,6 +28,7 @@ install(PROGRAMS
   scripts/mission_overlay
   scripts/diagnostic_bagger
   scripts/navpvt_to_imu
+  scripts/grunt_health
   DESTINATION lib/${PROJECT_NAME}
 )
 

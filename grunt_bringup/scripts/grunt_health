@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""grunt_health — quick post-restart health check.
+
+Verifies the critical sensor / driver nodes came up after
+`sudo systemctl restart grunt` and reports which ones crashed or are
+silently broken. Designed to run 30-60 s after restart, indoor or
+outdoor.
+
+Each subsystem is checked independently — failures cascade but the
+script always finishes. Exit code reflects severity:
+
+  0 = all healthy
+  1 = warnings (e.g. weak GPS indoors, NTRIP caster unreachable)
+  2 = failures (a critical node crashed or is silently dead)
+
+Caveat: indoor startup may have weak/missing GPS. The script reports
+that as a WARN, not a FAIL — as long as the F9P node is alive, RTK
+will recover once outside.
+
+Run:
+    /home/karim/ros2_ws/src/grunt/grunt_bringup/scripts/grunt_health
+or, after install:
+    ros2 run grunt_bringup grunt_health
+
+Override the robot prefix (default grunt1):
+    ros2 run grunt_bringup grunt_health --prefix grunt2
+
+Override the measurement window (default 8 s):
+    ros2 run grunt_bringup grunt_health --window 12
+"""
+from __future__ import annotations
+
+import argparse
+import importlib
+import subprocess
+import sys
+import time
+
+
+ROAM_SSID = "antwerp"  # SSID for roaming missions away from the house
+
+# Terminal colors
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+
+def color(level: str) -> str:
+    return {"pass": GREEN, "warn": YELLOW, "fail": RED}.get(level, "")
+
+
+def status(level: str, msg: str) -> None:
+    tag_map = {"pass": "[ OK ]", "warn": "[WARN]", "fail": "[FAIL]"}
+    print(f"  {color(level)}{tag_map.get(level, '[    ]')}{RESET} {msg}")
+
+
+def section(title: str) -> None:
+    print(f"\n{BOLD}{title}{RESET}")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Subprocess helpers — for non-topic checks (wifi, processes, services)
+# ──────────────────────────────────────────────────────────────────
+
+def _run(argv: list[str], timeout: int = 5) -> tuple[int, str, str]:
+    """Run a command, return (returncode, stdout, stderr). Never raises."""
+    try:
+        r = subprocess.run(argv, capture_output=True, timeout=timeout,
+                           text=True, errors="replace")
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "<timeout>"
+    except FileNotFoundError as e:
+        return 127, "", str(e)
+
+
+def process_alive(pattern: str) -> bool:
+    """True if at least one process matches the regex pattern."""
+    rc, _, _ = _run(["pgrep", "-f", pattern])
+    return rc == 0
+
+
+SERVICE_CALL_TIMEOUT = 8
+
+
+def service_call_returns_success(service: str, srv_type: str,
+                                  timeout: int = SERVICE_CALL_TIMEOUT) -> bool:
+    rc, out, _ = _run(
+        ["timeout", str(timeout), "ros2", "service", "call",
+         service, srv_type],
+        timeout=timeout + 2)
+    return "success=True" in out
+
+
+# ──────────────────────────────────────────────────────────────────
+# Topic data collection — single rclpy process for all subscriptions
+# ──────────────────────────────────────────────────────────────────
+
+class TopicCollector:
+    """One rclpy node, many subscriptions, single measurement window.
+
+    Discovery happens once for the whole batch instead of per subprocess,
+    which is what makes this drastically more reliable than spawning
+    `ros2 topic hz` per check on a system with variable DDS discovery
+    latency.
+
+    Usage:
+        c = TopicCollector(window_s=8)
+        c.add('/grunt1/bno055/imu')
+        c.add('/grunt1/battery_state', field='voltage')
+        c.run()
+        rate = c.rate('/grunt1/bno055/imu')
+        v = c.value('/grunt1/battery_state')
+    """
+
+    def __init__(self, window_s: float = 8.0, settle_s: float = 2.0):
+        self.window_s = window_s
+        self.settle_s = settle_s
+        self._specs = []   # list of (topic, field|None)
+        self._results = {} # topic → {"count":int, "value":any, "type":str|None}
+
+    def add(self, topic: str, field: str | None = None) -> None:
+        self._specs.append((topic, field))
+
+    @staticmethod
+    def _load_msg_class(type_str: str):
+        """Turn 'pkg/msg/Type' into the class. Returns None on failure."""
+        try:
+            parts = type_str.split('/')
+            if len(parts) == 3:
+                pkg, kind, name = parts
+            elif len(parts) == 2:
+                pkg, name = parts
+                kind = "msg"
+            else:
+                return None
+            module = importlib.import_module(f"{pkg}.{kind}")
+            return getattr(module, name)
+        except (ImportError, AttributeError, ValueError):
+            return None
+
+    def run(self) -> None:
+        import rclpy
+        from rclpy.qos import (QoSProfile, ReliabilityPolicy,
+                                DurabilityPolicy, HistoryPolicy)
+
+        rclpy.init()
+        node = rclpy.create_node('grunt_health_probe')
+
+        # BEST_EFFORT subscriber compatible with both BEST_EFFORT and
+        # RELIABLE publishers. Some topics use TRANSIENT_LOCAL durability
+        # (e.g. latched motor_state) — we'd miss those with VOLATILE,
+        # so we use a relaxed dual-subscription pattern: try
+        # TRANSIENT_LOCAL first for late-joining latched values, then
+        # also subscribe VOLATILE for live streams.
+        qos_volatile = QoSProfile(
+            depth=10, reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST)
+
+        # Give the daemon a moment to refresh its topic-type map.
+        # On this system the discovery handshake commonly takes
+        # ~1-2 seconds even when the topic is publishing at full rate.
+        deadline = time.time() + self.settle_s
+        topic_types = {}
+        while time.time() < deadline:
+            for name, types in node.get_topic_names_and_types():
+                if types:
+                    topic_types[name] = types[0]
+            rclpy.spin_once(node, timeout_sec=0.1)
+
+        # Build subscriptions for everything we asked about
+        subs = []
+        for topic, field in self._specs:
+            type_str = topic_types.get(topic)
+            self._results[topic] = {
+                "count": 0, "value": None, "type": type_str}
+            if type_str is None:
+                continue
+            cls = self._load_msg_class(type_str)
+            if cls is None:
+                continue
+            def make_cb(t, f):
+                def cb(msg):
+                    self._results[t]["count"] += 1
+                    if f is not None:
+                        try:
+                            self._results[t]["value"] = getattr(msg, f)
+                        except AttributeError:
+                            pass
+                return cb
+            try:
+                sub = node.create_subscription(
+                    cls, topic, make_cb(topic, field), qos_volatile)
+                subs.append(sub)
+            except Exception:
+                # Failed to subscribe — leave count at 0
+                pass
+
+        # Measure
+        start = time.time()
+        while time.time() - start < self.window_s:
+            rclpy.spin_once(node, timeout_sec=0.1)
+
+        # Cleanup
+        for s in subs:
+            try:
+                node.destroy_subscription(s)
+            except Exception:
+                pass
+        node.destroy_node()
+        rclpy.shutdown()
+
+    def rate(self, topic: str) -> float:
+        r = self._results.get(topic)
+        if r is None:
+            return 0.0
+        return r["count"] / self.window_s if self.window_s > 0 else 0.0
+
+    def count(self, topic: str) -> int:
+        r = self._results.get(topic)
+        return r["count"] if r else 0
+
+    def value(self, topic: str):
+        r = self._results.get(topic)
+        return r["value"] if r else None
+
+    def type(self, topic: str) -> str | None:
+        r = self._results.get(topic)
+        return r["type"] if r else None
+
+
+# ──────────────────────────────────────────────────────────────────
+# Health check functions — each reads from the TopicCollector
+# ──────────────────────────────────────────────────────────────────
+
+def check_wifi() -> int:
+    section("WiFi")
+    rc, out, _ = _run(["nmcli", "-t", "-f", "active,ssid,signal", "dev", "wifi"])
+    ssid, signal = None, None
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3 and parts[0] == "yes":
+            ssid = parts[1]
+            try:
+                signal = int(parts[2])
+            except ValueError:
+                signal = None
+            break
+    if ssid is None:
+        status("fail", "no active wifi connection")
+        return 2
+    bar_len = 10
+    filled = max(0, min(bar_len, (signal or 0) // 10))
+    bar = "█" * filled + "░" * (bar_len - filled)
+    msg = f"SSID={ssid!r} signal={signal}% [{bar}]"
+    if ssid == ROAM_SSID:
+        status("pass", f"{msg}  (roaming SSID)")
+        return 0
+    status("warn", f"{msg}  (expected {ROAM_SSID!r} for roaming missions)")
+    return 1
+
+
+def check_bno055(prefix: str, c: TopicCollector) -> int:
+    section("BNO055 IMU")
+    if not process_alive("bno055/lib/bno055/bno055"):
+        status("fail", "bno055 process not running")
+        return 2
+    status("pass", "bno055 process is running")
+    rate = c.rate(f"/{prefix}/bno055/imu")
+    if rate > 20:
+        status("pass", f"/{prefix}/bno055/imu at {rate:.1f} Hz")
+        return 0
+    if rate > 0:
+        status("warn", f"/{prefix}/bno055/imu at {rate:.1f} Hz (expected ~27)")
+        return 1
+    status("fail", f"/{prefix}/bno055/imu silent — process up but I2C stuck?")
+    return 2
+
+
+def check_p2os(prefix: str, c: TopicCollector) -> int:
+    section("p2os_driver (ARCOS chassis)")
+    if not process_alive("p2os_driver/lib/p2os_driver/p2os_driver"):
+        status("fail", "p2os_driver process not running")
+        return 2
+    status("pass", "p2os_driver process is running")
+    pose_rate = c.rate(f"/{prefix}/pose")
+    if pose_rate < 5:
+        if pose_rate > 0:
+            status("warn", f"/{prefix}/pose at {pose_rate:.1f} Hz (expected ~10)")
+            return 1
+        status("fail",
+               f"/{prefix}/pose silent — process up but SIP not flowing "
+               "(serial sync may have failed)")
+        return 2
+    status("pass", f"/{prefix}/pose at {pose_rate:.1f} Hz (SIP loop healthy)")
+    issues = 0
+
+    # Battery voltage. P3-AT operating range ~11.5-12.8V; ARCOS
+    # low-voltage cutoff near 11.0V.
+    v = c.value(f"/{prefix}/battery_state")
+    if v is None:
+        status("warn", "battery voltage not received")
+        issues += 1
+    else:
+        try:
+            v = float(v)
+            if v >= 12.0:
+                status("pass", f"battery: {v:.2f} V")
+            elif v >= 11.5:
+                status("warn", f"battery: {v:.2f} V — getting low, charge soon")
+                issues += 1
+            elif v >= 11.0:
+                status("warn",
+                       f"battery: {v:.2f} V — LOW, charge before next mission")
+                issues += 1
+            else:
+                status("fail",
+                       f"battery: {v:.2f} V — CRITICAL, ARCOS may cut motors")
+                issues += 2
+        except (TypeError, ValueError):
+            status("warn", f"battery voltage unparseable: {v!r}")
+            issues += 1
+
+    # Motor enable state
+    m = c.value(f"/{prefix}/motor_state")
+    if m is None:
+        status("warn", "motor_state not received")
+        issues += 1
+    elif m == 1:
+        status("pass", "motors ENABLED (motor_state=1)")
+    else:
+        status("warn",
+               f"motors DISABLED (motor_state={m}) — re-enable with: "
+               f"ros2 topic pub /{prefix}/motor_state p2os_msgs/MotorState "
+               "'{state: 1}' -1")
+        issues += 1
+    return issues
+
+
+def check_sonar(prefix: str, c: TopicCollector) -> int:
+    section("Sonar array")
+    rate = c.rate(f"/{prefix}/sonar/cloud")
+    if rate > 5:
+        status("pass", f"/{prefix}/sonar/cloud at {rate:.1f} Hz")
+        return 0
+    if rate > 0:
+        status("warn", f"/{prefix}/sonar/cloud at {rate:.1f} Hz (expected ~10)")
+        return 1
+    pose_rate = c.rate(f"/{prefix}/pose")
+    if pose_rate < 1:
+        status("warn", "sonar silent — but SIP isn't flowing either; fix p2os first")
+        return 1
+    status("warn",
+           "sonar silent but SIP is flowing — sonars may be disabled "
+           "(check use_sonar param or ARCOS SONAR command)")
+    return 1
+
+
+def check_ntrip(prefix: str, c: TopicCollector) -> int:
+    section("NTRIP client (RTK corrections)")
+    if not process_alive("ntrip_client.*ntrip_ros"):
+        status("fail", "ntrip_client process not running")
+        return 2
+    status("pass", "ntrip_client process is running")
+    rate = c.rate(f"/{prefix}/rtk/rtcm")
+    if rate > 0:
+        status("pass", f"RTCM corrections flowing at {rate:.1f} Hz")
+        return 0
+    status("warn",
+           "no RTCM received in measurement window — caster may be "
+           "unreachable, auth failed, or no internet on this network")
+    return 1
+
+
+def check_ublox(prefix: str, c: TopicCollector) -> int:
+    section("F9P GPS")
+    if not process_alive("ublox_gps_node"):
+        status("fail", "ublox_gps_node process not running")
+        return 2
+    status("pass", "ublox_gps_node process is running")
+    rate = c.rate(f"/{prefix}/rtk/navpvt")
+    if rate > 2:
+        status("pass", f"/{prefix}/rtk/navpvt at {rate:.1f} Hz")
+        return 0
+    if rate > 0:
+        status("warn",
+               f"/{prefix}/rtk/navpvt at {rate:.1f} Hz "
+               "(slow — sky obstructed?)")
+        return 1
+    status("warn",
+           f"/{prefix}/rtk/navpvt silent — common indoors. Node is up, "
+           "should recover outdoors.")
+    return 1
+
+
+def _node_state(node_name: str, timeout: int = 4) -> str:
+    rc, out, _ = _run(
+        ["timeout", str(timeout), "ros2", "service", "call",
+         f"{node_name}/get_state", "lifecycle_msgs/srv/GetState"],
+        timeout=timeout + 2)
+    for line in out.splitlines():
+        if "label=" in line:
+            try:
+                return line.split("label=", 1)[1].split("'")[1]
+            except IndexError:
+                return ""
+    return ""
+
+
+def check_nav2(prefix: str) -> int:
+    section("Nav2 stack")
+    svc_list_rc, svc_out, _ = _run(
+        ["timeout", "4", "ros2", "service", "list"], timeout=6)
+    nav_lifecycle_svc = f"/{prefix}/nav/lifecycle_manager_navigation/is_active"
+    if nav_lifecycle_svc not in svc_out:
+        status("warn",
+               "Nav2 not running (no lifecycle_manager service). "
+               "Expected if grunt-nav@<mode> isn't started yet.")
+        return 1
+    if service_call_returns_success(
+            nav_lifecycle_svc, "std_srvs/srv/Trigger"):
+        status("pass", "lifecycle_manager_navigation reports all nodes ACTIVE")
+        return 0
+    nodes = ["controller_server", "planner_server", "bt_navigator",
+             "behavior_server", "velocity_smoother", "collision_monitor"]
+    states = {n: _node_state(f"/{prefix}/nav/{n}") for n in nodes}
+    n_active = sum(1 for s in states.values() if s == "active")
+    n_silent = sum(1 for s in states.values() if s == "")
+    if n_silent == len(nodes):
+        status("fail",
+               "all Nav2 lifecycle services unresponsive — stack likely "
+               "stuck. Try: sudo systemctl restart grunt-nav@outdoor")
+        return 2
+    status("fail", f"Nav2 partial activation ({n_active}/{len(nodes)} active):")
+    for n, s in states.items():
+        marker = "OK" if s == "active" else ("SILENT" if s == "" else s.upper())
+        print(f"      {n:22s} {marker}")
+    return 2
+
+
+# ──────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description="Quick grunt health check")
+    p.add_argument("--prefix", default="grunt1",
+                   help="robot namespace prefix (default: grunt1)")
+    p.add_argument("--window", type=float, default=8.0,
+                   help="topic measurement window in seconds (default: 8)")
+    args = p.parse_args(argv)
+
+    print(f"{BOLD}grunt health check — {time.strftime('%H:%M:%S')}  "
+          f"prefix={args.prefix}{RESET}")
+
+    # Collect all topic data in one rclpy pass — far more reliable than
+    # spawning ros2 topic hz per check.
+    print(f"  (subscribing to topics, sampling for {args.window:.0f}s...)",
+          flush=True)
+    c = TopicCollector(window_s=args.window)
+    pfx = args.prefix
+    c.add(f"/{pfx}/bno055/imu")
+    c.add(f"/{pfx}/pose")
+    c.add(f"/{pfx}/sonar/cloud")
+    c.add(f"/{pfx}/rtk/rtcm")
+    c.add(f"/{pfx}/rtk/navpvt")
+    c.add(f"/{pfx}/battery_state", field="voltage")
+    c.add(f"/{pfx}/motor_state", field="state")
+    try:
+        c.run()
+    except Exception as e:
+        print(f"  {RED}[FAIL]{RESET} topic collection failed: {e}", file=sys.stderr)
+
+    total = 0
+    total += check_wifi()
+    total += check_bno055(args.prefix, c)
+    total += check_p2os(args.prefix, c)
+    total += check_sonar(args.prefix, c)
+    total += check_ntrip(args.prefix, c)
+    total += check_ublox(args.prefix, c)
+    total += check_nav2(args.prefix)
+
+    section("Summary")
+    if total == 0:
+        print(f"  {GREEN}{BOLD}All systems healthy.{RESET}\n")
+        return 0
+    if total < 4:
+        print(f"  {YELLOW}{BOLD}{total} issue point(s) — review WARN/FAIL above.{RESET}\n")
+        return 1
+    print(f"  {RED}{BOLD}{total} issue point(s) — significant problems.{RESET}\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
