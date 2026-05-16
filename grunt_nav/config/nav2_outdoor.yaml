@@ -236,11 +236,16 @@ behavior_server:
 # collision_monitor-triggered EscapeSequence the new path passes
 # through the same physical obstacle (only laterally shifted by the
 # escape's small drive). With obstacle_layer the planner sees the
-# obstacle and reroutes properly. observation_persistence is much
-# longer than the local costmap's (30s vs 3s) so the obstacle stays
+# obstacle and reroutes properly. observation_persistence is slightly
+# longer than the local costmap's (5s vs 3s) so the obstacle stays
 # visible across the planner's 1Hz call cadence and the multi-second
 # escape sequence — and raytracing naturally clears marks as the
-# robot moves past them.
+# robot moves past them. The original 30s was experimentally found
+# to cause a "costmap eats itself" feedback loop: ambient lane-edge
+# sonar marks persisted long after the robot drove past them, the
+# planner kept routing around them as if they were discrete
+# obstacles, the carrot pulled the robot off center, more lane-edge
+# marks landed, repeat. See segment_deviation_2026-05-02.md.
 global_costmap:
   global_costmap:
     ros__parameters:
@@ -276,11 +281,16 @@ global_costmap:
           max_obstacle_height: 1.0
           expected_update_rate: 10.0
           inf_is_valid: false
-          # Long persistence so the planner sees an obstacle long
-          # enough to reroute around it, even across the multi-second
-          # EscapeSequence cycle. Raytracing handles natural decay
-          # as the robot moves past obstacles.
-          observation_persistence: 30.0
+          # 5s persistence: long enough that the planner sees a real
+          # obstacle across one EscapeSequence cycle (1Hz planner call
+          # + 2-3s recovery), short enough that ambient lane-edge
+          # sonar marks age out before they reshape later plans.
+          # 2026-05-14: dropped from 30s. The longer window was driving
+          # a costmap-eats-itself loop with sonar at lane edges; see
+          # ponderdocs/nav/docs/segment_deviation_2026-05-02.md for the
+          # bag evidence. Raytracing still clears marks as the robot
+          # drives past them.
+          observation_persistence: 5.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
