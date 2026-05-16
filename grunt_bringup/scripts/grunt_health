@@ -37,7 +37,8 @@ import sys
 import time
 
 
-ROAM_SSID = "antwerp"  # SSID for roaming missions away from the house
+ROAM_SSID = "Antwerp"  # SSID for roaming missions away from the house
+                       # — compared case-insensitively below
 
 # Terminal colors
 GREEN = "\033[32m"
@@ -124,6 +125,10 @@ class TopicCollector:
     def add(self, topic: str, field: str | None = None) -> None:
         self._specs.append((topic, field))
 
+    def last_msg(self, topic: str):
+        r = self._results.get(topic)
+        return r.get("last_msg") if r else None
+
     @staticmethod
     def _load_msg_class(type_str: str):
         """Turn 'pkg/msg/Type' into the class. Returns None on failure."""
@@ -185,6 +190,7 @@ class TopicCollector:
             def make_cb(t, f):
                 def cb(msg):
                     self._results[t]["count"] += 1
+                    self._results[t]["last_msg"] = msg
                     if f is not None:
                         try:
                             self._results[t]["value"] = getattr(msg, f)
@@ -256,7 +262,7 @@ def check_wifi() -> int:
     filled = max(0, min(bar_len, (signal or 0) // 10))
     bar = "█" * filled + "░" * (bar_len - filled)
     msg = f"SSID={ssid!r} signal={signal}% [{bar}]"
-    if ssid == ROAM_SSID:
+    if ssid.lower() == ROAM_SSID.lower():
         status("pass", f"{msg}  (roaming SSID)")
         return 0
     status("warn", f"{msg}  (expected {ROAM_SSID!r} for roaming missions)")
@@ -382,18 +388,71 @@ def check_ublox(prefix: str, c: TopicCollector) -> int:
         return 2
     status("pass", "ublox_gps_node process is running")
     rate = c.rate(f"/{prefix}/rtk/navpvt")
-    if rate > 2:
-        status("pass", f"/{prefix}/rtk/navpvt at {rate:.1f} Hz")
-        return 0
-    if rate > 0:
+    if rate < 1:
+        if rate > 0:
+            status("warn",
+                   f"/{prefix}/rtk/navpvt at {rate:.1f} Hz "
+                   "(slow — sky obstructed?)")
+            return 1
         status("warn",
-               f"/{prefix}/rtk/navpvt at {rate:.1f} Hz "
-               "(slow — sky obstructed?)")
+               f"/{prefix}/rtk/navpvt silent — common indoors. Node is up, "
+               "should recover outdoors.")
         return 1
-    status("warn",
-           f"/{prefix}/rtk/navpvt silent — common indoors. Node is up, "
-           "should recover outdoors.")
-    return 1
+    status("pass", f"/{prefix}/rtk/navpvt at {rate:.1f} Hz")
+
+    # Drill into the latest NavPVT for fix quality + position
+    msg = c.last_msg(f"/{prefix}/rtk/navpvt")
+    if msg is None:
+        # Rate > 1 but no message captured — odd, but not fatal
+        return 0
+
+    issues = 0
+    # Fix type: 0=none, 1=DR only, 2=2D, 3=3D, 4=GNSS+DR, 5=time only
+    fix_names = {0: "NO FIX", 1: "DR only", 2: "2D", 3: "3D",
+                 4: "GNSS+DR", 5: "time only"}
+    ft = getattr(msg, "fix_type", None)
+    ft_name = fix_names.get(ft, f"unknown ({ft})")
+
+    # Carrier-phase RTK status from flags bits 6-7:
+    # 0 = no carrier RTK (plain GNSS), 1 = float, 2 = fixed
+    flags = getattr(msg, "flags", 0) or 0
+    carrier = (flags >> 6) & 0x03
+    carrier_names = {0: "no RTK", 1: "RTK FLOAT", 2: "RTK FIXED"}
+    carrier_name = carrier_names.get(carrier, "?")
+
+    # Position (lat/lon scaled by 1e-7), satellite count, horizontal accuracy
+    lat = getattr(msg, "lat", 0) * 1e-7
+    lon = getattr(msg, "lon", 0) * 1e-7
+    num_sv = getattr(msg, "num_sv", 0)
+    h_acc_m = getattr(msg, "h_acc", 0) * 1e-3  # mm → m
+
+    # Fix-quality scoring
+    if ft in (3, 4) and carrier == 2:
+        status("pass", f"fix: 3D + RTK FIXED ({num_sv} sv, h_acc {h_acc_m:.3f} m)")
+    elif ft in (3, 4) and carrier == 1:
+        status("pass", f"fix: 3D + RTK FLOAT ({num_sv} sv, h_acc {h_acc_m:.3f} m)")
+    elif ft in (3, 4) and carrier == 0:
+        status("warn",
+               f"fix: 3D plain GNSS, no RTK ({num_sv} sv, h_acc {h_acc_m:.2f} m) "
+               "— check NTRIP corrections")
+        issues += 1
+    elif ft == 2:
+        status("warn", f"fix: 2D only ({num_sv} sv, h_acc {h_acc_m:.2f} m)")
+        issues += 1
+    elif ft == 0:
+        status("warn",
+               f"fix: NO FIX yet ({num_sv} sv) — indoors? Wait for sky view.")
+        issues += 1
+    else:
+        status("warn",
+               f"fix: {ft_name}, {carrier_name} "
+               f"({num_sv} sv, h_acc {h_acc_m:.2f} m)")
+        issues += 1
+
+    # Always report position so the operator can sanity-check site
+    if abs(lat) > 0.01 or abs(lon) > 0.01:
+        status("pass", f"position: lat={lat:.7f}, lon={lon:.7f}")
+    return issues
 
 
 def _node_state(node_name: str, timeout: int = 4) -> str:
