@@ -130,6 +130,9 @@ class TopicCollector:
         self.debug = debug
         self._specs = []   # list of (topic, field|None, latched)
         self._results = {} # topic → {count, value, last_msg, type, sub_at}
+        self._collect_tf = False
+        self._tf_edges = set()         # unique (parent, child) seen on /tf
+        self._tf_static_edges = set()  # unique (parent, child) on /tf_static
 
     def add(self, topic: str, field: str | None = None,
              latched: bool = False) -> None:
@@ -142,6 +145,22 @@ class TopicCollector:
         self._results[topic] = {
             "count": 0, "value": None, "last_msg": None,
             "type": None, "sub_at": None}
+
+    def add_tf(self) -> None:
+        """Subscribe to /tf and /tf_static during the measurement window
+        and collect the unique (parent_frame, child_frame) edges seen.
+        Inspect with tf_edges() and tf_static_edges() after run().
+
+        Use this to verify TF tree connectivity — e.g. "is ekf_local
+        actually broadcasting odom→base_link?" — which is much more
+        diagnostic than just checking that the EKF process is alive."""
+        self._collect_tf = True
+
+    def tf_edges(self) -> set:
+        return self._tf_edges
+
+    def tf_static_edges(self) -> set:
+        return self._tf_static_edges
 
     def last_msg(self, topic: str):
         r = self._results.get(topic)
@@ -185,6 +204,31 @@ class TopicCollector:
         spec_map = {t: (f, lat) for t, f, lat in self._specs}
         subs = {}   # topic → list of subscriptions (1 or 2 per topic)
         debug_log = []
+
+        # TF edge collection — subscribe immediately if requested; we
+        # know the type (tf2_msgs/TFMessage) without needing discovery.
+        if self._collect_tf:
+            try:
+                from tf2_msgs.msg import TFMessage
+
+                def tf_cb(msg):
+                    for t in msg.transforms:
+                        self._tf_edges.add(
+                            (t.header.frame_id, t.child_frame_id))
+
+                def tf_static_cb(msg):
+                    for t in msg.transforms:
+                        self._tf_static_edges.add(
+                            (t.header.frame_id, t.child_frame_id))
+
+                node.create_subscription(
+                    TFMessage, '/tf', tf_cb, qos_profile_sensor_data)
+                node.create_subscription(
+                    TFMessage, '/tf_static', tf_static_cb, qos_latched)
+                debug_log.append(
+                    "  +sub /tf (VOLATILE) and /tf_static (TL) for edge collection")
+            except Exception as e:
+                debug_log.append(f"  TF subscribe failed: {e}")
 
         def make_cb(t, f):
             def cb(msg):
@@ -580,6 +624,83 @@ def check_nav_mode_vs_environment(prefix: str, c: TopicCollector) -> int:
     return 2
 
 
+def _active_nav_mode() -> str:
+    """Return 'indoor' / 'outdoor' for whichever grunt-nav@<mode> is
+    active, or '<mode>' as a literal placeholder if neither is active."""
+    for mode in ("outdoor", "indoor"):
+        rc, _, _ = _run(["systemctl", "is-active",
+                          f"grunt-nav@{mode}.service"], timeout=3)
+        if rc == 0:
+            return mode
+    return "<mode>"
+
+
+def check_localization(prefix: str, c: TopicCollector) -> int:
+    """Verify the EKFs are actually producing output (not just alive)
+    and that the TF tree has the edges Nav2 needs.
+
+    Runs BEFORE check_nav2 so that a broken TF tree gets reported as
+    the root cause instead of being misattributed to Nav2 (which then
+    falls over downstream because it can't transform robot pose).
+
+    The classic failure mode this catches: ekf_local process alive but
+    its filter loop has stuck (deadlock, futex_wait), so /odometry/local
+    isn't published and odom→base_link disappears from TF. Nav2 then
+    floods 'Cannot clear map because robot pose cannot be retrieved'
+    errors and looks broken — but the actual fix is `systemctl restart
+    grunt` to respawn the EKF."""
+    section("Localization (EKF + TF)")
+    issues = 0
+    odom_topic = f"/{prefix}/odometry/local"
+    global_topic = f"/{prefix}/odometry/global"
+    odom_frame = f"{prefix}/odom"
+    base_link = f"{prefix}/base_link"
+    map_frame = f"{prefix}/map"
+
+    # ekf_local output. The critical one — without /odometry/local
+    # there's no odom→base_link broadcast and Nav2 cannot localize.
+    local_rate = c.rate(odom_topic)
+    if local_rate < 0.5:
+        status("fail",
+               f"{odom_topic} silent ({local_rate:.1f} Hz) — ekf_local "
+               f"process may be alive but its filter loop has stuck. "
+               f"Fix: sudo systemctl restart grunt")
+        issues += 2
+    else:
+        status("pass", f"{odom_topic} at {local_rate:.1f} Hz")
+
+    # ekf_global output. Less critical indoor (no map frame in use),
+    # essential outdoor.
+    global_rate = c.rate(global_topic)
+    if global_rate < 0.5:
+        status("warn",
+               f"{global_topic} silent ({global_rate:.1f} Hz) — outdoor "
+               f"missions need this for map→odom TF; indoor may be OK")
+        issues += 1
+    else:
+        status("pass", f"{global_topic} at {global_rate:.1f} Hz")
+
+    # TF tree connectivity. The actual edges Nav2 needs to localize.
+    # Combine /tf and /tf_static; either is valid for these edges.
+    edges = c.tf_edges() | c.tf_static_edges()
+    if (odom_frame, base_link) in edges:
+        status("pass", f"TF: {odom_frame} → {base_link} present")
+    else:
+        status("fail",
+               f"TF tree missing {odom_frame} → {base_link} "
+               f"(broadcast by ekf_local; without it Nav2 cannot work)")
+        issues += 2
+    if (map_frame, odom_frame) in edges:
+        status("pass", f"TF: {map_frame} → {odom_frame} present")
+    else:
+        status("warn",
+               f"TF tree missing {map_frame} → {odom_frame} "
+               f"(broadcast by ekf_global; required for outdoor)")
+        issues += 1
+
+    return issues
+
+
 def _node_state(node_name: str, timeout: int = 4) -> str:
     rc, out, _ = _run(
         ["timeout", str(timeout), "ros2", "service", "call",
@@ -592,6 +713,22 @@ def _node_state(node_name: str, timeout: int = 4) -> str:
             except IndexError:
                 return ""
     return ""
+
+
+# Lifecycle nodes spawned by both nav_indoor.launch.py and
+# nav_outdoor.launch.py. Keep in sync with the launch files'
+# `lifecycle_nodes` list. velocity_smoother is NOT included
+# (excluded from the chain in Phase 1).
+NAV2_LIFECYCLE_NODES = [
+    "controller_server",
+    "smoother_server",
+    "planner_server",
+    "route_server",
+    "behavior_server",
+    "collision_monitor",
+    "bt_navigator",
+    "waypoint_follower",
+]
 
 
 def check_nav2(prefix: str) -> int:
@@ -608,17 +745,36 @@ def check_nav2(prefix: str) -> int:
             nav_lifecycle_svc, "std_srvs/srv/Trigger"):
         status("pass", "lifecycle_manager_navigation reports all nodes ACTIVE")
         return 0
-    nodes = ["controller_server", "planner_server", "bt_navigator",
-             "behavior_server", "velocity_smoother", "collision_monitor"]
-    states = {n: _node_state(f"/{prefix}/nav/{n}") for n in nodes}
+
+    # Manager said NOT all active (or call timed out). Probe each node
+    # individually to distinguish the failure modes.
+    states = {n: _node_state(f"/{prefix}/nav/{n}")
+              for n in NAV2_LIFECYCLE_NODES}
     n_active = sum(1 for s in states.values() if s == "active")
     n_silent = sum(1 for s in states.values() if s == "")
-    if n_silent == len(nodes):
+    n_total = len(NAV2_LIFECYCLE_NODES)
+    mode = _active_nav_mode()
+
+    if n_silent == n_total:
+        # Nothing responded to get_state. We don't actually know if the
+        # nodes are dead, hung, or just CPU-starved past the 4s window.
+        # Almost always cascades from upstream — typically a broken TF
+        # tree starves controller_server's loop and floods the journal
+        # with errors, which saturates CPU/DDS and trips this branch.
         status("fail",
-               "all Nav2 lifecycle services unresponsive — stack likely "
-               "stuck. Try: sudo systemctl restart grunt-nav@outdoor")
+               f"Nav2 lifecycle services didn't respond within 4s "
+               f"({n_total}/{n_total} get_state calls timed out). Nodes "
+               f"may be alive but blocked or CPU-starved. CHECK THE "
+               f"LOCALIZATION SECTION ABOVE FIRST — a broken TF tree "
+               f"cascades here. If localization is healthy: "
+               f"sudo systemctl restart grunt-nav@{mode}")
         return 2
-    status("fail", f"Nav2 partial activation ({n_active}/{len(nodes)} active):")
+
+    # Mixed states — show per-node breakdown
+    status("fail",
+           f"Nav2 partial activation ({n_active}/{n_total} active). "
+           f"If localization above shows TF problems, fix those first; "
+           f"otherwise: sudo systemctl restart grunt-nav@{mode}")
     for n, s in states.items():
         marker = "OK" if s == "active" else ("SILENT" if s == "" else s.upper())
         print(f"      {n:22s} {marker}")
@@ -657,6 +813,12 @@ def main(argv=None) -> int:
     c.add(f"/{pfx}/motor_state", field="state")
     c.add(f"/{pfx}/nav/mode", latched=True)
     c.add(f"/{pfx}/localization/status")
+    # EKF output topics — feed check_localization.
+    c.add(f"/{pfx}/odometry/local")
+    c.add(f"/{pfx}/odometry/global")
+    # Track TF tree edges so check_localization can verify the actual
+    # broadcast edges (not just process liveness).
+    c.add_tf()
     try:
         c.run()
     except Exception as e:
@@ -669,6 +831,10 @@ def main(argv=None) -> int:
     total += check_sonar(args.prefix, c)
     total += check_ntrip(args.prefix, c)
     total += check_ublox(args.prefix, c)
+    # Localization MUST run before check_nav2 — a stuck EKF or broken
+    # TF tree cascades into Nav2 looking unhealthy, and the operator
+    # wants the root cause flagged first.
+    total += check_localization(args.prefix, c)
     total += check_nav2(args.prefix)
     total += check_nav_mode_vs_environment(args.prefix, c)
 
