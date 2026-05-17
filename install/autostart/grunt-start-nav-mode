@@ -1,0 +1,84 @@
+#!/bin/bash
+# grunt-start-nav-mode — pick which grunt-nav@<mode>.service to start
+# when grunt.service comes up.
+#
+# Called from grunt.service's ExecStartPost. Replaces the older
+# `Wants=grunt-nav@indoor.service` line, which hardcoded a single mode
+# at the unit-file level and disagreed with `systemctl is-enabled`.
+#
+# Decision order:
+#   1. /run/grunt/active_nav_mode  — "last active mode" register, written
+#      by grunt-nav@.service's ExecStartPost on every start. Lives in
+#      /run (tmpfs) so it survives `systemctl restart grunt` but is
+#      wiped on real reboot.
+#   2. systemctl is-enabled         — boot default (outdoor wins ties).
+#
+# Net effect:
+#   - Real reboot → /run wiped → boot default starts (operator-facing
+#     `systemctl enable grunt-nav@<mode>` is authoritative).
+#   - systemctl restart grunt → /run survives → the mode the operator
+#     last switched to is restored (no slamming back to boot default).
+#   - First-ever start with neither file nor enable → no nav started,
+#     operator must `systemctl start grunt-nav@<mode>` manually.
+#
+# Install:
+#   sudo install -m 0755 \
+#     /home/karim/ros2_ws/src/grunt/install/autostart/grunt-start-nav-mode \
+#     /usr/local/bin/grunt-start-nav-mode
+
+set -u
+
+STATE_FILE=/run/grunt/active_nav_mode
+LOG_TAG="grunt-start-nav-mode"
+
+log() { echo "${LOG_TAG}: $*"; }
+
+mode=""
+
+# 1. Last-active register (set by grunt-nav@.service ExecStartPost).
+if [ -r "${STATE_FILE}" ]; then
+    candidate=$(tr -d '[:space:]' < "${STATE_FILE}" 2>/dev/null)
+    if [ "${candidate}" = "indoor" ] || [ "${candidate}" = "outdoor" ]; then
+        mode="${candidate}"
+        log "restoring last-active mode '${mode}' from ${STATE_FILE}"
+    elif [ -n "${candidate}" ]; then
+        log "ignoring invalid ${STATE_FILE} contents: '${candidate}'"
+    fi
+fi
+
+# 2. systemctl-enabled fallback. Outdoor preferred on ties because it's
+#    the more common operational mode; the cheatsheet still asks
+#    operators to enable EXACTLY ONE.
+if [ -z "${mode}" ]; then
+    for m in outdoor indoor; do
+        if systemctl is-enabled --quiet "grunt-nav@${m}.service" 2>/dev/null; then
+            mode="${m}"
+            log "using boot default '${mode}' (systemctl is-enabled)"
+            break
+        fi
+    done
+fi
+
+if [ -z "${mode}" ]; then
+    log "no last-active record and no mode enabled — nav stays stopped"
+    exit 0
+fi
+
+# Background the systemctl call so this script (and thus
+# grunt.service's ExecStartPost) returns immediately. Without this,
+# we deadlock: grunt-nav has After=grunt.service (via BindsTo) so
+# can't activate until grunt.service is Active; grunt.service can't
+# reach Active until ExecStartPost returns; a foreground `systemctl
+# start` would wait forever for that activation. Backgrounded, the
+# call submits its job and waits asynchronously — ExecStartPost
+# returns, grunt becomes Active, the queued nav start proceeds.
+#
+# Could also use `systemctl --no-block start`, but the existing
+# sudoers rule (grunt-nav-sudoers) matches the literal argv
+# `systemctl start grunt-nav@*.service` — adding a flag would
+# require a parallel sudoers rule. Backgrounding stays compatible.
+#
+# sudo -n: never prompt. NOPASSWD entry in grunt-nav-sudoers
+# allows karim to start/stop grunt-nav@*.service.
+sudo -n /usr/bin/systemctl start "grunt-nav@${mode}.service" &
+exit 0

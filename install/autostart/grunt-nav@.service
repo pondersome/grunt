@@ -17,7 +17,8 @@
 #   sudo cp /home/karim/ros2_ws/src/grunt/install/autostart/grunt-nav@.service \
 #     /etc/systemd/system/
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable grunt-nav@indoor.service    # default boot mode
+#   sudo systemctl enable grunt-nav@outdoor.service   # boot default
+#   sudo systemctl disable grunt-nav@indoor.service   # enable EXACTLY one
 #
 # Switching at runtime:
 #   nav_mode_switcher handles this via `sudo systemctl stop/start`.
@@ -30,9 +31,17 @@
 # Dependency model:
 #   BindsTo=grunt.service + After=grunt.service — this unit requires
 #   grunt.service to be running. When grunt.service stops, this unit
-#   stops too (BindsTo is stronger than Wants). When grunt.service
-#   restarts, this unit also stops but does NOT auto-restart — the
-#   admin re-enables the desired mode.
+#   stops too (BindsTo is stronger than Wants).
+#
+#   When grunt.service restarts, this unit is stopped by the cascade,
+#   THEN re-started automatically by grunt.service's ExecStartPost
+#   (grunt-start-nav-mode). The restored mode is whichever was last
+#   active (recorded in /run/grunt/active_nav_mode by the
+#   ExecStartPost below) — so `systemctl restart grunt` preserves the
+#   operator's mode choice across the bounce.
+#
+#   On a real reboot, /run is wiped, and grunt-start-nav-mode falls
+#   back to `systemctl is-enabled` — the boot-default symlink wins.
 
 [Unit]
 Description=Grunt Nav2 stack (%i mode)
@@ -60,6 +69,13 @@ Environment=HOME=/home/karim
 WorkingDirectory=/home/karim/ros2_ws
 
 ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/karim/ros2_ws/install/setup.bash && exec ros2 launch grunt_nav nav_standalone.launch.py prefix:=${GRUNT_PREFIX} nav_mode:=%i'
+
+# Record the just-started mode in the tmpfs register so
+# grunt-start-nav-mode (called by grunt.service ExecStartPost) can
+# restore it on the next start of grunt.service. /run/grunt is owned
+# by karim — created by grunt.service's RuntimeDirectory=grunt;
+# BindsTo=grunt.service guarantees grunt is up when this fires.
+ExecStartPost=/bin/sh -c 'echo %i > /run/grunt/active_nav_mode'
 
 # 15s is enough for Nav2's lifecycle_manager to deactivate + cleanup
 # its managed nodes, plus the launch process to tear down.

@@ -67,9 +67,43 @@ class NavModeSwitcher(Node):
         # could otherwise race and leave both units active or neither.
         self._lock = threading.Lock()
 
+        # Last published mode — used by the periodic re-probe to
+        # republish only on change.
+        self._last_published_mode = None
+
+        # Initial probe. May see 'unknown' on a cold start if grunt
+        # came up before grunt-nav (BindsTo + ExecStartPost ordering)
+        # — the re-probe timer below catches the transition.
         current = self._detect_active_mode()
         self._publish_mode(current)
-        self.get_logger().info(f'nav_mode_switcher started, current mode: {current}')
+        self.get_logger().info(
+            f'nav_mode_switcher started, current mode: {current}'
+        )
+
+        # Periodic re-probe of systemctl state so the latched
+        # /<ns>/mode topic stays consistent with the actually-active
+        # unit. Catches:
+        #   - boot races (we started before grunt-nav came up)
+        #   - external `systemctl start/stop` bypassing set_mode
+        #   - grunt-start-nav-mode's auto-restore after `systemctl
+        #     restart grunt` (which stops then re-starts the nav unit)
+        # Republishes only when the detected mode changes; under steady
+        # state the cost is one cheap `systemctl is-active` per second
+        # per mode, no DDS traffic.
+        self.create_timer(1.0, self._reprobe_active_mode)
+
+    def _reprobe_active_mode(self) -> None:
+        # Skip while a set_mode switch is in flight — we'd just race
+        # the transition and publish a stale state.
+        if self._lock.locked():
+            return
+        current = self._detect_active_mode()
+        if current != self._last_published_mode:
+            self.get_logger().info(
+                f'nav mode changed externally: '
+                f'{self._last_published_mode} -> {current}'
+            )
+            self._publish_mode(current)
 
     def _detect_active_mode(self) -> str:
         """Return the mode whose grunt-nav@<mode>.service is active, or
@@ -100,6 +134,7 @@ class NavModeSwitcher(Node):
         msg = String()
         msg.data = mode
         self.mode_pub.publish(msg)
+        self._last_published_mode = mode
 
     def _on_set_mode(self, msg: String) -> None:
         target = msg.data.strip().lower()

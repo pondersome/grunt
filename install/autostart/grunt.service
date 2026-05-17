@@ -2,9 +2,13 @@
 #
 # Install:
 #   sudo cp /home/karim/ros2_ws/src/grunt/install/autostart/grunt.service /etc/systemd/system/
+#   sudo install -m 0755 /home/karim/ros2_ws/src/grunt/install/autostart/grunt-start-nav-mode /usr/local/bin/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable grunt.service     # auto-start on every boot
 #   sudo systemctl start grunt.service      # start right now
+#
+# (The grunt-start-nav-mode helper picks which grunt-nav@<mode>.service
+# to start when grunt comes up. See ExecStartPost below.)
 #
 # Watch live output (color + full detail, like attaching to a terminal):
 #   journalctl -fu grunt
@@ -30,26 +34,28 @@ Description=Grunt robot autonomy stack (ROS 2 Jazzy)
 After=network-online.target
 Wants=network-online.target
 
-# Pull in Nav2 (indoor by default) when grunt.service starts manually.
-# `systemctl enable grunt-nav@indoor.service` is only honored at boot
-# via multi-user.target — a mid-session `systemctl start grunt.service`
-# won't activate it without this Wants. BindsTo=grunt.service on the
-# nav unit already handles the reverse (nav stops when grunt stops).
-#
-# Caveat: each `systemctl restart grunt.service` bounces Nav2 back to
-# indoor even if the operator had switched to outdoor earlier. Any
-# runtime mode change is discarded on full-stack restart; the
-# nav_mode_switcher can be used to flip modes again post-start.
-#
-# To change the default mode, edit this line to point to
-# grunt-nav@outdoor.service.
-#
-# Ordering: deliberately NO After= here. The nav unit already has
-# After=grunt.service, so nav waits for grunt. Adding the reverse
-# would be circular.
-Wants=grunt-nav@indoor.service
+# Note: there is intentionally NO `Wants=grunt-nav@<mode>.service`
+# here. Hardcoding a mode would disagree with `systemctl is-enabled
+# grunt-nav@<mode>.service` (the operator-facing boot-default
+# mechanism). Instead, ExecStartPost below runs grunt-start-nav-mode
+# which picks the right unit:
+#   1. /run/grunt/active_nav_mode (last-active register, tmpfs)
+#   2. systemctl is-enabled fallback
+# This makes systemctl enable authoritative for boot defaults AND
+# preserves the operator's runtime mode choice across
+# `systemctl restart grunt`.
 
 [Service]
+# Create /run/grunt/ owned by User=karim before the service starts.
+# Used as a tmpfs-backed "last active nav mode" register, written by
+# grunt-nav@.service's ExecStartPost and read by grunt-start-nav-mode.
+# RuntimeDirectoryPreserve=yes keeps the directory across
+# `systemctl stop grunt` / `systemctl restart grunt`; tmpfs wipes it
+# on real reboot, which is exactly the semantic we want.
+RuntimeDirectory=grunt
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
 Type=simple
 User=karim
 Group=karim
@@ -75,6 +81,12 @@ EnvironmentFile=-/etc/default/grunt
 # directly. sourcing is inline because systemd's Environment= doesn't
 # run shell expansions.
 ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/karim/ros2_ws/install/setup.bash && exec ros2 launch grunt_bringup grunt.quiet.launch.py prefix:=${GRUNT_PREFIX} site:=${GRUNT_SITE} mountpoint:=${GRUNT_NTRIP_MOUNTPOINT} use_sonar:=True'
+
+# After grunt is up, start whichever nav mode the operator was last
+# using (or the boot default if /run was just wiped by a reboot).
+# Exits 0 even when no mode is determined, so a misconfigured nav
+# enable state doesn't fail grunt itself.
+ExecStartPost=/usr/local/bin/grunt-start-nav-mode
 
 ExecStop=/home/karim/ros2_ws/src/grunt/install/autostart/grunt_park_and_stop.sh ${GRUNT_PREFIX}
 
