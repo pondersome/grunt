@@ -102,10 +102,19 @@ def service_call_returns_success(service: str, srv_type: str,
 class TopicCollector:
     """One rclpy node, many subscriptions, single measurement window.
 
-    Discovery happens once for the whole batch instead of per subprocess,
-    which is what makes this drastically more reliable than spawning
-    `ros2 topic hz` per check on a system with variable DDS discovery
-    latency.
+    Discovery happens continuously throughout the window — every 0.5 s
+    we re-query the topic graph and add subscriptions for any of our
+    target topics that have just become discoverable. This is what makes
+    the collector robust against the variable DDS discovery latency on
+    this system, where a topic can sometimes take 5-8 seconds to show up
+    in `get_topic_names_and_types()` even though its publisher started
+    long ago.
+
+    QoS: subscribes with `qos_profile_sensor_data` (BEST_EFFORT +
+    VOLATILE + KEEP_LAST/5), which is the standard "lossy stream"
+    profile most sensor publishers expect. BEST_EFFORT subs are
+    compatible with both BE and RELIABLE publishers; VOLATILE subs
+    work with both VOLATILE and TRANSIENT_LOCAL publishers.
 
     Usage:
         c = TopicCollector(window_s=8)
@@ -116,14 +125,17 @@ class TopicCollector:
         v = c.value('/grunt1/battery_state')
     """
 
-    def __init__(self, window_s: float = 8.0, settle_s: float = 2.0):
+    def __init__(self, window_s: float = 8.0, debug: bool = False):
         self.window_s = window_s
-        self.settle_s = settle_s
+        self.debug = debug
         self._specs = []   # list of (topic, field|None)
-        self._results = {} # topic → {"count":int, "value":any, "type":str|None}
+        self._results = {} # topic → {count, value, last_msg, type, sub_at}
 
     def add(self, topic: str, field: str | None = None) -> None:
         self._specs.append((topic, field))
+        self._results[topic] = {
+            "count": 0, "value": None, "last_msg": None,
+            "type": None, "sub_at": None}
 
     def last_msg(self, topic: str):
         r = self._results.get(topic)
@@ -131,7 +143,7 @@ class TopicCollector:
 
     @staticmethod
     def _load_msg_class(type_str: str):
-        """Turn 'pkg/msg/Type' into the class. Returns None on failure."""
+        """Turn 'pkg/msg/Type' (or 'pkg/Type') into the class. None on failure."""
         try:
             parts = type_str.split('/')
             if len(parts) == 3:
@@ -147,83 +159,99 @@ class TopicCollector:
             return None
 
     def run(self) -> None:
+        import os
         import rclpy
-        from rclpy.qos import (QoSProfile, ReliabilityPolicy,
-                                DurabilityPolicy, HistoryPolicy)
+        from rclpy.qos import qos_profile_sensor_data
 
         rclpy.init()
-        node = rclpy.create_node('grunt_health_probe')
+        # PID-suffixed name so re-runs don't collide
+        node = rclpy.create_node(f'grunt_health_probe_{os.getpid()}')
 
-        # BEST_EFFORT subscriber compatible with both BEST_EFFORT and
-        # RELIABLE publishers. Some topics use TRANSIENT_LOCAL durability
-        # (e.g. latched motor_state) — we'd miss those with VOLATILE,
-        # so we use a relaxed dual-subscription pattern: try
-        # TRANSIENT_LOCAL first for late-joining latched values, then
-        # also subscribe VOLATILE for live streams.
-        qos_volatile = QoSProfile(
-            depth=10, reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST)
+        spec_map = {t: f for t, f in self._specs}
+        subs = {}   # topic → subscription
+        debug_log = []
 
-        # Give the daemon a moment to refresh its topic-type map.
-        # On this system the discovery handshake commonly takes
-        # ~1-2 seconds even when the topic is publishing at full rate.
-        deadline = time.time() + self.settle_s
-        topic_types = {}
-        while time.time() < deadline:
-            for name, types in node.get_topic_names_and_types():
-                if types:
-                    topic_types[name] = types[0]
-            rclpy.spin_once(node, timeout_sec=0.1)
+        def make_cb(t, f):
+            def cb(msg):
+                self._results[t]["count"] += 1
+                self._results[t]["last_msg"] = msg
+                if f is not None:
+                    try:
+                        self._results[t]["value"] = getattr(msg, f)
+                    except AttributeError:
+                        pass
+            return cb
 
-        # Build subscriptions for everything we asked about
-        subs = []
-        for topic, field in self._specs:
-            type_str = topic_types.get(topic)
-            self._results[topic] = {
-                "count": 0, "value": None, "type": type_str}
-            if type_str is None:
-                continue
-            cls = self._load_msg_class(type_str)
-            if cls is None:
-                continue
-            def make_cb(t, f):
-                def cb(msg):
-                    self._results[t]["count"] += 1
-                    self._results[t]["last_msg"] = msg
-                    if f is not None:
-                        try:
-                            self._results[t]["value"] = getattr(msg, f)
-                        except AttributeError:
-                            pass
-                return cb
-            try:
-                sub = node.create_subscription(
-                    cls, topic, make_cb(topic, field), qos_volatile)
-                subs.append(sub)
-            except Exception:
-                # Failed to subscribe — leave count at 0
-                pass
+        def try_subscribe_all_new(now: float):
+            """Look at the current topic graph; subscribe to any of our
+            target topics that we don't already have a subscription for."""
+            topic_type_map = dict(node.get_topic_names_and_types())
+            for topic, field in self._specs:
+                if topic in subs:
+                    continue
+                types = topic_type_map.get(topic)
+                if not types:
+                    continue
+                type_str = types[0]
+                cls = self._load_msg_class(type_str)
+                if cls is None:
+                    debug_log.append(f"  could not load class for {topic} ({type_str})")
+                    continue
+                try:
+                    sub = node.create_subscription(
+                        cls, topic, make_cb(topic, field),
+                        qos_profile_sensor_data)
+                    subs[topic] = sub
+                    self._results[topic]["type"] = type_str
+                    self._results[topic]["sub_at"] = now
+                    debug_log.append(
+                        f"  +sub {topic} ({type_str}) at +{now:.2f}s")
+                except Exception as e:
+                    debug_log.append(f"  sub-fail {topic}: {e}")
 
-        # Measure
+        # Discovery + measurement combined. Re-query the topic graph
+        # every 0.5s and subscribe to anything new. Keep spinning to
+        # process incoming messages.
         start = time.time()
-        while time.time() - start < self.window_s:
+        last_discovery = -1.0
+        while True:
+            now = time.time() - start
+            if now > self.window_s:
+                break
+            if now - last_discovery > 0.5:
+                try_subscribe_all_new(now)
+                last_discovery = now
             rclpy.spin_once(node, timeout_sec=0.1)
+
+        if self.debug:
+            print("  [debug] discovery log:")
+            for line in debug_log:
+                print(line)
+            print(f"  [debug] discovered types:")
+            for name, types in sorted(node.get_topic_names_and_types()):
+                if name in spec_map:
+                    print(f"    {name}: {types}")
 
         # Cleanup
-        for s in subs:
+        for topic, sub in subs.items():
             try:
-                node.destroy_subscription(s)
+                node.destroy_subscription(sub)
             except Exception:
                 pass
         node.destroy_node()
         rclpy.shutdown()
 
     def rate(self, topic: str) -> float:
+        """Effective rate over the time we were subscribed (not the full
+        window). If discovery delay ate the first 4 s of an 8 s window,
+        rate is computed from the remaining 4 s — gives an honest answer."""
         r = self._results.get(topic)
-        if r is None:
+        if r is None or r.get("sub_at") is None:
             return 0.0
-        return r["count"] / self.window_s if self.window_s > 0 else 0.0
+        listening = self.window_s - r["sub_at"]
+        if listening <= 0:
+            return 0.0
+        return r["count"] / listening
 
     def count(self, topic: str) -> int:
         r = self._results.get(topic)
@@ -242,26 +270,51 @@ class TopicCollector:
 # Health check functions — each reads from the TopicCollector
 # ──────────────────────────────────────────────────────────────────
 
+def _dbm_to_pct(dbm: int) -> int:
+    """NetworkManager-style signal-quality conversion. -100 dBm → 0%,
+    -40 dBm → 100%, linear in between."""
+    pct = (dbm + 100) * 100 // 60
+    return max(0, min(100, pct))
+
+
 def check_wifi() -> int:
     section("WiFi")
-    rc, out, _ = _run(["nmcli", "-t", "-f", "active,ssid,signal", "dev", "wifi"])
-    ssid, signal = None, None
+    # `nmcli dev wifi` depends on a fresh scan cache and often returns
+    # empty on first call after a long-idle period. The active-connection
+    # path always knows what we're connected to, and `iw dev link` reads
+    # signal strength directly from the kernel — neither needs the wifi
+    # scan to have completed.
+    rc, out, _ = _run(
+        ["nmcli", "-t", "-f", "name,device,type,state",
+         "connection", "show", "--active"])
+    ssid, iface = None, None
     for line in out.splitlines():
         parts = line.split(":")
-        if len(parts) >= 3 and parts[0] == "yes":
-            ssid = parts[1]
-            try:
-                signal = int(parts[2])
-            except ValueError:
-                signal = None
+        if len(parts) >= 4 and parts[2] == "802-11-wireless" \
+                and parts[3] == "activated":
+            ssid, iface = parts[0], parts[1]
             break
     if ssid is None:
         status("fail", "no active wifi connection")
         return 2
+    # Get signal strength via iw — direct from kernel
+    signal_pct = None
+    if iface:
+        rc, link_out, _ = _run(["iw", "dev", iface, "link"])
+        for line in link_out.splitlines():
+            line = line.strip()
+            if line.startswith("signal:"):
+                try:
+                    dbm = int(line.split()[1])
+                    signal_pct = _dbm_to_pct(dbm)
+                except (ValueError, IndexError):
+                    pass
+                break
     bar_len = 10
-    filled = max(0, min(bar_len, (signal or 0) // 10))
+    filled = max(0, min(bar_len, (signal_pct or 0) // 10))
     bar = "█" * filled + "░" * (bar_len - filled)
-    msg = f"SSID={ssid!r} signal={signal}% [{bar}]"
+    sig_str = f"{signal_pct}%" if signal_pct is not None else "?"
+    msg = f"SSID={ssid!r} signal={sig_str} [{bar}]"
     if ssid.lower() == ROAM_SSID.lower():
         status("pass", f"{msg}  (roaming SSID)")
         return 0
@@ -510,6 +563,8 @@ def main(argv=None) -> int:
                    help="robot namespace prefix (default: grunt1)")
     p.add_argument("--window", type=float, default=8.0,
                    help="topic measurement window in seconds (default: 8)")
+    p.add_argument("--debug", action="store_true",
+                   help="print discovery log + what topic types were found")
     args = p.parse_args(argv)
 
     print(f"{BOLD}grunt health check — {time.strftime('%H:%M:%S')}  "
@@ -519,7 +574,7 @@ def main(argv=None) -> int:
     # spawning ros2 topic hz per check.
     print(f"  (subscribing to topics, sampling for {args.window:.0f}s...)",
           flush=True)
-    c = TopicCollector(window_s=args.window)
+    c = TopicCollector(window_s=args.window, debug=args.debug)
     pfx = args.prefix
     c.add(f"/{pfx}/bno055/imu")
     c.add(f"/{pfx}/pose")
