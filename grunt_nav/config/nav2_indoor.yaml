@@ -104,9 +104,14 @@ controller_server:
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
       # Indoor moves are slower and shorter; require less movement
-      # per window, allow less total time before declaring stuck.
+      # per window. Bumped 15→25s to give margin for BT-driven
+      # recovery commands flowing over twist_mux priority 75
+      # (cmd_vel_recovery) without tripping Nav2's own progress
+      # abort. EscapeSequence wrap on the pose branch is Phase D.2
+      # backlog (#47); plumbing is in place for it now.
+      # See memory/project_recovery_twist_mux_refactor.md.
       required_movement_radius: 0.1
-      movement_time_allowance: 15.0
+      movement_time_allowance: 25.0
     general_goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"

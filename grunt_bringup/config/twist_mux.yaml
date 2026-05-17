@@ -2,10 +2,23 @@
   ros__parameters:
     use_stamped: false
     topics:
+      # Operator teleop — highest priority below the estop locks.
       joystick:
         topic: cmd_vel_joy
         timeout: 0.5
         priority: 100
+      # BT-driven recovery commands (BackUp / Spin / DriveOnHeading).
+      # Sits ABOVE Nav2's cmd_vel_nav so the BT can override the
+      # controller without halting the FollowGPSWaypoints action. The
+      # FollowGPSWaypoints goal stays alive throughout the mission;
+      # recovery preempts at the cmd_vel layer, not the action layer.
+      # Bypasses collision_monitor by design (the polygon hit is what
+      # triggered the recovery; we don't want it to also block escape).
+      recovery:
+        topic: cmd_vel_recovery
+        timeout: 0.5
+        priority: 75
+      # Nav2 controller_server, post-collision_monitor.
       navigation:
         topic: cmd_vel_nav
         timeout: 0.5

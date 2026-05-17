@@ -45,14 +45,17 @@ def generate_launch_description():
 
     remappings = [('/tf', '/tf'), ('/tf_static', '/tf_static')]
     # Same cmd_vel chain as outdoor — see nav_outdoor.launch.py for the
-    # full rationale. Summary: controller + behavior_server both publish
-    # to cmd_vel_nav_raw; collision_monitor gates to cmd_vel_nav;
-    # twist_mux consumes cmd_vel_nav at priority 50.
+    # full rationale. Summary: controller_server publishes to
+    # /grunt1/cmd_vel_nav_raw → collision_monitor gates → /grunt1/cmd_vel_nav
+    # (twist_mux priority 50). behavior_server publishes recovery
+    # commands directly to /grunt1/cmd_vel_recovery (twist_mux priority
+    # 75), bypassing collision_monitor.
     controller_cmd_vel_remappings = remappings + [
         ('cmd_vel', ['/', prefix, '/cmd_vel_nav_raw']),
     ]
-    behavior_cmd_vel_remappings = controller_cmd_vel_remappings
-    cmd_vel_remappings = controller_cmd_vel_remappings
+    behavior_cmd_vel_remappings = remappings + [
+        ('cmd_vel', ['/', prefix, '/cmd_vel_recovery']),
+    ]
     base_remappings = remappings
 
     prefixed_params = ReplaceString(
@@ -126,7 +129,7 @@ def generate_launch_description():
                         respawn=True,
                         respawn_delay=5.0,
                         parameters=[configured_params],
-                        remappings=cmd_vel_remappings,
+                        remappings=behavior_cmd_vel_remappings,
                     ),
                     Node(
                         package='nav2_bt_navigator',

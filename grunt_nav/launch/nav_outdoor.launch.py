@@ -49,24 +49,37 @@ def generate_launch_description():
     # Use absolute paths for TF and cmd_vel so the /nav sub-namespace
     # doesn't redirect them away from the main robot topics
     remappings = [('/tf', '/tf'), ('/tf_static', '/tf_static')]
-    # cmd_vel chain with collision_monitor inline — BOTH controller
-    # and behavior_server route through it:
+    # cmd_vel chain — controller and behavior_server route to DIFFERENT
+    # mux inputs so recovery can preempt navigation without halting the
+    # FollowGPSWaypoints action:
     #   controller_server  →  /grunt1/cmd_vel_nav_raw
-    #   behavior_server    →  /grunt1/cmd_vel_nav_raw
     #   collision_monitor  (subscribes raw, gates via polygons, publishes:)
-    #                      →  /grunt1/cmd_vel_nav
-    #   twist_mux          (priority 50)
-    # Rationale: a "deadlocked" recovery (robot can't complete a spin
-    # or backup because persisted cloud points still trigger the stop
-    # polygon) is no worse than a no-op wait — operator intervenes in
-    # both cases. But letting the non-deadlock cases self-recover
-    # strictly dominates the wait-only alternative.
+    #                      →  /grunt1/cmd_vel_nav   (twist_mux priority 50)
+    #   behavior_server    →  /grunt1/cmd_vel_recovery  (twist_mux priority 75)
+    #
+    # Recovery commands bypass collision_monitor by design. The polygon
+    # hit is what triggered the recovery in the first place; routing the
+    # BackUp/Spin/DriveOnHeading through the same gate would re-block
+    # them (the old chain had a deadlock comment documenting this exact
+    # failure mode — sonar marks behind the chassis blocking reverse
+    # cmd_vel while we tried to back up). The recovery is short-lived
+    # and bounded (BackUp ≤0.75m, Spin ≤0.6rad, DriveOnHeading ≤0.40m
+    # at ≤0.20 m/s); not gating is the lesser risk vs. wedging the
+    # robot in front of an obstacle it could otherwise escape from.
+    #
+    # The recovery-on-its-own-mux topology also fixes the BT/Nav2
+    # desync race that was truncating mission bags: RunGpsMission's
+    # FollowGPSWaypoints goal stays alive through the whole mission
+    # (recovery preempts at the cmd_vel layer, not the action layer),
+    # so there's no halt-resend cycle and no stale-result-callback
+    # surface to attribute an OLD goal's CANCELED/ABORTED to a NEW
+    # goal. See memory/project_recovery_twist_mux_refactor.md.
     controller_cmd_vel_remappings = remappings + [
         ('cmd_vel', ['/', prefix, '/cmd_vel_nav_raw']),
     ]
-    behavior_cmd_vel_remappings = controller_cmd_vel_remappings
-    # Legacy alias — kept for any node that doesn't distinguish.
-    cmd_vel_remappings = controller_cmd_vel_remappings
+    behavior_cmd_vel_remappings = remappings + [
+        ('cmd_vel', ['/', prefix, '/cmd_vel_recovery']),
+    ]
     # Nodes that don't publish cmd_vel just get TF remappings
     base_remappings = remappings
 
@@ -150,7 +163,7 @@ def generate_launch_description():
                         respawn=True,
                         respawn_delay=5.0,
                         parameters=[configured_params],
-                        remappings=cmd_vel_remappings,
+                        remappings=behavior_cmd_vel_remappings,
                     ),
                     Node(
                         package='nav2_bt_navigator',
