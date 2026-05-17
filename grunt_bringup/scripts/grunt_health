@@ -586,12 +586,22 @@ def check_ublox(prefix: str, c: TopicCollector) -> int:
 
 
 def check_nav_mode_vs_environment(prefix: str, c: TopicCollector) -> int:
-    """Catch the indoor-mode-during-outdoor-mission failure mode that
-    cost us a mission on 2026-05-16. The localization_supervisor
-    publishes its environment classification on
-    /<prefix>/localization/status (JSON), and nav_mode_switcher
-    publishes the currently-active Nav2 mode on /<prefix>/nav/mode.
-    They should agree."""
+    """Cross-reference nav_mode vs localization_supervisor's environment
+    classification. Catches the indoor-mode-during-outdoor-mission
+    failure mode that cost us a mission on 2026-05-16.
+
+    Severity is WARN, not FAIL, because nothing on the live control
+    path consumes the `environment` field today — it's pure
+    observation. The supervisor's heuristic also has no debounce
+    (single-tick decision per 1Hz evaluate), so transient RTK
+    degrades can briefly mis-classify. A persistent mismatch is
+    still worth flagging — it usually means the operator forgot to
+    switch modes — but a brief one isn't operationally fatal.
+
+    Severity should flip back to FAIL once task #36 (Environs-driven
+    set_mode trigger / grunt_environs) ships with proper debounce +
+    auto-switching, at which point a sustained mismatch DOES mean
+    something broke (the auto-switcher should have acted but didn't)."""
     import json
     section("Nav mode vs environment")
     nav_mode = None
@@ -616,12 +626,12 @@ def check_nav_mode_vs_environment(prefix: str, c: TopicCollector) -> int:
     if nav_mode == env:
         status("pass", f"nav_mode={nav_mode!r} matches environment={env!r}")
         return 0
-    status("fail",
-           f"MISMATCH: nav_mode={nav_mode!r} but environment={env!r} — "
-           f"mission will fail. Fix: "
-           f"ros2 topic pub /{prefix}/nav/set_mode std_msgs/String "
-           f"\"data: '{env}'\" -1")
-    return 2
+    status("warn",
+           f"mismatch: nav_mode={nav_mode!r} but environment={env!r} — "
+           f"if intentional (bench testing, mode-pre-staging), ignore. "
+           f"Otherwise: ros2 topic pub /{prefix}/nav/set_mode "
+           f"std_msgs/String \"data: '{env}'\" -1")
+    return 1
 
 
 def _active_nav_mode() -> str:
