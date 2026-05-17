@@ -128,11 +128,17 @@ class TopicCollector:
     def __init__(self, window_s: float = 8.0, debug: bool = False):
         self.window_s = window_s
         self.debug = debug
-        self._specs = []   # list of (topic, field|None)
+        self._specs = []   # list of (topic, field|None, latched)
         self._results = {} # topic → {count, value, last_msg, type, sub_at}
 
-    def add(self, topic: str, field: str | None = None) -> None:
-        self._specs.append((topic, field))
+    def add(self, topic: str, field: str | None = None,
+             latched: bool = False) -> None:
+        """`latched=True` for topics published with TRANSIENT_LOCAL
+        durability (e.g. nav/mode, mission_overlay/selected_mission) —
+        the collector will subscribe both VOLATILE and TRANSIENT_LOCAL
+        so the latched cached value gets delivered to late-joining
+        subscribers."""
+        self._specs.append((topic, field, latched))
         self._results[topic] = {
             "count": 0, "value": None, "last_msg": None,
             "type": None, "sub_at": None}
@@ -161,14 +167,23 @@ class TopicCollector:
     def run(self) -> None:
         import os
         import rclpy
-        from rclpy.qos import qos_profile_sensor_data
+        from rclpy.qos import (qos_profile_sensor_data, QoSProfile,
+                                ReliabilityPolicy, DurabilityPolicy,
+                                HistoryPolicy)
 
         rclpy.init()
         # PID-suffixed name so re-runs don't collide
         node = rclpy.create_node(f'grunt_health_probe_{os.getpid()}')
 
-        spec_map = {t: f for t, f in self._specs}
-        subs = {}   # topic → subscription
+        # For latched topics: a separate TRANSIENT_LOCAL subscription
+        # gets the cached value from late-joining publishers.
+        qos_latched = QoSProfile(
+            depth=1, reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST)
+
+        spec_map = {t: (f, lat) for t, f, lat in self._specs}
+        subs = {}   # topic → list of subscriptions (1 or 2 per topic)
         debug_log = []
 
         def make_cb(t, f):
@@ -186,7 +201,7 @@ class TopicCollector:
             """Look at the current topic graph; subscribe to any of our
             target topics that we don't already have a subscription for."""
             topic_type_map = dict(node.get_topic_names_and_types())
-            for topic, field in self._specs:
+            for topic, field, latched in self._specs:
                 if topic in subs:
                     continue
                 types = topic_type_map.get(topic)
@@ -197,17 +212,34 @@ class TopicCollector:
                 if cls is None:
                     debug_log.append(f"  could not load class for {topic} ({type_str})")
                     continue
+                topic_subs = []
+                # Always do BEST_EFFORT+VOLATILE — catches live streams from
+                # any publisher (BE or RELIABLE, VOLATILE or TL).
                 try:
-                    sub = node.create_subscription(
+                    s = node.create_subscription(
                         cls, topic, make_cb(topic, field),
                         qos_profile_sensor_data)
-                    subs[topic] = sub
+                    topic_subs.append(s)
+                except Exception as e:
+                    debug_log.append(f"  sub-fail VOLATILE {topic}: {e}")
+                # For latched topics, also do RELIABLE+TRANSIENT_LOCAL so
+                # the publisher's cached value reaches us as a late joiner.
+                # A TL subscriber WON'T connect to a VOLATILE publisher,
+                # so we need both subs to cover both publisher configs.
+                if latched:
+                    try:
+                        s = node.create_subscription(
+                            cls, topic, make_cb(topic, field), qos_latched)
+                        topic_subs.append(s)
+                    except Exception as e:
+                        debug_log.append(f"  sub-fail TL {topic}: {e}")
+                if topic_subs:
+                    subs[topic] = topic_subs
                     self._results[topic]["type"] = type_str
                     self._results[topic]["sub_at"] = now
                     debug_log.append(
-                        f"  +sub {topic} ({type_str}) at +{now:.2f}s")
-                except Exception as e:
-                    debug_log.append(f"  sub-fail {topic}: {e}")
+                        f"  +sub {topic} ({type_str}) "
+                        f"{'(VOLATILE+TL)' if latched else '(VOLATILE)'} at +{now:.2f}s")
 
         # Discovery + measurement combined. Re-query the topic graph
         # every 0.5s and subscribe to anything new. Keep spinning to
@@ -233,11 +265,12 @@ class TopicCollector:
                     print(f"    {name}: {types}")
 
         # Cleanup
-        for topic, sub in subs.items():
-            try:
-                node.destroy_subscription(sub)
-            except Exception:
-                pass
+        for topic, sub_list in subs.items():
+            for s in sub_list:
+                try:
+                    node.destroy_subscription(s)
+                except Exception:
+                    pass
         node.destroy_node()
         rclpy.shutdown()
 
@@ -508,6 +541,45 @@ def check_ublox(prefix: str, c: TopicCollector) -> int:
     return issues
 
 
+def check_nav_mode_vs_environment(prefix: str, c: TopicCollector) -> int:
+    """Catch the indoor-mode-during-outdoor-mission failure mode that
+    cost us a mission on 2026-05-16. The localization_supervisor
+    publishes its environment classification on
+    /<prefix>/localization/status (JSON), and nav_mode_switcher
+    publishes the currently-active Nav2 mode on /<prefix>/nav/mode.
+    They should agree."""
+    import json
+    section("Nav mode vs environment")
+    nav_mode = None
+    nav_mode_msg = c.last_msg(f"/{prefix}/nav/mode")
+    if nav_mode_msg is not None:
+        nav_mode = getattr(nav_mode_msg, "data", None)
+    env = None
+    loc_msg = c.last_msg(f"/{prefix}/localization/status")
+    if loc_msg is not None:
+        try:
+            d = json.loads(loc_msg.data)
+            env = d.get("environment")
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    if nav_mode is None:
+        status("warn", "nav/mode not received (nav_mode_switcher down?)")
+        return 1
+    if env is None:
+        status("warn",
+               "localization/status not received or has no environment field")
+        return 1
+    if nav_mode == env:
+        status("pass", f"nav_mode={nav_mode!r} matches environment={env!r}")
+        return 0
+    status("fail",
+           f"MISMATCH: nav_mode={nav_mode!r} but environment={env!r} — "
+           f"mission will fail. Fix: "
+           f"ros2 topic pub /{prefix}/nav/set_mode std_msgs/String "
+           f"\"data: '{env}'\" -1")
+    return 2
+
+
 def _node_state(node_name: str, timeout: int = 4) -> str:
     rc, out, _ = _run(
         ["timeout", str(timeout), "ros2", "service", "call",
@@ -583,6 +655,8 @@ def main(argv=None) -> int:
     c.add(f"/{pfx}/rtk/navpvt")
     c.add(f"/{pfx}/battery_state", field="voltage")
     c.add(f"/{pfx}/motor_state", field="state")
+    c.add(f"/{pfx}/nav/mode", latched=True)
+    c.add(f"/{pfx}/localization/status")
     try:
         c.run()
     except Exception as e:
@@ -596,6 +670,7 @@ def main(argv=None) -> int:
     total += check_ntrip(args.prefix, c)
     total += check_ublox(args.prefix, c)
     total += check_nav2(args.prefix)
+    total += check_nav_mode_vs_environment(args.prefix, c)
 
     section("Summary")
     if total == 0:
