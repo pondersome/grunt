@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""add_interstitials — insert interpolated waypoints between sparse GPS waypoints.
+
+Reads a mission YAML, for every consecutive pair of waypoints with geographic
+distance > max_spacing_m, inserts evenly-spaced interstitial waypoints. Writes
+a new mission YAML alongside the original (suffix derived from spacing).
+
+Use to test whether tighter spacing actually reduces tracking error vs. the
+existing sparse-waypoint mission — a controller-side question that RPP tuning
+alone can't answer (chassis dynamics dominate).
+
+Usage:
+    ros2 run grunt_bringup add_interstitials \\
+        /home/karim/ros2_ws/grunt_missions/sites/ranchero/260501-131659.yaml \\
+        --max-spacing 3.0
+
+Output filename: <stem>-i<spacing>m.yaml in the same directory.
+
+Interpolation:
+- lat/lon: linear (equirectangular approximation — accurate enough on
+  driveway scales; total Earth-curvature error at 300m is mm-class).
+- alt: linear.
+- yaw: bearing from previous to next ORIGINAL waypoint, in ENU
+  convention (east = 0, CCW positive).
+- h_acc, carr_phase, fix_time: marked as "interpolated" so we can
+  distinguish from real fixes during post-mission analysis.
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import sys
+from pathlib import Path
+
+import yaml
+
+
+EARTH_R = 6371000.0
+
+
+def lla_dist_m(a, b):
+    """Equirectangular distance between two lat/lon dicts."""
+    lat1, lon1 = math.radians(a['lat']), math.radians(a['lon'])
+    lat2, lon2 = math.radians(b['lat']), math.radians(b['lon'])
+    dx = (lon2 - lon1) * math.cos(0.5 * (lat1 + lat2)) * EARTH_R
+    dy = (lat2 - lat1) * EARTH_R
+    return math.hypot(dx, dy), dx, dy
+
+
+def bearing_enu_rad(a, b):
+    """Bearing from a to b, ENU yaw convention (east = 0, CCW = +)."""
+    _, dx, dy = lla_dist_m(a, b)
+    return math.atan2(dy, dx)
+
+
+def interpolate(a, b, t):
+    """Lerp from a to b at parameter t in [0, 1]."""
+    return {
+        'lat': a['lat'] + t * (b['lat'] - a['lat']),
+        'lon': a['lon'] + t * (b['lon'] - a['lon']),
+        'alt': a.get('alt', 0.0) + t * (b.get('alt', 0.0) - a.get('alt', 0.0)),
+        # Yaw filled in by caller — same bearing for all interstitials in segment.
+        'fix_time': 'interpolated',
+        'h_acc': 0.0,
+        'carr_phase': 'interpolated',
+    }
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('input', help='Mission YAML to densify')
+    p.add_argument('--max-spacing', type=float, default=3.0,
+        help='Insert interstitials when consecutive waypoints are more than '
+             'this far apart (meters). Default 3.0.')
+    p.add_argument('--output', help='Output path. Default: <stem>-i<spacing>m.yaml')
+    args = p.parse_args()
+
+    src = Path(args.input)
+    if not src.exists():
+        print(f'No such file: {src}', file=sys.stderr)
+        return 1
+    spec = yaml.safe_load(src.read_text())
+    if not spec.get('waypoints'):
+        print('No waypoints in mission', file=sys.stderr)
+        return 1
+    if spec.get('frame', 'gps') != 'gps':
+        print(f'Only GPS-frame missions supported; got frame={spec.get("frame")}',
+              file=sys.stderr)
+        return 1
+
+    wps = spec['waypoints']
+    new_wps = [wps[0]]
+    inserted = 0
+    seg_dists = []
+    for i in range(len(wps) - 1):
+        a, b = wps[i], wps[i+1]
+        d, _, _ = lla_dist_m(a, b)
+        seg_dists.append(d)
+        if d > args.max_spacing:
+            # Number of segments after splitting:
+            n = math.ceil(d / args.max_spacing)
+            # Bearing along this segment (same for all interstitials):
+            yaw = bearing_enu_rad(a, b)
+            for k in range(1, n):
+                t = k / n
+                wp = interpolate(a, b, t)
+                wp['yaw'] = round(yaw, 4)
+                new_wps.append(wp)
+                inserted += 1
+        new_wps.append(b)
+
+    out = src.parent / (args.output or f'{src.stem}-i{int(args.max_spacing)}m.yaml')
+    spec_out = {
+        'name': f"{spec['name']}-i{int(args.max_spacing)}m",
+        'description': (f"{spec.get('description', '')} | densified with "
+                        f"{inserted} interstitials, max spacing "
+                        f"{args.max_spacing}m"),
+        'frame': spec['frame'],
+        'waypoints': new_wps,
+    }
+    out.write_text(yaml.safe_dump(spec_out, sort_keys=False, default_flow_style=None))
+    print(f'Original: {len(wps)} waypoints, longest segment {max(seg_dists):.1f}m, '
+          f'segments > {args.max_spacing}m: {sum(1 for d in seg_dists if d > args.max_spacing)}/{len(seg_dists)}')
+    print(f'Output:   {len(new_wps)} waypoints (+{inserted} interstitials) → {out}')
+
+
+if __name__ == '__main__':
+    sys.exit(main() or 0)
