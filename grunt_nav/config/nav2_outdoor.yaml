@@ -149,28 +149,44 @@ controller_server:
       # linearly with v, so S-turn oscillation gets WORSE faster than
       # speed grows. Velocity-scaling holds K nearly constant.
       use_velocity_scaled_lookahead_dist: true
-      # Round 3 (2026-05-01 evening) was 4.5s — softer K to dampen
-      # oscillation but exposed a worse failure mode: chassis settles
-      # parallel to the path but laterally offset, with no recovery
-      # force on long segments. Mission 2026-05-18 22:48 confirmed:
-      # per-segment median CTE up to 1.22m on a 14m segment, max 1.75m
-      # — the chassis tracks straight but offset for the whole segment.
+      # Round 3 (2026-05-01 evening): bumped 3.0 → 4.5s. The previous
+      # round dropped abs_median(ω) from 0.46 → 0.12 rad/s and stdev
+      # from 0.65 → 0.32 — large win — but visible meandering in N1/N2
+      # missions still showed the chassis settling parallel to the path
+      # but offset, with rotations at the waypoint transitions. Bumping
+      # lookahead_time further softens K = 2v/L (gain inversely
+      # proportional to L) so per-cycle correction commands shrink and
+      # the chassis under-delivery (slope ~0.5) becomes a smaller
+      # absolute error. Closed-loop period now ≈ 4.5 + 0.3 = 4.8s.
       #
-      # Round 4 (2026-05-18 late): partway back toward round 2's 3.0s.
-      # Tighter pursuit (smaller L → larger K = 2v/L per cycle) so
-      # lateral error gets corrected within a segment instead of
-      # accumulating. Watch for round-2's oscillation re-emergence —
-      # if ω stdev climbs back, bump to 3.5s.
-      lookahead_time: 3.0
+      # Round 4 (2026-05-18 late): tried 3.0s with the hypothesis that
+      # tighter pursuit would reduce long-segment CTE (median CTE up
+      # to 1.22m had been observed at 4.5s).
+      #
+      # Round 4 REVERTED (2026-05-19, two missions): oscillation
+      # measurably returned, CTE didn't improve. ω stats over two
+      # round-trip missions:
+      #     R3 (4.5s)  abs_mean=0.14  abs_median=0.07  p90=0.33  sign-flips=22-43
+      #     R4 (3.0s)  abs_mean=0.20  abs_median=0.14  p90=0.42  sign-flips=60-67
+      # Sign-flip rate doubled, median ω roughly doubled — exactly the
+      # pattern round 3's notes warned about. Operator reported that
+      # CTE did not noticeably improve.
+      #
+      # Conclusion: at the current chassis-slip (0.5x) and speed (1.0
+      # m/s), the steady-state offset is dominated by chassis dynamics,
+      # not lookahead. Shortening L just buys back oscillation in
+      # exchange for nothing. Next escalation should be on different
+      # axes — speed cap, regulated_linear_scaling_min_radius, or
+      # interstitial waypoints — NOT another pass at L.
+      lookahead_time: 4.5
       # Fallback when velocity-scaling can't compute.
       lookahead_dist: 3.0
-      # min/max clamps. Floor stays 1.2 to keep > xy_goal_tolerance=1.0
+      # min/max clamps. Floor at 1.2 to keep > xy_goal_tolerance=1.0
       # (avoids RPP's carrot-within-tolerance rotate trap).
-      # Ceiling dropped 5.0 → 3.5 to match round 4's tighter pursuit;
-      # v=1.0 × 3.0s = 3.0m, with 0.5m headroom. Will need to revisit
-      # if desired_linear_vel lifts toward the 1.5 m/s firmware ceiling.
+      # Ceiling 5.0 accommodates v=1.0 × 4.5s = 4.5m + 0.5m headroom
+      # for the 1.5 m/s firmware ceiling if speed lifts again.
       min_lookahead_dist: 1.2
-      max_lookahead_dist: 3.5
+      max_lookahead_dist: 5.0
       # ─── in-place rotation ─────────────────────────────────────────
       # 0.6 → π rad/s top angular velocity during rotate-to-heading.
       # The kinematic decel formula in rotateToHeading() ensures we
@@ -180,15 +196,16 @@ controller_server:
       # ceiling kicks in first.
       rotate_to_heading_angular_vel: 3.14159
       use_rotate_to_heading: true
-      # Round 4 (2026-05-18 late): lowered 0.5 (28.6°) → 0.30 (17°).
-      # Same "small frequent corrections > rare drastic ones" rationale
-      # but applied harder. Goal: zero out heading bias accumulation at
-      # waypoint transitions, since chassis slip 0.5× under-delivery
-      # means smooth curvature commands can't correct accumulated
-      # lateral offset on long segments (confirmed 2026-05-18 22:48
-      # mission). More in-place rotations are jerky but reset drift —
-      # acceptable trade-off for the cross-track improvement.
-      rotate_to_heading_min_angle: 0.30
+      # Lowered 0.785 (45°) → 0.5 (~28.6°). Operator philosophy: prefer
+      # earlier, smaller in-place corrections over rare large ones.
+      # At α=28.6°, the kinematic-decel ceiling is sqrt(2·3.2·0.5) =
+      # 1.79 rad/s — 56% of the rotate_to_heading_angular_vel cap, so
+      # rotations stay well below π and execute in ~0.5s.
+      #
+      # Round 4 also tried 0.30 (17°) on 2026-05-18, reverted with
+      # lookahead — see lookahead_time block for the rationale. The
+      # CTE-vs-oscillation tradeoff couldn't be improved on these axes.
+      rotate_to_heading_min_angle: 0.5
       # ─── slew-rate limit on omega ──────────────────────────────────
       # Was 1.5 (chosen earlier as a damping aid for S-turns). With
       # rotate_to_heading_angular_vel=π, we need higher max_angular_
