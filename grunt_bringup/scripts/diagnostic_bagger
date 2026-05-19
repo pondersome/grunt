@@ -79,6 +79,13 @@ TOPIC_TEMPLATES = [
     '/{prefix}/cmd_vel_nav',
     '/{prefix}/cmd_vel_nav_raw',
     '/{prefix}/cmd_vel_joy',
+    # cmd_vel_recovery: BT-driven escape behaviors (BackUp/Spin/
+    # DriveOnHeading) publish here at twist_mux priority 75, bypassing
+    # collision_monitor. Added 2026-05-17 alongside the recovery
+    # refactor. Without this, bag shows 0 messages on the topic even
+    # when behavior_server is actively recovering — making post-mortem
+    # of "did the BT actually try to recover?" impossible.
+    '/{prefix}/cmd_vel_recovery',
 
     # Recovery + safety state
     '/{prefix}/bt_runner/active_behavior',
@@ -125,7 +132,15 @@ TOPIC_TEMPLATES = [
 
     # IMU + joy
     '/{prefix}/bno055/imu',
-    '/joy',
+    # joy_node runs under the robot namespace (launched via grunt.quiet),
+    # so its topic is /<prefix>/joy — NOT the bare /joy. The bare path
+    # was a 2026-05-17 vintage bug; the bag recorded 0 /joy messages
+    # because nothing publishes there. Continuity of /<prefix>/joy lets
+    # us distinguish "joystick USB dropped out" from "operator wasn't
+    # holding the deadman" — joy_node publishes ~30Hz continuously
+    # while connected, regardless of button state, so a gap means a
+    # real disconnect.
+    '/{prefix}/joy',
 ]
 
 MISSION_BEHAVIORS = {'run_gps_mission', 'run_pose_mission'}
