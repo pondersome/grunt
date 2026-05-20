@@ -179,6 +179,7 @@ def generate_launch_description():
         DeclareLaunchArgument('Behaviors', default_value='1', description='Start grunt_behaviors BT runner + waypoint recorder (requires Nav2 for missions)'),
         DeclareLaunchArgument('DiagnosticBag', default_value='1', description='Auto-record a diagnostic rosbag while bt_runner is running a mission'),
         DeclareLaunchArgument('diagnostic_bag_root', default_value=os.path.expanduser('~/bag_files/grunt'), description='Root directory for mission-triggered diagnostic bags'),
+        DeclareLaunchArgument('SystemMetrics', default_value='1', description='Start the system_metrics node — CPU/memory/network PSI + topic-load/latency telemetry on ~/diagnostics/system'),
         DeclareLaunchArgument('Wifi', default_value='1', description='Start isr_wifi connected-link telemetry + pose-correlated sampler'),
         DeclareLaunchArgument('wifi_interface', default_value='wlo1', description='Linux wireless interface for the primary operational link'),
         DeclareLaunchArgument('WifiSwitcher', default_value='true', description='Enable the Phase 1.5 resiliency switcher (one-way fallback via nmcli)'),
@@ -494,6 +495,24 @@ def generate_launch_description():
     )
 
 
+    # System resource + network pressure telemetry. Always-on (not
+    # mission-scoped like diagnostic_bagger) so it covers teleop and idle
+    # too; diagnostic_bagger records its topic when a mission runs.
+    gp_system_metrics = GroupAction(
+        actions=[
+            Node(
+                package='grunt_bringup',
+                executable='system_metrics',
+                name='system_metrics',
+                parameters=[{
+                    'prefix': LaunchConfiguration('prefix'),
+                }],
+                output='screen',
+            ),
+        ],
+        condition=IfCondition(LaunchConfiguration('SystemMetrics'))
+    )
+
     # Parent GroupAction that applies a namespace
     parent_group = GroupAction([
         PushRosNamespace(LaunchConfiguration('prefix')),
@@ -509,6 +528,7 @@ def generate_launch_description():
         gp_joy_commands,
         gp_nav_mode_switcher,
         gp_behaviors,
+        gp_system_metrics,
         gp_wifi,
         gp_lidar,
         gp_joy_tele,

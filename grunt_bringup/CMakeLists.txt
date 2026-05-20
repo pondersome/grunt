@@ -30,6 +30,7 @@ install(PROGRAMS
   scripts/navpvt_to_imu
   scripts/grunt_health
   scripts/add_interstitials
+  scripts/system_metrics
   DESTINATION lib/${PROJECT_NAME}
 )
 

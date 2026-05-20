@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""System resource + network pressure telemetry for mission diagnostics.
+
+Publishes diagnostic_msgs/DiagnosticArray on /<prefix>/diagnostics/system at a
+fixed rate. Designed to be bagged alongside nav data (diagnostic_bagger picks
+up the topic) so post-mission analysis can overlay resource pressure against
+controller behaviour — e.g. a CPU stall against a controller stutter, or a
+wifi-link drop against a costmap-staleness event.
+
+What it captures
+----------------
+  * PSI  — kernel Pressure Stall Information for cpu / memory / io, both
+           system-wide (/proc/pressure/*) and per systemd-unit cgroup
+           (cpu.pressure etc.). PSI is the canonical Linux "how starved is
+           this resource" signal; system-wide totals would have hidden the
+           CPUAccounting cgroup-starvation gotcha — per-cgroup makes it
+           visible.
+  * CPU  — system busy fraction + loadavg; per-cgroup CPU cores consumed.
+  * MEM  — system used/available/swap; per-cgroup current usage.
+  * NET  — per-interface throughput, error/drop rates, wifi link quality.
+           Per-interface (not aggregate) so wifi / ZeroTier / ethernet stay
+           separable — connection quality and the off-robot boundary differ
+           sharply between them.
+  * LATENCY — ICMP RTT to configurable targets (gateway, base station,
+              ZeroTier peers); plus per-topic message age for stamped
+              control topics (pipeline latency).
+  * TOPIC LOAD — Hz and kbit/s for heavy topics (point clouds, cameras,
+              monitor bridges). Raw subscriptions: counted and sized
+              without deserialisation, so watching an 11k-point cloud is
+              cheap.
+
+Forward design
+--------------
+Everything that will vary across deployments is a parameter, so new sensors
+(cameras, extra clouds), new monitors (Foxglove / Vizanti / custom bridges)
+and new ping targets are added via config, NOT code:
+  * net_interfaces  — default: all non-loopback, auto-discovered
+  * ping_targets    — 'name=host' entries; the default gateway is auto-added
+  * load_topics     — raw rate/bandwidth probes
+  * latency_topics  — deserialised rate/age probes
+  * cgroup_glob     — which system.slice units to sample
+Topics are resolved lazily on a discovery timer, so a camera that starts
+late (or a monitor that connects mid-mission) is picked up automatically.
+"""
+import glob
+import os
+import re
+import subprocess
+import threading
+import time
+
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import (QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy,
+                       QoSHistoryPolicy)
+from rclpy.time import Time
+
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+from rosidl_runtime_py.utilities import get_message
+
+
+CGROUP_ROOT = '/sys/fs/cgroup/system.slice'
+
+OK = DiagnosticStatus.OK
+WARN = DiagnosticStatus.WARN
+ERROR = DiagnosticStatus.ERROR
+
+
+# --------------------------------------------------------------------------
+# /proc + /sys readers (dependency-free; no psutil)
+# --------------------------------------------------------------------------
+def _read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def _fmt(v, nd=3):
+    try:
+        if v is None:
+            return 'n/a'
+        f = float(v)
+        if f != f:  # NaN
+            return 'nan'
+        return f'{f:.{nd}f}'
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _kv(d):
+    return [KeyValue(key=str(k), value=str(v)) for k, v in d.items()]
+
+
+def _parse_psi(text):
+    """Parse /proc/pressure/* or a cgroup *.pressure file.
+
+    Returns a flat dict, e.g. {'some_avg10': '0.00', 'full_avg60': '0.00'}.
+    avg* fields are the % of wall-time tasks stalled on the resource over
+    10/60/300s windows; 'total' is the cumulative stall in microseconds.
+    """
+    out = {}
+    if not text:
+        return out
+    for line in text.strip().splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        kind = parts[0]            # 'some' or 'full'
+        for tok in parts[1:]:
+            if '=' in tok:
+                k, v = tok.split('=', 1)
+                out[f'{kind}_{k}'] = v
+    return out
+
+
+def _parse_meminfo():
+    out = {}
+    text = _read_text('/proc/meminfo')
+    if not text:
+        return out
+    for line in text.splitlines():
+        if ':' not in line:
+            continue
+        key, rest = line.split(':', 1)
+        fields = rest.split()
+        if fields:
+            try:
+                out[key] = int(fields[0])   # kB
+            except ValueError:
+                pass
+    return out
+
+
+def _read_net_dev():
+    out = {}
+    text = _read_text('/proc/net/dev')
+    if not text:
+        return out
+    for line in text.splitlines():
+        if ':' not in line:
+            continue
+        name, rest = line.split(':', 1)
+        f = rest.split()
+        if len(f) < 16:
+            continue
+        # rx: bytes packets errs drop ... ; tx starts at index 8
+        out[name.strip()] = {
+            'rx_bytes': int(f[0]), 'rx_errs': int(f[2]), 'rx_drop': int(f[3]),
+            'tx_bytes': int(f[8]), 'tx_errs': int(f[10]), 'tx_drop': int(f[11]),
+        }
+    return out
+
+
+def _read_wireless():
+    out = {}
+    text = _read_text('/proc/net/wireless')
+    if not text:
+        return out
+    for line in text.splitlines():
+        if ':' not in line or 'face' in line:
+            continue
+        name, rest = line.split(':', 1)
+        f = rest.split()
+        if len(f) >= 3:
+            # status link level noise
+            out[name.strip()] = {'link': f[1].rstrip('.'),
+                                  'level_dbm': f[2].rstrip('.')}
+    return out
+
+
+def _default_gateway():
+    text = _read_text('/proc/net/route')
+    if not text:
+        return None
+    for line in text.splitlines()[1:]:
+        f = line.split()
+        if len(f) > 2 and f[1] == '00000000' and f[2] != '00000000':
+            gw = f[2]
+            try:
+                return '.'.join(str(int(gw[i:i + 2], 16)) for i in (6, 4, 2, 0))
+            except ValueError:
+                return None
+    return None
+
+
+class _CpuSampler:
+    """System CPU busy fraction from /proc/stat deltas."""
+
+    def __init__(self):
+        self._prev = None
+
+    def sample(self):
+        text = _read_text('/proc/stat')
+        if not text:
+            return None
+        for line in text.splitlines():
+            if line.startswith('cpu '):
+                fields = [int(x) for x in line.split()[1:]]
+                idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
+                total = sum(fields)
+                prev, self._prev = self._prev, (idle, total)
+                if prev is None:
+                    return None
+                d_total = total - prev[1]
+                if d_total <= 0:
+                    return None
+                return 1.0 - (idle - prev[0]) / d_total
+        return None
+
+
+# --------------------------------------------------------------------------
+# Background ICMP latency prober
+# --------------------------------------------------------------------------
+class _PingMonitor:
+    """Pings targets on a background thread; main loop reads cached results.
+
+    Kept off the executor thread because `ping -c1 -W1` blocks up to a
+    second per target — sampling it inline would stall the publish timer.
+    """
+
+    def __init__(self, targets, interval, logger):
+        self.targets = targets               # list[(name, host)]
+        self.interval = interval
+        self.logger = logger
+        self._results = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        if self.targets:
+            self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.is_set():
+            for name, host in self.targets:
+                if self._stop.is_set():
+                    break
+                rtt, loss = self._ping(host)
+                with self._lock:
+                    self._results[name] = {'host': host, 'rtt_ms': rtt,
+                                            'loss': loss}
+            self._stop.wait(self.interval)
+
+    @staticmethod
+    def _ping(host):
+        try:
+            r = subprocess.run(['ping', '-n', '-c', '1', '-W', '1', host],
+                               capture_output=True, text=True, timeout=3.0)
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return float('nan'), 100.0
+        if r.returncode != 0:
+            return float('nan'), 100.0
+        m = re.search(r'time=([\d.]+)', r.stdout)
+        return (float(m.group(1)) if m else float('nan')), 0.0
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._results)
+
+
+# --------------------------------------------------------------------------
+# Node
+# --------------------------------------------------------------------------
+class SystemMetrics(Node):
+    def __init__(self):
+        super().__init__('system_metrics')
+
+        self.declare_parameter('prefix', 'grunt1')
+        self.declare_parameter('publish_rate_hz', 1.0)
+        self.declare_parameter('cgroup_glob', 'grunt*.service')
+        self.declare_parameter('net_interfaces', [''])   # [''] => all non-lo
+        self.declare_parameter('ping_targets', [''])     # 'name=host' or 'host'
+        self.declare_parameter('ping_gateway', True)
+        self.declare_parameter('ping_interval_sec', 10.0)
+        self.declare_parameter('load_topics',
+                               ['/{prefix}/l2/points',
+                                '/{prefix}/sonar/cloud'])
+        self.declare_parameter('latency_topics',
+                               ['/{prefix}/cmd_vel',
+                                '/{prefix}/cmd_vel_nav',
+                                '/{prefix}/odometry/global',
+                                '/{prefix}/odometry/local'])
+        self.declare_parameter('psi_warn_avg10', 25.0)
+        self.declare_parameter('mem_warn_frac', 0.85)
+        self.declare_parameter('mem_error_frac', 0.95)
+
+        self.prefix = self.get_parameter('prefix').value
+        rate = float(self.get_parameter('publish_rate_hz').value)
+        self._cgroup_glob = self.get_parameter('cgroup_glob').value
+        self._ifaces = [i for i in self.get_parameter('net_interfaces').value if i]
+        self._psi_warn = float(self.get_parameter('psi_warn_avg10').value)
+        self._mem_warn = float(self.get_parameter('mem_warn_frac').value)
+        self._mem_error = float(self.get_parameter('mem_error_frac').value)
+
+        def _resolve(lst):
+            return [t.format(prefix=self.prefix) for t in lst]
+
+        self._load_topics = _resolve(self.get_parameter('load_topics').value)
+        self._latency_topics = _resolve(self.get_parameter('latency_topics').value)
+
+        # ping targets
+        targets = []
+        for entry in self.get_parameter('ping_targets').value:
+            if not entry:
+                continue
+            if '=' in entry:
+                name, host = entry.split('=', 1)
+            else:
+                name = host = entry
+            targets.append((name, host))
+        if self.get_parameter('ping_gateway').value:
+            gw = _default_gateway()
+            if gw:
+                targets.append(('gateway', gw))
+        self._ping = _PingMonitor(
+            targets, float(self.get_parameter('ping_interval_sec').value),
+            self.get_logger())
+        self._ping.start()
+
+        # samplers / delta state
+        self._cpu = _CpuSampler()
+        self._ncpu = os.cpu_count() or 1
+        self._cg_cpu_prev = {}      # cgroup name -> (usage_usec, monotonic)
+        self._net_prev = {}         # iface -> (counters, monotonic)
+        self._last_mono = time.monotonic()
+
+        # topic monitoring state (single-threaded executor => no lock needed)
+        self._monitor_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10)
+        self._subscribed = set()
+        all_topics = set(self._load_topics) | set(self._latency_topics)
+        self._counts = {t: 0 for t in all_topics}
+        self._bytes = {t: 0 for t in self._load_topics}
+        self._age_max = {}
+        self._age_last = {}
+
+        self.pub = self.create_publisher(
+            DiagnosticArray, f'/{self.prefix}/diagnostics/system', 10)
+
+        self._discover()
+        self.create_timer(5.0, self._discover)
+        self.create_timer(1.0 / max(rate, 0.1), self._publish)
+
+        self.get_logger().info(
+            f'system_metrics ready: prefix={self.prefix}, rate={rate}Hz, '
+            f'ping_targets={[n for n, _ in targets]}, '
+            f'load_topics={len(self._load_topics)}, '
+            f'latency_topics={len(self._latency_topics)}')
+
+    # -- topic discovery / subscription ------------------------------------
+    def _discover(self):
+        names_types = dict(self.get_topic_names_and_types())
+        for topic in self._load_topics:
+            if topic not in self._subscribed:
+                self._try_subscribe(topic, names_types.get(topic), raw=True)
+        for topic in self._latency_topics:
+            if topic not in self._subscribed:
+                self._try_subscribe(topic, names_types.get(topic), raw=False)
+
+    def _try_subscribe(self, topic, types, raw):
+        if not types:
+            return
+        try:
+            msg_cls = get_message(types[0])
+        except (ImportError, ValueError, AttributeError) as e:
+            self.get_logger().warn(f'cannot load type {types[0]} for {topic}: {e}')
+            return
+        cb = (self._make_load_cb(topic) if raw
+              else self._make_latency_cb(topic))
+        self.create_subscription(msg_cls, topic, cb, self._monitor_qos, raw=raw)
+        self._subscribed.add(topic)
+        self.get_logger().info(
+            f'monitoring {"load" if raw else "latency"} topic '
+            f'{topic} ({types[0]})')
+
+    def _make_load_cb(self, topic):
+        def cb(msg):
+            # raw=True => msg is the serialised bytes; len() is the wire size,
+            # no deserialisation cost even for MB-scale point clouds.
+            self._counts[topic] += 1
+            self._bytes[topic] += len(msg)
+        return cb
+
+    def _make_latency_cb(self, topic):
+        def cb(msg):
+            self._counts[topic] += 1
+            hdr = getattr(msg, 'header', None)
+            stamp = getattr(hdr, 'stamp', None)
+            if stamp is None or (stamp.sec == 0 and stamp.nanosec == 0):
+                return
+            age = (self.get_clock().now() - Time.from_msg(stamp)).nanoseconds / 1e9
+            self._age_last[topic] = age
+            self._age_max[topic] = max(self._age_max.get(topic, 0.0), age)
+        return cb
+
+    # -- publish -----------------------------------------------------------
+    def _publish(self):
+        now_mono = time.monotonic()
+        dt = max(now_mono - self._last_mono, 1e-3)
+        self._last_mono = now_mono
+
+        statuses = []
+
+        def add(name, values, level=OK, message='OK'):
+            s = DiagnosticStatus()
+            s.name = name
+            s.hardware_id = self.prefix
+            s.level = level
+            s.message = message
+            s.values = _kv(values)
+            statuses.append(s)
+
+        # --- system CPU ---
+        busy = self._cpu.sample()
+        la = (_read_text('/proc/loadavg') or '').split()
+        add('system/cpu', {
+            'busy_frac': _fmt(busy),
+            'loadavg_1': la[0] if la else 'n/a',
+            'loadavg_5': la[1] if len(la) > 1 else 'n/a',
+            'loadavg_15': la[2] if len(la) > 2 else 'n/a',
+            'ncpu': self._ncpu,
+        })
+
+        # --- system PSI (the headline "pressure" signal) ---
+        for res in ('cpu', 'memory', 'io'):
+            psi = _parse_psi(_read_text(f'/proc/pressure/{res}'))
+            if not psi:
+                continue
+            level, message = OK, 'OK'
+            try:
+                if float(psi.get('some_avg10', 0)) >= self._psi_warn:
+                    level, message = WARN, f'{res} stall avg10 high'
+            except ValueError:
+                pass
+            add(f'system/pressure/{res}', psi, level, message)
+
+        # --- system memory ---
+        mi = _parse_meminfo()
+        if mi:
+            total = mi.get('MemTotal', 0)
+            avail = mi.get('MemAvailable', 0)
+            used_frac = (total - avail) / total if total else 0.0
+            level, message = OK, 'OK'
+            if used_frac >= self._mem_error:
+                level, message = ERROR, 'memory critical'
+            elif used_frac >= self._mem_warn:
+                level, message = WARN, 'memory high'
+            add('system/memory', {
+                'total_mb': total // 1024,
+                'available_mb': avail // 1024,
+                'used_frac': _fmt(used_frac),
+                'swap_used_mb': (mi.get('SwapTotal', 0)
+                                 - mi.get('SwapFree', 0)) // 1024,
+            }, level, message)
+
+        # --- per-cgroup CPU / memory / PSI ---
+        for cg in sorted(glob.glob(os.path.join(CGROUP_ROOT, self._cgroup_glob))):
+            name = os.path.basename(cg)
+            short = name[:-8] if name.endswith('.service') else name
+            values = {}
+
+            cpu_stat = _read_text(os.path.join(cg, 'cpu.stat'))
+            if cpu_stat:
+                for line in cpu_stat.splitlines():
+                    if line.startswith('usage_usec'):
+                        usage = int(line.split()[1])
+                        prev = self._cg_cpu_prev.get(name)
+                        self._cg_cpu_prev[name] = (usage, now_mono)
+                        if prev:
+                            cores = (usage - prev[0]) / 1e6 / max(
+                                now_mono - prev[1], 1e-3)
+                            values['cpu_cores'] = _fmt(cores)
+                        break
+
+            mem_cur = _read_text(os.path.join(cg, 'memory.current'))
+            if mem_cur and mem_cur.strip().isdigit():
+                values['mem_mb'] = int(mem_cur.strip()) // (1024 * 1024)
+
+            for res in ('cpu', 'memory', 'io'):
+                psi = _parse_psi(_read_text(os.path.join(cg, f'{res}.pressure')))
+                if 'some_avg10' in psi:
+                    values[f'{res}_psi_avg10'] = psi['some_avg10']
+                    values[f'{res}_psi_avg60'] = psi.get('some_avg60', '')
+
+            if values:
+                add(f'cgroup/{short}', values)
+
+        # --- network, per interface ---
+        netdev = _read_net_dev()
+        wireless = _read_wireless()
+        for iface, cur in sorted(netdev.items()):
+            if iface == 'lo' or (self._ifaces and iface not in self._ifaces):
+                continue
+            values = {'oper': (_read_text(f'/sys/class/net/{iface}/operstate')
+                               or '?').strip()}
+            prev = self._net_prev.get(iface)
+            self._net_prev[iface] = (cur, now_mono)
+            if prev:
+                p, pt = prev
+                pdt = max(now_mono - pt, 1e-3)
+                values['rx_kbps'] = _fmt((cur['rx_bytes'] - p['rx_bytes'])
+                                         * 8 / 1e3 / pdt)
+                values['tx_kbps'] = _fmt((cur['tx_bytes'] - p['tx_bytes'])
+                                         * 8 / 1e3 / pdt)
+                values['rx_drop_ps'] = _fmt((cur['rx_drop'] - p['rx_drop']) / pdt)
+                values['tx_drop_ps'] = _fmt((cur['tx_drop'] - p['tx_drop']) / pdt)
+                values['rx_err_ps'] = _fmt((cur['rx_errs'] - p['rx_errs']) / pdt)
+                values['tx_err_ps'] = _fmt((cur['tx_errs'] - p['tx_errs']) / pdt)
+            if iface in wireless:
+                values['wifi_link'] = wireless[iface]['link']
+                values['wifi_level_dbm'] = wireless[iface]['level_dbm']
+            level = WARN if values['oper'] not in ('up', 'unknown') else OK
+            add(f'net/{iface}', values, level,
+                'OK' if level == OK else f'link {values["oper"]}')
+
+        # --- network latency (ping) ---
+        for name, res in sorted(self._ping.snapshot().items()):
+            level, message = OK, 'OK'
+            if res['loss'] >= 100.0:
+                level, message = ERROR, 'unreachable'
+            add(f'latency/ping/{name}', {
+                'host': res['host'],
+                'rtt_ms': _fmt(res['rtt_ms']),
+                'loss_pct': _fmt(res['loss'], 1),
+            }, level, message)
+
+        # --- topic load (Hz + bandwidth) ---
+        for topic in self._load_topics:
+            cnt = self._counts.get(topic, 0)
+            byt = self._bytes.get(topic, 0)
+            self._counts[topic] = 0
+            self._bytes[topic] = 0
+            add(f'topic/load{topic}', {
+                'subscribed': str(topic in self._subscribed),
+                'hz': _fmt(cnt / dt),
+                'kbps': _fmt(byt * 8 / 1e3 / dt),
+                'msgs': cnt,
+            })
+
+        # --- topic latency (Hz + message age) ---
+        for topic in self._latency_topics:
+            cnt = self._counts.get(topic, 0)
+            self._counts[topic] = 0
+            age_max = self._age_max.pop(topic, None)
+            add(f'topic/latency{topic}', {
+                'subscribed': str(topic in self._subscribed),
+                'hz': _fmt(cnt / dt),
+                'age_max_ms': _fmt(age_max * 1e3) if age_max is not None
+                else 'n/a',
+                'age_last_ms': (_fmt(self._age_last[topic] * 1e3)
+                                if topic in self._age_last else 'n/a'),
+            })
+
+        arr = DiagnosticArray()
+        arr.header.stamp = self.get_clock().now().to_msg()
+        arr.status = statuses
+        self.pub.publish(arr)
+
+    def destroy_node(self):
+        self._ping.stop()
+        super().destroy_node()
+
+
+def main():
+    rclpy.init()
+    node = SystemMetrics()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

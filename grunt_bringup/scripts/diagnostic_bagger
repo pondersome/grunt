@@ -105,6 +105,14 @@ TOPIC_TEMPLATES = [
     '/{prefix}/l2/points',
     '/{prefix}/l2/imu',
 
+    # System resource + network pressure telemetry (system_metrics node).
+    # DiagnosticArray at ~1 Hz: PSI, per-cgroup CPU/mem, per-iface network
+    # throughput + wifi link, ping RTT, topic load/latency. Lets a
+    # post-mortem overlay a CPU stall or wifi drop against a controller
+    # stutter — the costmap RELIABLE-backpressure regression would have
+    # been obvious in this stream.
+    '/{prefix}/diagnostics/system',
+
     # Mission state
     '/{prefix}/mission_overlay/selected_mission',
 
