@@ -87,6 +87,24 @@ TOPIC_TEMPLATES = [
     # of "did the BT actually try to recover?" impossible.
     '/{prefix}/cmd_vel_recovery',
 
+    # Chassis / ARCOS controller state (p2os_driver). Added 2026-05-20
+    # for ARCOS motor-stage fault forensics (see
+    # memory/project_arcos_motor_stage_fault.md): the descending-beep
+    # stall events show up here as motors.state dropping to 0 and as
+    # raw wheel velocity (pose.twist) going to ~0 while cmd_vel is
+    # nonzero. battery_state lets the low-voltage hypothesis be ruled
+    # in or out at the event timestamps.
+    #   - pose: p2os wheel odometry (raw, pre-EKF) — Odometry
+    #   - motor_state: ARCOS motor-enable bit (hardware, from the SIP)
+    #   - motor_stall: SIP per-wheel stall flags — the firmware's own
+    #     commanded-vs-actual discrepancy fault flag (motor stall /
+    #     H-bridge cutout). The most direct signal for the ARCOS fault.
+    #   - battery_state: pack voltage
+    '/{prefix}/pose',
+    '/{prefix}/motor_state',
+    '/{prefix}/motor_stall',
+    '/{prefix}/battery_state',
+
     # Recovery + safety state
     '/{prefix}/bt_runner/active_behavior',
     '/{prefix}/bt_runner/armed',
