@@ -506,6 +506,12 @@ def generate_launch_description():
                 name='system_metrics',
                 parameters=[{
                     'prefix': LaunchConfiguration('prefix'),
+                    # hal.robodojo.net is the primary operator station.
+                    # Pinging it forces the VPN path, so off-network
+                    # missions surface VPN latency / reachability rather
+                    # than just the local gateway (which the node still
+                    # auto-adds via ping_gateway).
+                    'ping_targets': ['operator=hal.robodojo.net'],
                 }],
                 output='screen',
             ),

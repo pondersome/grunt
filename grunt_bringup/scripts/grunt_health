@@ -399,6 +399,128 @@ def check_wifi() -> int:
     return 1
 
 
+def _diag_level(s) -> int:
+    """DiagnosticStatus.level is an octet — rclpy delivers it as a
+    length-1 bytes object. Normalize to a plain int (0=OK 1=WARN
+    2=ERROR 3=STALE)."""
+    lv = s.level
+    if isinstance(lv, (bytes, bytearray)):
+        return lv[0] if lv else 0
+    return int(lv)
+
+
+def check_system_metrics(prefix: str, c: TopicCollector) -> int:
+    """Summarize the system_metrics resource/network telemetry stream.
+
+    system_metrics already levels every DiagnosticStatus (the PSI,
+    memory, and packet-loss thresholds live in that node's params).
+    This check just surfaces the headline numbers and rolls up whatever
+    it flagged. Runs early so resource pressure is visible before the
+    localization / Nav2 sections — a CPU-starved stack frequently
+    explains a Nav2 'didn't respond' further down."""
+    section("System resources (system_metrics)")
+    msg = c.last_msg(f"/{prefix}/diagnostics/system")
+    if msg is None:
+        status("warn",
+               "/diagnostics/system silent — system_metrics node down "
+               "(launch arg SystemMetrics) or still discovering")
+        return 1
+
+    by_name = {s.name: s for s in msg.status}
+    tag = {0: "pass", 1: "warn", 2: "fail", 3: "warn"}
+
+    def fields(name: str):
+        s = by_name.get(name)
+        return {kv.key: kv.value for kv in s.values} if s else None
+
+    issues = 0
+
+    # CPU — PSI stall is the headline pressure signal
+    cpu, psi = fields("system/cpu"), fields("system/pressure/cpu")
+    if cpu and psi:
+        lvl = _diag_level(by_name["system/pressure/cpu"])
+        try:
+            busy = float(cpu.get("busy_frac", 0)) * 100
+        except ValueError:
+            busy = 0.0
+        line = (f"CPU: busy {busy:.0f}%, load {cpu.get('loadavg_1', '?')}, "
+                f"PSI stall avg10 {psi.get('some_avg10', '?')}%")
+        if lvl >= 1:
+            line += " — sustained stall, control loops may sag"
+        status(tag.get(lvl, "warn"), line)
+        issues += min(lvl, 2)
+
+    # Memory
+    mem = fields("system/memory")
+    if mem:
+        lvl = _diag_level(by_name["system/memory"])
+        try:
+            uf = float(mem.get("used_frac", 0)) * 100
+        except ValueError:
+            uf = 0.0
+        status(tag.get(lvl, "warn"),
+               f"Memory: {uf:.0f}% used, {mem.get('available_mb', '?')} MB "
+               f"free, swap {mem.get('swap_used_mb', '?')} MB")
+        issues += min(lvl, 2)
+
+    # Per-cgroup CPU / memory — informational
+    for name in sorted(by_name):
+        if not name.startswith("cgroup/"):
+            continue
+        f = fields(name)
+        status("pass",
+               f"{name.split('/', 1)[1]}: {f.get('cpu_cores', '?')} cores, "
+               f"{f.get('mem_mb', '?')} MB, "
+               f"CPU PSI avg10 {f.get('cpu_psi_avg10', '?')}%")
+
+    # Network — flagged interfaces, plus any carrying live traffic
+    for name in sorted(by_name):
+        if not name.startswith("net/"):
+            continue
+        s = by_name[name]
+        f = fields(name)
+        iface = name.split("/", 1)[1]
+        try:
+            rx, tx = float(f.get("rx_kbps", 0)), float(f.get("tx_kbps", 0))
+        except ValueError:
+            rx = tx = 0.0
+        wifi = ""
+        if "wifi_level_dbm" in f:
+            wifi = (f", wifi {f.get('wifi_level_dbm', '?')} dBm "
+                    f"link {f.get('wifi_link', '?')}")
+        if _diag_level(s) >= 1:
+            status("warn",
+                   f"{iface}: {s.message} — rx drop "
+                   f"{f.get('rx_drop_ps', '?')}/s tx drop "
+                   f"{f.get('tx_drop_ps', '?')}/s{wifi}")
+            issues += 1
+        elif rx > 1.0 or tx > 1.0:
+            status("pass", f"{iface}: rx {rx:.0f} / tx {tx:.0f} kbps{wifi}")
+
+    # Network latency (ping). system_metrics never levels a ping as
+    # ERROR — an unreachable target is WARN at most, or OK if it's an
+    # informational target (e.g. the gateway, whose reachability just
+    # signals home-network presence). Reflect whatever level it set.
+    for name in sorted(by_name):
+        if not name.startswith("latency/ping/"):
+            continue
+        s = by_name[name]
+        f = fields(name)
+        target = name.rsplit("/", 1)[1]
+        host = f.get("host", "?")
+        if _diag_level(s) >= 1:
+            status("warn", f"ping {target} ({host}): {s.message}")
+            issues += 1
+        elif s.message != "OK":
+            # reachable=False but informational (gateway while roaming)
+            status("pass", f"ping {target} ({host}): {s.message}")
+        else:
+            status("pass",
+                   f"ping {target} ({host}): {f.get('rtt_ms', '?')} ms")
+
+    return issues
+
+
 def check_bno055(prefix: str, c: TopicCollector) -> int:
     section("BNO055 IMU")
     if not process_alive("bno055/lib/bno055/bno055"):
@@ -826,6 +948,8 @@ def main(argv=None) -> int:
     # EKF output topics — feed check_localization.
     c.add(f"/{pfx}/odometry/local")
     c.add(f"/{pfx}/odometry/global")
+    # system_metrics resource/network telemetry — feed check_system_metrics.
+    c.add(f"/{pfx}/diagnostics/system")
     # Track TF tree edges so check_localization can verify the actual
     # broadcast edges (not just process liveness).
     c.add_tf()
@@ -836,6 +960,9 @@ def main(argv=None) -> int:
 
     total = 0
     total += check_wifi()
+    # Resource pressure first — a CPU-starved machine cascades into the
+    # localization / Nav2 sections below, so flag it up front.
+    total += check_system_metrics(args.prefix, c)
     total += check_bno055(args.prefix, c)
     total += check_p2os(args.prefix, c)
     total += check_sonar(args.prefix, c)

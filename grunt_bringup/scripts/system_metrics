@@ -279,6 +279,7 @@ class SystemMetrics(Node):
         self.declare_parameter('ping_targets', [''])     # 'name=host' or 'host'
         self.declare_parameter('ping_gateway', True)
         self.declare_parameter('ping_interval_sec', 10.0)
+        self.declare_parameter('ping_optional_targets', ['gateway'])
         self.declare_parameter('load_topics',
                                ['/{prefix}/l2/points',
                                 '/{prefix}/sonar/cloud'])
@@ -290,6 +291,7 @@ class SystemMetrics(Node):
         self.declare_parameter('psi_warn_avg10', 25.0)
         self.declare_parameter('mem_warn_frac', 0.85)
         self.declare_parameter('mem_error_frac', 0.95)
+        self.declare_parameter('net_drop_warn_ps', 20.0)
 
         self.prefix = self.get_parameter('prefix').value
         rate = float(self.get_parameter('publish_rate_hz').value)
@@ -298,6 +300,9 @@ class SystemMetrics(Node):
         self._psi_warn = float(self.get_parameter('psi_warn_avg10').value)
         self._mem_warn = float(self.get_parameter('mem_warn_frac').value)
         self._mem_error = float(self.get_parameter('mem_error_frac').value)
+        self._net_drop_warn = float(self.get_parameter('net_drop_warn_ps').value)
+        self._ping_optional = set(
+            self.get_parameter('ping_optional_targets').value)
 
         def _resolve(lst):
             return [t.format(prefix=self.prefix) for t in lst]
@@ -464,7 +469,13 @@ class SystemMetrics(Node):
             }, level, message)
 
         # --- per-cgroup CPU / memory / PSI ---
-        for cg in sorted(glob.glob(os.path.join(CGROUP_ROOT, self._cgroup_glob))):
+        # Recursive: systemd nests template instances under a per-template
+        # slice (e.g. grunt-nav@outdoor.service lives in
+        # system.slice/system-grunt\x2dnav.slice/), so a flat glob would
+        # miss the Nav2 cgroup.
+        for cg in sorted(glob.glob(
+                os.path.join(CGROUP_ROOT, '**', self._cgroup_glob),
+                recursive=True)):
             name = os.path.basename(cg)
             short = name[:-8] if name.endswith('.service') else name
             values = {}
@@ -496,6 +507,12 @@ class SystemMetrics(Node):
                 add(f'cgroup/{short}', values)
 
         # --- network, per interface ---
+        # Level is driven by packet loss / errors — the real
+        # network-pressure signal — NOT by link state. A permanently-down
+        # docker0 or an unused ethernet port is not a fault; flagging it
+        # would just create standing WARN noise. `oper` is reported as a
+        # value; judging whether a *specific* link should be up belongs to
+        # the consumer (grunt_health knows the operational interface).
         netdev = _read_net_dev()
         wireless = _read_wireless()
         for iface, cur in sorted(netdev.items()):
@@ -503,31 +520,44 @@ class SystemMetrics(Node):
                 continue
             values = {'oper': (_read_text(f'/sys/class/net/{iface}/operstate')
                                or '?').strip()}
+            level, message = OK, 'OK'
             prev = self._net_prev.get(iface)
             self._net_prev[iface] = (cur, now_mono)
             if prev:
                 p, pt = prev
                 pdt = max(now_mono - pt, 1e-3)
+                rx_drop = (cur['rx_drop'] - p['rx_drop']) / pdt
+                tx_drop = (cur['tx_drop'] - p['tx_drop']) / pdt
+                rx_err = (cur['rx_errs'] - p['rx_errs']) / pdt
+                tx_err = (cur['tx_errs'] - p['tx_errs']) / pdt
                 values['rx_kbps'] = _fmt((cur['rx_bytes'] - p['rx_bytes'])
                                          * 8 / 1e3 / pdt)
                 values['tx_kbps'] = _fmt((cur['tx_bytes'] - p['tx_bytes'])
                                          * 8 / 1e3 / pdt)
-                values['rx_drop_ps'] = _fmt((cur['rx_drop'] - p['rx_drop']) / pdt)
-                values['tx_drop_ps'] = _fmt((cur['tx_drop'] - p['tx_drop']) / pdt)
-                values['rx_err_ps'] = _fmt((cur['rx_errs'] - p['rx_errs']) / pdt)
-                values['tx_err_ps'] = _fmt((cur['tx_errs'] - p['tx_errs']) / pdt)
+                values['rx_drop_ps'] = _fmt(rx_drop)
+                values['tx_drop_ps'] = _fmt(tx_drop)
+                values['rx_err_ps'] = _fmt(rx_err)
+                values['tx_err_ps'] = _fmt(tx_err)
+                if max(rx_drop, tx_drop, rx_err, tx_err) >= self._net_drop_warn:
+                    level, message = WARN, 'packet loss / errors'
             if iface in wireless:
                 values['wifi_link'] = wireless[iface]['link']
                 values['wifi_level_dbm'] = wireless[iface]['level_dbm']
-            level = WARN if values['oper'] not in ('up', 'unknown') else OK
-            add(f'net/{iface}', values, level,
-                'OK' if level == OK else f'link {values["oper"]}')
+            add(f'net/{iface}', values, level, message)
 
         # --- network latency (ping) ---
+        # An unreachable target is never ERROR — a ping going dark means
+        # a network boundary, not a robot fault. Targets in
+        # ping_optional_targets (the gateway by default) stay OK when
+        # unreachable: the gateway is a home-network presence hint, so
+        # "gateway down" simply means roaming. Other targets WARN.
         for name, res in sorted(self._ping.snapshot().items()):
-            level, message = OK, 'OK'
-            if res['loss'] >= 100.0:
-                level, message = ERROR, 'unreachable'
+            if res['loss'] < 100.0:
+                level, message = OK, 'OK'
+            elif name in self._ping_optional:
+                level, message = OK, 'unreachable (informational)'
+            else:
+                level, message = WARN, 'unreachable'
             add(f'latency/ping/{name}', {
                 'host': res['host'],
                 'rtt_ms': _fmt(res['rtt_ms']),
@@ -578,8 +608,18 @@ def main():
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
+    except Exception:
+        # Under `ros2 launch` shutdown the context can invalidate mid-spin;
+        # rclpy may surface that as a low-level RCLError rather than
+        # ExternalShutdownException. If the context is already gone it's a
+        # shutdown race, not a real fault — only re-raise if still valid.
+        if rclpy.ok():
+            raise
     finally:
-        node.destroy_node()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
         if rclpy.ok():
             rclpy.shutdown()
 
