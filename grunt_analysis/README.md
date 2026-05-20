@@ -60,6 +60,7 @@ questions when the report points at one.
 | Check whether the planner is curving plans off the segment line | `python -m grunt_analysis.planner_audit` | `planner_audit.md`, `planner_only.svg` |
 | Find what triggered a foliage-stuck event (vs cluster recounting) | `python -m grunt_analysis.onsets` | `onset_audit.md`, `planner_with_marks.svg` |
 | See the actual recorded costmap at a moment (best evidence) | `python -m grunt_analysis.costmap_render` | `actual_costmap_<tag>_<label>.png` per event |
+| Audit ARCOS chassis stalls (cmd-vs-chassis dropouts, firmware stall flag, battery) | `python -m grunt_analysis.arcos` | `arcos_audit.md` |
 
 ### Most useful for routine post-mission
 
@@ -116,6 +117,9 @@ PYTHONPATH=. python3 -m grunt_analysis.onsets <bag> --mission-yaml <m>
 PYTHONPATH=. python3 -m grunt_analysis.planner_audit <bag> --mission-yaml <m>
 PYTHONPATH=. python3 -m grunt_analysis.costmap_render <bag> --mission-yaml <m>
 
+# ARCOS chassis stall audit — no mission YAML needed (pure chassis telemetry)
+PYTHONPATH=. python3 -m grunt_analysis.arcos <bag>
+
 # Render costmaps at specific times (in addition to fresh onsets)
 PYTHONPATH=. python3 -m grunt_analysis.costmap_render <bag> \
     --mission-yaml <m> --at 120 --at 254 --at 329
@@ -130,6 +134,7 @@ Output (default — written next to the bag, or to `--out <dir>`):
 | `planner_audit` | `planner_audit.md`, `planner_only.svg` |
 | `onsets` | `onset_audit.md`, `planner_with_marks.svg` |
 | `costmap_render` | `actual_costmap_<tag>_<label>.png` × N |
+| `arcos` | `arcos_audit.md` |
 
 Override output dir with `--out /some/dir`. Pass `--site-yaml` to point
 at a different site (defaults to
@@ -204,6 +209,10 @@ Each of these adds new metric functions; the runner composes them.
 ## Status
 
 - 2026-05-01: initial extract from chat-session sleuthing scripts.
+- 2026-05-20: `arcos` module promoted from /tmp — ARCOS chassis stall
+  audit (cmd-vs-chassis dropout episodes, firmware `motor_stall` flag
+  correlation, battery + motor-state summary). `bag.py` gained
+  `motor_stall` / `motor_state` / `battery_state` decoders.
 - 2026-05-02: deep-dive modules promoted from /tmp:
   - `segdev` — per-segment deviation + planner overlay + carrot vectors
   - `planner_audit` — plan-vs-segment deviation + EKF jump detection

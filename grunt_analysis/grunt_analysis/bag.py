@@ -44,6 +44,9 @@ TOPIC_SCHEMA = {
     "/grunt1/nav/collision_monitor_state": "(t, action_type)",
     "/grunt1/localization/status": "(t, status_dict)",
     "/grunt1/pose":              "(t, vx, vyaw)",  # p2os wheel odometry twist
+    "/grunt1/motor_stall":       "(t, left, right)",   # SIP per-wheel stall bits
+    "/grunt1/motor_state":       "(t, state)",         # ARCOS motor-enable bit
+    "/grunt1/battery_state":     "(t, voltage)",       # pack voltage
     # RPP observables — added 2026-05-01 once the bagger started
     # capturing /nav/-namespaced topics correctly.
     "/grunt1/nav/lookahead_point":          "(t, x, y)",   # the carrot
@@ -91,6 +94,12 @@ def _decode_message(topic: str, msg, t: float) -> Optional[tuple]:
         if topic == "/grunt1/pose":
             return (t, msg.twist.twist.linear.x, msg.twist.twist.angular.z)
         return (t, msg.linear.x, msg.angular.z)
+    if topic == "/grunt1/motor_stall":
+        return (t, bool(msg.left), bool(msg.right))
+    if topic == "/grunt1/motor_state":
+        return (t, int(msg.state))
+    if topic == "/grunt1/battery_state":
+        return (t, float(msg.voltage))
     if topic == "/grunt1/sonar/cloud":
         return (t, int(msg.width))
     if topic == "/grunt1/nav/collision_monitor_state":
