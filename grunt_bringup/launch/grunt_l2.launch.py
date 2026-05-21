@@ -103,9 +103,18 @@ def generate_launch_description() -> LaunchDescription:
                     "input_topic": "points",
                     "output_topic": "points_filtered",
                     "base_frame": [prefix, "/base_link"],
-                    "cuboid_x_min": -0.40, "cuboid_x_max": 1.10,
-                    "cuboid_y_min": -0.45, "cuboid_y_max": 0.45,
-                    "cuboid_z_min":  0.00, "cuboid_z_max": 1.50,
+                    # Calibrated 2026-05-21 from l2_parked_ground by
+                    # grunt_analysis.self_filter_cal (fit to actual
+                    # self-returns + 10 cm margin). Replaces the loose
+                    # hand-set box whose 1.10 m forward reach blanked
+                    # real obstacles until ~1 m ahead. z_max is the
+                    # ten-hut arm envelope; mast/antenna returns above
+                    # the costmap's max_obstacle_height (1.5 m) need no
+                    # masking. Re-run the tool if the robot's shape
+                    # changes (arm pose, collision damage, sensors).
+                    "cuboid_x_min": -0.13, "cuboid_x_max": 0.80,
+                    "cuboid_y_min": -0.48, "cuboid_y_max": 0.37,
+                    "cuboid_z_min":  0.17, "cuboid_z_max": 1.08,
                 }],
                 respawn=True,
                 respawn_delay=3.0,
