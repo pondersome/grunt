@@ -110,5 +110,22 @@ def generate_launch_description() -> LaunchDescription:
                 respawn=True,
                 respawn_delay=3.0,
             ),
+
+            # Ground-plane removal: drops drivable-ground points so the
+            # Nav2 voxel_layer marks only real obstacles, not sloped
+            # ground. Consumes points_filtered, emits points_obstacles.
+            Node(
+                package="grunt_bringup",
+                executable="l2_ground_filter",
+                name="l2_ground_filter",
+                output="screen",
+                parameters=[{
+                    "input_topic": "points_filtered",
+                    "output_topic": "points_obstacles",
+                    "base_frame": [prefix, "/base_link"],
+                }],
+                respawn=True,
+                respawn_delay=3.0,
+            ),
         ]),
     ])

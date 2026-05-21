@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""L2 ground-plane removal filter.
+
+Removes drivable-ground points from the L2 cloud so the Nav2 voxel_layer
+marks only real obstacles — not sloped ground. A fixed
+`min_obstacle_height` band marks real sloped ground as a false obstacle
+wall on non-flat terrain, and grunt's site has no flat ground; this
+filter solves that, slope- and mount-error-independently.
+
+Per cloud: transform to base_link, estimate a coarse smooth ground
+surface (per-cell low percentile on a ~1 m grid, hole-filled and lightly
+smoothed), compute each point's height above that surface via bilinear
+interpolation, and drop points close to the ground — keep the raised
+ones. Republishes the obstacle cloud unchanged in the original sensor
+frame, all point fields preserved (raw-byte row mask).
+
+The algorithm was validated offline by `grunt_analysis.traversability`
+(the L2 ground/traversability feasibility study — verdict GO). That
+study used dense aggregated clouds; this runs per-cloud (sparser), so
+the grid is coarser. Per-cloud-under-motion behaviour is not yet
+field-validated (chassis down) — bench-verify parked, field-verify when
+the chassis is restored.
+
+Subscribes : <input_topic>   PointCloud2  BEST_EFFORT
+Publishes  : <output_topic>  PointCloud2  BEST_EFFORT
+"""
+import numpy as np
+from scipy.ndimage import distance_transform_edt, median_filter
+
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+
+from sensor_msgs.msg import PointCloud2
+from tf2_ros import Buffer, TransformListener, TransformException
+
+# coarse ground grid (base_link frame) — generous window covering the
+# costmap's obstacle range; points outside it are dropped (out of range).
+WIN_X = (-2.0, 13.0)
+WIN_Y = (-8.0, 8.0)
+GROUND_PCTILE = 20        # per-cell ground = this percentile of z
+MEDIAN_SIZE = 3           # ground-grid smoothing (cells); edge-preserving
+
+
+def _transform_matrix(t) -> np.ndarray:
+    """geometry_msgs/TransformStamped -> 4x4 homogeneous transform."""
+    q = t.transform.rotation
+    tr = t.transform.translation
+    x, y, z, w = q.x, q.y, q.z, q.w
+    n = x * x + y * y + z * z + w * w
+    s = 0.0 if n == 0.0 else 2.0 / n
+    M = np.identity(4)
+    M[0, 0] = 1 - s * (y * y + z * z)
+    M[0, 1] = s * (x * y - z * w)
+    M[0, 2] = s * (x * z + y * w)
+    M[1, 0] = s * (x * y + z * w)
+    M[1, 1] = 1 - s * (x * x + z * z)
+    M[1, 2] = s * (y * z - x * w)
+    M[2, 0] = s * (x * z - y * w)
+    M[2, 1] = s * (y * z + x * w)
+    M[2, 2] = 1 - s * (x * x + y * y)
+    M[0, 3], M[1, 3], M[2, 3] = tr.x, tr.y, tr.z
+    return M
+
+
+class L2GroundFilter(Node):
+    def __init__(self):
+        super().__init__('l2_ground_filter')
+
+        self.declare_parameter('input_topic', 'points_filtered')
+        self.declare_parameter('output_topic', 'points_obstacles')
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('ground_cell', 1.0)        # m, ground grid
+        self.declare_parameter('min_cell_pts', 8)
+        # keep points >= this height above the ground surface. The L2
+        # grazing-angle ground-noise floor is ~100 mm (traversability
+        # study), so 0.15 m sits above ground noise — flags substantial
+        # obstacles, not thin sticks.
+        self.declare_parameter('haag_keep', 0.15)
+
+        self.base_frame = self.get_parameter('base_frame').value
+        self.gcell = float(self.get_parameter('ground_cell').value)
+        self.min_cell_pts = int(self.get_parameter('min_cell_pts').value)
+        self.haag_keep = float(self.get_parameter('haag_keep').value)
+        self.nx = int(np.ceil((WIN_X[1] - WIN_X[0]) / self.gcell))
+        self.ny = int(np.ceil((WIN_Y[1] - WIN_Y[0]) / self.gcell))
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.T = None
+        self._in = 0
+        self._out = 0
+
+        self.pub = self.create_publisher(
+            PointCloud2, self.get_parameter('output_topic').value,
+            qos_profile_sensor_data)
+        self.create_subscription(
+            PointCloud2, self.get_parameter('input_topic').value,
+            self._on_cloud, qos_profile_sensor_data)
+        self.create_timer(10.0, self._log_stats)
+
+        self.get_logger().info(
+            f'l2_ground_filter ready: base_frame={self.base_frame}, '
+            f'ground grid {self.nx}x{self.ny} @ {self.gcell} m, '
+            f'haag_keep={self.haag_keep} m')
+
+    def _ensure_transform(self, sensor_frame: str) -> bool:
+        if self.T is not None:
+            return True
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.base_frame, sensor_frame, rclpy.time.Time())
+        except TransformException as e:
+            self.get_logger().warn(
+                f'waiting for TF {self.base_frame} <- {sensor_frame}: {e}',
+                throttle_duration_sec=5.0)
+            return False
+        self.T = _transform_matrix(tf)
+        self.get_logger().info(
+            f'cached static transform {self.base_frame} <- {sensor_frame}')
+        return True
+
+    def _ground_surface(self, xb: np.ndarray):
+        """Coarse smoothed ground surface from base_link points.
+
+        Returns the (nx, ny) surface grid, or None if too sparse.
+        """
+        fx = (xb[:, 0] - WIN_X[0]) / self.gcell
+        fy = (xb[:, 1] - WIN_Y[0]) / self.gcell
+        inwin = (fx >= 0) & (fx < self.nx) & (fy >= 0) & (fy < self.ny)
+        if inwin.sum() < self.min_cell_pts:
+            return None
+        ix = fx[inwin].astype(np.int64)
+        iy = fy[inwin].astype(np.int64)
+        cid = ix * self.ny + iy
+        zs = xb[inwin, 2]
+        ground = np.full(self.nx * self.ny, np.nan)
+        order = np.lexsort((zs, cid))
+        cid_s, z_s = cid[order], zs[order]
+        uniq, start, cnt = np.unique(cid_s, return_index=True,
+                                     return_counts=True)
+        for u, s, c in zip(uniq, start, cnt):
+            if c >= self.min_cell_pts:
+                ground[u] = z_s[s + int(GROUND_PCTILE / 100.0 * c)]
+        ground = ground.reshape(self.nx, self.ny)
+        miss = ~np.isfinite(ground)
+        if miss.all():
+            return None
+        idx = distance_transform_edt(miss, return_distances=False,
+                                     return_indices=True)
+        return median_filter(ground[tuple(idx)], size=MEDIAN_SIZE,
+                             mode='nearest')
+
+    def _ground_z(self, xb: np.ndarray, surf: np.ndarray) -> np.ndarray:
+        """Bilinear-interpolated ground height at each point's (x,y)."""
+        cx = np.clip((xb[:, 0] - WIN_X[0]) / self.gcell - 0.5,
+                     0, self.nx - 1)
+        cy = np.clip((xb[:, 1] - WIN_Y[0]) / self.gcell - 0.5,
+                     0, self.ny - 1)
+        x0 = np.clip(cx.astype(np.int64), 0, self.nx - 2)
+        y0 = np.clip(cy.astype(np.int64), 0, self.ny - 2)
+        tx, ty = cx - x0, cy - y0
+        return (surf[x0, y0] * (1 - tx) * (1 - ty)
+                + surf[x0 + 1, y0] * tx * (1 - ty)
+                + surf[x0, y0 + 1] * (1 - tx) * ty
+                + surf[x0 + 1, y0 + 1] * tx * ty)
+
+    def _on_cloud(self, msg: PointCloud2) -> None:
+        if not self._ensure_transform(msg.header.frame_id):
+            return
+        offs = {f.name: f.offset for f in msg.fields}
+        if not all(k in offs for k in ('x', 'y', 'z')):
+            self.get_logger().error('cloud missing x/y/z fields',
+                                     throttle_duration_sec=10.0)
+            return
+        n = msg.width * msg.height
+        if n == 0:
+            self.pub.publish(msg)
+            return
+        raw = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            n, msg.point_step)
+
+        def f32(name):
+            col = raw[:, offs[name]:offs[name] + 4]
+            return col.copy().view(np.float32).reshape(n)
+
+        xyz = np.column_stack((f32('x'), f32('y'), f32('z'))).astype(
+            np.float64)
+        xb = xyz @ self.T[:3, :3].T + self.T[:3, 3]
+
+        surf = self._ground_surface(xb)
+        if surf is None:
+            return                         # too sparse — skip this cloud
+        in_win = ((xb[:, 0] >= WIN_X[0]) & (xb[:, 0] <= WIN_X[1])
+                  & (xb[:, 1] >= WIN_Y[0]) & (xb[:, 1] <= WIN_Y[1]))
+        haag = xb[:, 2] - self._ground_z(xb, surf)
+        keep = in_win & (haag >= self.haag_keep)
+
+        self._in += n
+        self._out += int(keep.sum())
+
+        out = PointCloud2()
+        out.header = msg.header
+        out.height = 1
+        out.width = int(keep.sum())
+        out.fields = msg.fields
+        out.is_bigendian = msg.is_bigendian
+        out.point_step = msg.point_step
+        out.row_step = msg.point_step * out.width
+        out.data = raw[keep].tobytes()
+        out.is_dense = msg.is_dense
+        self.pub.publish(out)
+
+    def _log_stats(self) -> None:
+        if self._in:
+            self.get_logger().info(
+                f'L2 ground filter: in {self._in} / kept {self._out} pts '
+                f'(dropped {self._in - self._out} as ground) over 10s')
+        self._in = 0
+        self._out = 0
+
+
+def main():
+    rclpy.init()
+    node = L2GroundFilter()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    except Exception:
+        if rclpy.ok():
+            raise
+    finally:
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

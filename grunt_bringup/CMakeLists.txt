@@ -32,6 +32,7 @@ install(PROGRAMS
   scripts/add_interstitials
   scripts/system_metrics
   scripts/l2_self_filter
+  scripts/l2_ground_filter
   DESTINATION lib/${PROJECT_NAME}
 )
 

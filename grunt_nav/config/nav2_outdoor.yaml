@@ -504,7 +504,9 @@ local_costmap:
         mark_threshold: 0
         observation_sources: "lidar_points"
         lidar_points:
-          topic: /grunt1/l2/points_filtered
+          # points_obstacles = self-filtered + ground-removed (l2_ground_filter).
+          # Ground-removed so sloped ground is not a false obstacle wall.
+          topic: /grunt1/l2/points_obstacles
           data_type: "PointCloud2"
           sensor_frame: grunt1/mast/l2
           marking: true
