@@ -123,6 +123,24 @@ TOPIC_TEMPLATES = [
     '/{prefix}/l2/points',
     '/{prefix}/l2/imu',
 
+    # --- TEMPORARY: custom L2 costmap-pipeline evaluation -------------
+    # These three audit the hand-rolled L2 ground-filter pipeline
+    # (l2_self_filter -> l2_ground_filter -> voxel_layer) under live
+    # mission conditions:
+    #   - points_obstacles: the filtered cloud the costmap actually
+    #     consumes (raw /l2/points above lets the filter be re-run
+    #     offline, but not audited live — per-cloud sparsity is a
+    #     runtime-only effect).
+    #   - voxel_layer / obstacle_layer: per-plugin costmap grids, so the
+    #     L2/voxel contribution can be separated from the sonar layer
+    #     (only the composed costmap is recorded above).
+    # REMOVE these three once GroundGrid is adopted and the hand-rolled
+    # filter is retired — see project_l2_traversability_study.md.
+    '/{prefix}/l2/points_obstacles',
+    '/{prefix}/nav/local_costmap/voxel_layer',
+    '/{prefix}/nav/local_costmap/obstacle_layer',
+    # -----------------------------------------------------------------
+
     # System resource + network pressure telemetry (system_metrics node).
     # DiagnosticArray at ~1 Hz: PSI, per-cgroup CPU/mem, per-iface network
     # throughput + wifi link, ping RTT, topic load/latency. Lets a
