@@ -40,10 +40,13 @@ ACT_STILL_VYAW = 0.08   # rad/s — actual "not rotating"
 MIN_EPISODE_S = 1.0     # ignore sub-second decel tails / cmd latency
 MATCH_WIN = 0.20        # s — nearest-sample match window
 
-TOPICS = ['/grunt1/cmd_vel', '/grunt1/odometry/local',
+TOPICS = ['/grunt1/cmd_vel', '/grunt1/wheel_cmd', '/grunt1/odometry/local',
           '/grunt1/nav/is_rotating_to_heading', '/grunt1/cmd_vel_joy',
           '/grunt1/motor_stall', '/grunt1/motor_state',
           '/grunt1/battery_state']
+
+TRACK_M = 0.40          # P3-AT wheel track — for cmd_vel-derived per-wheel
+WHEEL_MOVE = 0.03       # m/s — a wheel is "commanded to move" above this
 
 
 def _nearest(times, table, t):
@@ -104,6 +107,74 @@ def firmware_stall_episodes(stall):
     return eps
 
 
+def perwheel_audit(stall, wheelcmd, cmd):
+    """Per-wheel commanded-vs-measured velocity.
+
+    Measured = motor_stall left_vel/right_vel (encoder, controller-
+    independent). Commanded = wheel_cmd directly if present (the VEL2
+    tank-drive bench test), else derived from cmd_vel (v_l/r = vx -/+
+    w*track/2). Each motor_stall sample is paired with the nearest
+    command; the weak drive channel shows the lower tracking ratio.
+
+    Returns a dict (source, n, per-wheel + one-wheel-isolated stats) or
+    None when there is nothing to compare.
+    """
+    if not stall or stall[0][3] is None or stall[0][4] is None:
+        return None      # pre-2026-05-21 bag: no per-wheel velocity
+    if wheelcmd:
+        source = "wheel_cmd (VEL2 direct per-wheel)"
+        src, src_t = wheelcmd, [c[0] for c in wheelcmd]
+
+        def cmd_lr(row):
+            return (row[1], row[2])
+    elif cmd:
+        source = "cmd_vel derived (v_l/r = vx -/+ w*track/2)"
+        src, src_t = cmd, [c[0] for c in cmd]
+
+        def cmd_lr(row):
+            return (row[1] - row[2] * TRACK_M / 2,
+                    row[1] + row[2] * TRACK_M / 2)
+    else:
+        return None
+
+    pairs = []   # (cmd_l, cmd_r, meas_l, meas_r)
+    for s in stall:
+        c = _nearest(src_t, src, s[0])
+        if c is not None:
+            cl, cr = cmd_lr(c)
+            pairs.append((cl, cr, s[3], s[4]))
+    if not pairs:
+        return None
+
+    def wheel(ci, mi, sub=None):
+        pp = pairs if sub is None else [p for p in pairs if sub(p)]
+        mv = [p for p in pp if abs(p[ci]) > WHEEL_MOVE]
+        if not mv:
+            return None
+        sc = sum(p[ci] for p in mv)
+        return {'n': len(mv),
+                'mean_cmd': sc / len(mv),
+                'mean_meas': sum(p[mi] for p in mv) / len(mv),
+                'ratio': sum(p[mi] for p in mv) / sc
+                if abs(sc) > 1e-6 else float('nan')}
+
+    out = {'source': source, 'n': len(pairs),
+           'left': wheel(0, 2), 'right': wheel(1, 3)}
+    # one-wheel-isolated: only left commanded (cmd_r idle), and vice versa
+    il = wheel(0, 2, lambda p: abs(p[1]) < WHEEL_MOVE)
+    ir = wheel(1, 3, lambda p: abs(p[0]) < WHEEL_MOVE)
+    if il:
+        leak = [p[3] for p in pairs
+                if abs(p[0]) > WHEEL_MOVE and abs(p[1]) < WHEEL_MOVE]
+        il['idle_meas'] = sum(leak) / len(leak) if leak else 0.0
+    if ir:
+        leak = [p[2] for p in pairs
+                if abs(p[1]) > WHEEL_MOVE and abs(p[0]) < WHEEL_MOVE]
+        ir['idle_meas'] = sum(leak) / len(leak) if leak else 0.0
+    out['iso_left'], out['iso_right'] = il, ir
+    return out
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="ARCOS chassis stall audit")
     p.add_argument("bag_dir", help="bag directory or .mcap file")
@@ -126,14 +197,17 @@ def main(argv=None) -> int:
                  for (t, yaw, vx, vyaw, x, y) in d['/grunt1/odometry/local'])
     rot = sorted((t - t0, f)
                  for (t, f) in d['/grunt1/nav/is_rotating_to_heading'])
-    stall = sorted((t - t0, L, R) for (t, L, R) in d['/grunt1/motor_stall'])
+    stall = sorted((t - t0, L, R, lv, rv)
+                   for (t, L, R, lv, rv) in d['/grunt1/motor_stall'])
+    wheelcmd = sorted((t - t0, l, r) for (t, l, r) in d['/grunt1/wheel_cmd'])
     mstate = sorted((t - t0, s) for (t, s) in d['/grunt1/motor_state'])
     batt = sorted((t - t0, v) for (t, v) in d['/grunt1/battery_state'])
 
-    if not cmd:
-        print(f"no /cmd_vel in {label} — nothing to audit", file=sys.stderr)
+    if not cmd and not wheelcmd:
+        print(f"no /cmd_vel or /wheel_cmd in {label} — nothing to audit",
+              file=sys.stderr)
         return 1
-    dur = max(c[0] for c in cmd)
+    dur = max(seq[-1][0] for seq in (cmd, wheelcmd, stall) if seq)
     rot_t = [r[0] for r in rot]
     stall_t = [s[0] for s in stall]
     mstate_t = [m[0] for m in mstate]
@@ -203,6 +277,63 @@ def main(argv=None) -> int:
                 L.append(f"| {k} | {ts:.1f} | {ed:.1f} | {w} |")
     else:
         L.append("- no /motor_stall in bag (pre-2026-05-20 driver?)")
+    L.append("")
+
+    # per-wheel velocity audit (the bench test: commanded vs measured)
+    pw = perwheel_audit(stall, wheelcmd, cmd)
+    L.append("## Per-wheel velocity audit")
+    if pw is None:
+        L.append("- no per-wheel data — needs /motor_stall carrying "
+                 "left_vel/right_vel (driver >= 2026-05-21) plus a "
+                 "/wheel_cmd or /cmd_vel command stream")
+    else:
+        L.append(f"- command source: {pw['source']}")
+        L.append(f"- measured: motor_stall left_vel/right_vel (encoder, "
+                 f"controller-independent); {pw['n']} paired samples")
+        L.append("")
+        L.append("| wheel | n moving | mean cmd (m/s) | mean meas (m/s) "
+                 "| tracking |")
+        L.append("|---|---|---|---|---|")
+        for w in ('left', 'right'):
+            r = pw[w]
+            if r:
+                rt = (f"{100 * r['ratio']:.0f}%"
+                      if r['ratio'] == r['ratio'] else "n/a")
+                L.append(f"| {w} | {r['n']} | {r['mean_cmd']:+.3f} | "
+                         f"{r['mean_meas']:+.3f} | {rt} |")
+            else:
+                L.append(f"| {w} | 0 | — | — | — |")
+        lr, rr = pw['left'], pw['right']
+        if lr and rr and lr['ratio'] == lr['ratio'] \
+                and rr['ratio'] == rr['ratio']:
+            gap = abs(lr['ratio'] - rr['ratio'])
+            weak = 'left' if lr['ratio'] < rr['ratio'] else 'right'
+            lo, hi = sorted((lr['ratio'], rr['ratio']))
+            L.append("")
+            if gap > 0.10:
+                L.append(f"- **Asymmetry: the {weak} wheel tracks "
+                         f"{100 * lo:.0f}% of its command vs "
+                         f"{100 * hi:.0f}% on the other — the {weak} "
+                         f"drive channel (motor / encoder / H-bridge) is "
+                         f"the weak side.**")
+            else:
+                L.append(f"- Wheels track within {100 * gap:.0f}% of each "
+                         f"other — no per-wheel asymmetry in this bag.")
+        if pw['iso_left'] or pw['iso_right']:
+            L.append("")
+            L.append("### One-wheel-isolated segments (cleanest signal)")
+            L.append("")
+            L.append("| driven wheel | n | driven cmd | driven meas | "
+                     "tracking | idle-wheel meas |")
+            L.append("|---|---|---|---|---|---|")
+            for w in ('left', 'right'):
+                r = pw[f'iso_{w}']
+                if r:
+                    rt = (f"{100 * r['ratio']:.0f}%"
+                          if r['ratio'] == r['ratio'] else "n/a")
+                    L.append(f"| {w} | {r['n']} | {r['mean_cmd']:+.3f} | "
+                             f"{r['mean_meas']:+.3f} | {rt} | "
+                             f"{r.get('idle_meas', 0.0):+.3f} |")
     L.append("")
 
     # cmd-vs-chassis stall episodes

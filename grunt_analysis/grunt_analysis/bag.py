@@ -44,7 +44,8 @@ TOPIC_SCHEMA = {
     "/grunt1/nav/collision_monitor_state": "(t, action_type)",
     "/grunt1/localization/status": "(t, status_dict)",
     "/grunt1/pose":              "(t, vx, vyaw)",  # p2os wheel odometry twist
-    "/grunt1/motor_stall":       "(t, left, right)",   # SIP per-wheel stall bits
+    "/grunt1/motor_stall":       "(t, left, right, left_vel, right_vel)",
+    "/grunt1/wheel_cmd":         "(t, left, right)",   # VEL2 tank-drive cmd, m/s
     "/grunt1/motor_state":       "(t, state)",         # ARCOS motor-enable bit
     "/grunt1/battery_state":     "(t, voltage)",       # pack voltage
     # RPP observables — added 2026-05-01 once the bagger started
@@ -95,7 +96,18 @@ def _decode_message(topic: str, msg, t: float) -> Optional[tuple]:
             return (t, msg.twist.twist.linear.x, msg.twist.twist.angular.z)
         return (t, msg.linear.x, msg.angular.z)
     if topic == "/grunt1/motor_stall":
-        return (t, bool(msg.left), bool(msg.right))
+        # left/right stall bits + per-wheel measured velocity (m/s).
+        # left_vel/right_vel were added 2026-05-21 — bags from an older
+        # driver lack the fields; decode them as None so callers can
+        # tell "absent" from a genuine zero.
+        lv = getattr(msg, "left_vel", None)
+        rv = getattr(msg, "right_vel", None)
+        return (t, bool(msg.left), bool(msg.right),
+                None if lv is None else float(lv),
+                None if rv is None else float(rv))
+    if topic == "/grunt1/wheel_cmd":
+        # p2os_msgs/WheelCmd — commanded per-wheel velocity, m/s
+        return (t, float(msg.left), float(msg.right))
     if topic == "/grunt1/motor_state":
         return (t, int(msg.state))
     if topic == "/grunt1/battery_state":
