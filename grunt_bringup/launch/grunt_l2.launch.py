@@ -89,5 +89,26 @@ def generate_launch_description() -> LaunchDescription:
                 respawn=True,
                 respawn_delay=3.0,
             ),
+
+            # Self-return filter: drops points inside a static cuboid
+            # around the robot so the L2 cloud fed to the Nav2 costmap
+            # does not mark the chassis/mast/arm itself. Republishes
+            # points_filtered in the original mast/l2 frame.
+            Node(
+                package="grunt_bringup",
+                executable="l2_self_filter",
+                name="l2_self_filter",
+                output="screen",
+                parameters=[{
+                    "input_topic": "points",
+                    "output_topic": "points_filtered",
+                    "base_frame": [prefix, "/base_link"],
+                    "cuboid_x_min": -0.40, "cuboid_x_max": 1.10,
+                    "cuboid_y_min": -0.45, "cuboid_y_max": 0.45,
+                    "cuboid_z_min":  0.00, "cuboid_z_max": 1.50,
+                }],
+                respawn=True,
+                respawn_delay=3.0,
+            ),
         ]),
     ])

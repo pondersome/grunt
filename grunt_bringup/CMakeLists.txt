@@ -31,6 +31,7 @@ install(PROGRAMS
   scripts/grunt_health
   scripts/add_interstitials
   scripts/system_metrics
+  scripts/l2_self_filter
   DESTINATION lib/${PROJECT_NAME}
 )
 

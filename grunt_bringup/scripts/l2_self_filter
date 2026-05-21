@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""L2 LiDAR self-return filter.
+
+Drops PointCloud2 points that fall inside a static cuboid around the
+robot (chassis + mast + stowed arm), so the L2 cloud fed to the Nav2
+costmap does not mark the robot itself as an obstacle.
+
+The cuboid is defined in the robot base frame; the incoming cloud is in
+the L2 sensor frame. The static base<-sensor transform is looked up
+once via tf2 and cached — the URDF mount is fixed and the arm is stowed
+during navigation. Surviving points are republished UNCHANGED in the
+original sensor frame, so the costmap's `sensor_frame` config stays
+valid. All point fields (intensity, time, ring, ...) are preserved:
+filtering is a row-mask on the raw byte buffer, with no decode/re-encode.
+
+Subscribes : <input_topic>   PointCloud2  BEST_EFFORT
+Publishes  : <output_topic>  PointCloud2  BEST_EFFORT
+"""
+import numpy as np
+
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+
+from sensor_msgs.msg import PointCloud2
+from tf2_ros import Buffer, TransformListener, TransformException
+
+
+def _transform_matrix(t) -> np.ndarray:
+    """geometry_msgs/TransformStamped -> 4x4 homogeneous transform."""
+    q = t.transform.rotation
+    tr = t.transform.translation
+    x, y, z, w = q.x, q.y, q.z, q.w
+    n = x * x + y * y + z * z + w * w
+    s = 0.0 if n == 0.0 else 2.0 / n
+    M = np.identity(4)
+    M[0, 0] = 1 - s * (y * y + z * z)
+    M[0, 1] = s * (x * y - z * w)
+    M[0, 2] = s * (x * z + y * w)
+    M[1, 0] = s * (x * y + z * w)
+    M[1, 1] = 1 - s * (x * x + z * z)
+    M[1, 2] = s * (y * z - x * w)
+    M[2, 0] = s * (x * z - y * w)
+    M[2, 1] = s * (y * z + x * w)
+    M[2, 2] = 1 - s * (x * x + y * y)
+    M[0, 3], M[1, 3], M[2, 3] = tr.x, tr.y, tr.z
+    return M
+
+
+class L2SelfFilter(Node):
+    def __init__(self):
+        super().__init__('l2_self_filter')
+
+        self.declare_parameter('input_topic', 'points')
+        self.declare_parameter('output_topic', 'points_filtered')
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('cuboid_x_min', -0.40)
+        self.declare_parameter('cuboid_x_max', 1.10)
+        self.declare_parameter('cuboid_y_min', -0.45)
+        self.declare_parameter('cuboid_y_max', 0.45)
+        self.declare_parameter('cuboid_z_min', 0.00)
+        self.declare_parameter('cuboid_z_max', 1.50)
+
+        self.base_frame = self.get_parameter('base_frame').value
+        self.lo = np.array([self.get_parameter(f'cuboid_{a}_min').value
+                            for a in 'xyz'], dtype=np.float64)
+        self.hi = np.array([self.get_parameter(f'cuboid_{a}_max').value
+                            for a in 'xyz'], dtype=np.float64)
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.T = None                  # cached 4x4: base_frame <- sensor_frame
+        self._in = 0
+        self._out = 0
+
+        self.pub = self.create_publisher(
+            PointCloud2, self.get_parameter('output_topic').value,
+            qos_profile_sensor_data)
+        self.create_subscription(
+            PointCloud2, self.get_parameter('input_topic').value,
+            self._on_cloud, qos_profile_sensor_data)
+        self.create_timer(10.0, self._log_stats)
+
+        self.get_logger().info(
+            f'l2_self_filter ready: base_frame={self.base_frame}, '
+            f'cuboid lo={self.lo.tolist()} hi={self.hi.tolist()}')
+
+    def _ensure_transform(self, sensor_frame: str) -> bool:
+        """Look up and cache the static base<-sensor transform once."""
+        if self.T is not None:
+            return True
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.base_frame, sensor_frame, rclpy.time.Time())
+        except TransformException as e:
+            self.get_logger().warn(
+                f'waiting for TF {self.base_frame} <- {sensor_frame}: {e}',
+                throttle_duration_sec=5.0)
+            return False
+        self.T = _transform_matrix(tf)
+        self.get_logger().info(
+            f'cached static transform {self.base_frame} <- {sensor_frame}')
+        return True
+
+    def _on_cloud(self, msg: PointCloud2) -> None:
+        if not self._ensure_transform(msg.header.frame_id):
+            return
+        offs = {f.name: f.offset for f in msg.fields}
+        if not all(k in offs for k in ('x', 'y', 'z')):
+            self.get_logger().error('cloud missing x/y/z fields',
+                                     throttle_duration_sec=10.0)
+            return
+
+        n = msg.width * msg.height
+        if n == 0:
+            self.pub.publish(msg)
+            return
+
+        # row-major (n, point_step) view of the raw buffer — filtering is
+        # a row mask, so every field (intensity/time/ring) is preserved.
+        raw = np.frombuffer(msg.data, dtype=np.uint8).reshape(n,
+                                                              msg.point_step)
+
+        def f32(name):
+            col = raw[:, offs[name]:offs[name] + 4]
+            return col.copy().view(np.float32).reshape(n)
+
+        xyz = np.column_stack((f32('x'), f32('y'), f32('z'))).astype(np.float64)
+        xyz_base = xyz @ self.T[:3, :3].T + self.T[:3, 3]
+        inside = np.all((xyz_base >= self.lo) & (xyz_base <= self.hi), axis=1)
+        keep = ~inside
+
+        self._in += n
+        self._out += int(keep.sum())
+
+        out = PointCloud2()
+        out.header = msg.header                 # original sensor frame + stamp
+        out.height = 1
+        out.width = int(keep.sum())
+        out.fields = msg.fields
+        out.is_bigendian = msg.is_bigendian
+        out.point_step = msg.point_step
+        out.row_step = msg.point_step * out.width
+        out.data = raw[keep].tobytes()
+        out.is_dense = msg.is_dense
+        self.pub.publish(out)
+
+    def _log_stats(self) -> None:
+        if self._in:
+            self.get_logger().info(
+                f'L2 self-filter: in {self._in} / out {self._out} pts '
+                f'(dropped {self._in - self._out}) over 10s')
+        self._in = 0
+        self._out = 0
+
+
+def main():
+    rclpy.init()
+    node = L2SelfFilter()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    except Exception:
+        if rclpy.ok():
+            raise
+    finally:
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
