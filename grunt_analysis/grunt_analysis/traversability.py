@@ -20,7 +20,8 @@ Classification (operator spec, 2026-05-20):
     ~100 mm step -> obstacle; gradual blends -> drivable
 
 Sections: B1 cloud characterization, B2a global plane / mount-tilt
-indicator, B2b per-cell classification, B3 verdict + render.
+indicator, B2b per-cell classification, B2c threshold calibration,
+B2d ground noise vs range, B3 verdict + render.
 
 Run via:
     python -m grunt_analysis.traversability <bag_dir>
@@ -39,6 +40,10 @@ from .bag import discover_mcap
 
 DEFAULT_CLOUD_TOPIC = "/grunt1/l2/points"
 RANGE_BINS = [0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 1e9]
+# forward-x bins for the B2d range-stratified ground-noise profile.
+# Fine near the chassis (where the "obstacle pops in late" concern is),
+# coarser far out where cells are sparse.
+X_BINS = [0.3, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0]
 CUBOID_LO = np.array([-0.40, -0.45, 0.00])
 CUBOID_HI = np.array([1.10, 0.45, 1.50])
 MIN_OBSTACLE_HEIGHT = 0.10
@@ -198,6 +203,7 @@ def grid_classify(P: np.ndarray):
     # constant per cell), so the (cid, z) sort already orders it.
     haag90 = np.full(nx * ny, np.nan)
     haag98 = np.full(nx * ny, np.nan)
+    zstd = np.full(nx * ny, np.nan)
     surf_flat = surf.ravel()
     for u, s, c in zip(uniq, start, cnt):
         if c < MIN_CELL_PTS:
@@ -205,8 +211,10 @@ def grid_classify(P: np.ndarray):
         h = z_s[s:s + c] - surf_flat[u]            # sorted ascending
         haag90[u] = h[int(0.90 * (c - 1))]
         haag98[u] = h[int(0.98 * (c - 1))]
+        zstd[u] = h.std()                          # vertical scatter
     haag90 = haag90.reshape(nx, ny)
     haag98 = haag98.reshape(nx, ny)
+    zstd = zstd.reshape(nx, ny)
 
     # ground step: largest abrupt jump in the smooth surface to a
     # 4-neighbour cell — catches a real step (invisible to haag, since
@@ -230,7 +238,7 @@ def grid_classify(P: np.ndarray):
     cls[caution] = CAUTION
     cls[obstacle] = OBSTACLE
     return dict(nx=nx, ny=ny, ground=surf, npts=npts,
-                haag90=haag90, haag98=haag98, step=step, cls=cls)
+                haag90=haag90, haag98=haag98, zstd=zstd, step=step, cls=cls)
 
 
 def render_png(g: dict, path: Path, title: str) -> bool:
@@ -282,6 +290,36 @@ def _region_values(grid: np.ndarray, x_lo, x_hi, y_lo, y_hi) -> np.ndarray:
     sub = grid[np.ix_((xs >= x_lo) & (xs < x_hi),
                       (ys >= y_lo) & (ys < y_hi))].ravel()
     return sub[np.isfinite(sub)]
+
+
+def _range_profile(g: dict, x_bins, y_lo=-1.0, y_hi=1.0) -> list:
+    """Range-stratified ground-noise profile down the lane corridor.
+
+    For each forward-x band, over the operator-confirmed-drivable
+    corridor (|y| < ~1 m, so haag is pure ground-return noise — no real
+    obstacles), report: cell coverage (catches a near-field blind zone)
+    and the ground-noise distribution. The noise floor at range x IS
+    the minimum obstacle height reliably separable from ground there.
+    Returns one row per bin: (x_lo, x_hi, n_cells, n_covered, haag90,
+    zstd) with haag90/zstd the finite per-cell arrays in that band.
+    """
+    nx, ny = g["cls"].shape
+    xs = WIN_X[0] + (np.arange(nx) + 0.5) * CELL
+    ys = WIN_Y[0] + (np.arange(ny) + 0.5) * CELL
+    my = (ys >= y_lo) & (ys < y_hi)
+    rows = []
+    for x_lo, x_hi in zip(x_bins[:-1], x_bins[1:]):
+        mx = (xs >= x_lo) & (xs < x_hi)
+        if not mx.any():
+            continue
+        sel = np.ix_(mx, my)
+        npts = g["npts"][sel]
+        haag = g["haag90"][sel].ravel()
+        zstd = g["zstd"][sel].ravel()
+        rows.append((x_lo, x_hi, npts.size,
+                     int((npts >= MIN_CELL_PTS).sum()),
+                     haag[np.isfinite(haag)], zstd[np.isfinite(zstd)]))
+    return rows
 
 
 def main(argv=None) -> int:
@@ -470,6 +508,43 @@ def main(argv=None) -> int:
           f"right {_pct(rgt_h)}", file=sys.stderr)
     print(f"  calib step   mm p50/75/90/95 — corridor {_pct(cor_s)} | "
           f"right {_pct(rgt_s)}", file=sys.stderr)
+
+    # B2d — range-stratified ground-noise profile (precision vs range)
+    rp = _range_profile(g, X_BINS)
+    L += ["## B2d — ground noise vs range", "",
+          "Down the operator-confirmed-drivable corridor (|y| < 1 m), "
+          "per forward-x band: cell coverage, and the ground-return "
+          "noise (haag90 = per-cell 90th-pctile height above the "
+          "smoothed surface; z-std = per-cell vertical scatter). The "
+          "haag90 p95 is the **minimum obstacle height reliably "
+          "separable from ground** at that range — an obstacle shorter "
+          "than it stays buried in noise until the robot closes in.", "",
+          "| forward x | corridor cells | coverage | haag90 p50/p90/p95 "
+          "(mm) | z-std p50/p95 (mm) |",
+          "|---|---|---|---|---|"]
+
+    def _qs(v, qs):
+        return ("n/a" if v.size == 0
+                else " / ".join(f"{1000 * np.percentile(v, q):.0f}"
+                                for q in qs))
+
+    for x_lo, x_hi, n_cell, n_cov, haag, zstd in rp:
+        cov = f"{100 * n_cov / n_cell:.0f}%" if n_cell else "-"
+        L.append(f"| {x_lo:.1f}-{x_hi:.0f} m | {n_cell} | {cov} | "
+                 f"{_qs(haag, (50, 90, 95))} | {_qs(zstd, (50, 95))} |")
+    L += ["",
+          "_Near-field caveat: the l2_self_filter cuboid extends to "
+          f"x={CUBOID_HI[0]:.2f} m, so cells inside it have some points "
+          "removed — low coverage in the 0.3-1 m band is partly the "
+          "self-filter, not purely a sensor blind zone._", ""]
+    if rp:
+        near = next((r for r in rp if r[0] < 1.5), None)
+        far = rp[-1]
+        if near is not None and near[4].size and far[4].size:
+            print(f"  range noise: haag90 p95 {1000*np.percentile(near[4],95):.0f}"
+                  f"mm @ {near[0]:.1f}-{near[1]:.0f}m -> "
+                  f"{1000*np.percentile(far[4],95):.0f}mm @ "
+                  f"{far[0]:.0f}-{far[1]:.0f}m", file=sys.stderr)
 
     # B3 — verdict by region
     corridor = _region_breakdown(cls, 1.0, 8.0, -1.0, 1.0)
