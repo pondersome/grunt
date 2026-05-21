@@ -33,6 +33,7 @@ install(PROGRAMS
   scripts/system_metrics
   scripts/l2_self_filter
   scripts/l2_ground_filter
+  scripts/costmap_snapshot
   DESTINATION lib/${PROJECT_NAME}
 )
 
