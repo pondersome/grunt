@@ -35,6 +35,7 @@ def create_p2os_node(context, *args, **kwargs):
     max_yawdecel = float(LaunchConfiguration('max_yawdecel').perform(context))
     p2os_baud_rate = int(LaunchConfiguration('p2os_baud_rate').perform(context))
     cmd_vel_timeout = float(LaunchConfiguration('cmd_vel_timeout').perform(context))
+    enable_wheel_cmd = LaunchConfiguration('enable_wheel_cmd').perform(context)
 
     # When localization is active: suppress p2os TF, don't remap pose to odom
     # When not active: p2os broadcasts TF and pose is remapped to odom (legacy behavior)
@@ -59,6 +60,10 @@ def create_p2os_node(context, *args, **kwargs):
                 'max_yawdecel': max_yawdecel,
                 'baud_rate': p2os_baud_rate,
                 'cmd_vel_timeout': cmd_vel_timeout,
+                # Tank-drive (per-wheel VEL2) wheel_cmd path — bench
+                # diagnostics only. Off by default; the driver only
+                # subscribes to wheel_cmd when this is true.
+                'enable_wheel_cmd': enable_wheel_cmd in ('True', 'true', '1'),
                 # Lift sonar frames to top-plate height. URDF
                 # pioneer3at_body.xacro places front_sonar at z=0.25 and
                 # back_sonar at z=0.247 above base_link; 0.25 is close
@@ -205,6 +210,7 @@ def generate_launch_description():
         DeclareLaunchArgument('max_yawdecel', default_value='5.0', description='Rotational deceleration (rad/s²). 0.0 = firmware default (~1.75 rad/s²). Ceiling: 5.24 rad/s²'),
         DeclareLaunchArgument('p2os_baud_rate', default_value='115200', description='Serial baud rate (9600/19200/38400/57600/115200). 0 = use robot model default'),
         DeclareLaunchArgument('cmd_vel_timeout', default_value='0.2', description='Driver-level cmd_vel silence watchdog (s). Zeroes wheels if no cmd_vel arrives within this interval. 0.0 disables.'),
+        DeclareLaunchArgument('enable_wheel_cmd', default_value='false', description='Enable the per-wheel VEL2 tank-drive path (subscribes to wheel_cmd). Bench diagnostics only — leave false for normal operation.'),
         # Teleop velocity limits (what joystick sends before driver clamp)
         DeclareLaunchArgument('max_vx', default_value='0.8', description='Teleop max linear velocity (m/s)'),
         DeclareLaunchArgument('max_vx_turbo', default_value='1.5', description='Teleop max linear velocity with turbo button (m/s)'),
