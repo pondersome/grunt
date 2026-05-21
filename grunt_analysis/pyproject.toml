@@ -6,6 +6,8 @@ requires-python = ">=3.10"
 dependencies = [
     "mcap-ros2-support",
     "matplotlib",
+    "numpy",
+    "scipy",
     "pyyaml",
 ]
 

@@ -61,6 +61,7 @@ questions when the report points at one.
 | Find what triggered a foliage-stuck event (vs cluster recounting) | `python -m grunt_analysis.onsets` | `onset_audit.md`, `planner_with_marks.svg` |
 | See the actual recorded costmap at a moment (best evidence) | `python -m grunt_analysis.costmap_render` | `actual_costmap_<tag>_<label>.png` per event |
 | Audit ARCOS chassis stalls (cmd-vs-chassis dropouts, firmware stall flag, battery) | `python -m grunt_analysis.arcos` | `arcos_audit.md` |
+| Study L2 ground / traversability (per-cell ground model, drivable / obstacle classification) | `python -m grunt_analysis.traversability` | `traversability_report.md`, `traversability_classes.png` |
 
 ### Most useful for routine post-mission
 
@@ -120,6 +121,9 @@ PYTHONPATH=. python3 -m grunt_analysis.costmap_render <bag> --mission-yaml <m>
 # ARCOS chassis stall audit — no mission YAML needed (pure chassis telemetry)
 PYTHONPATH=. python3 -m grunt_analysis.arcos <bag>
 
+# L2 ground / traversability study — no mission YAML needed
+PYTHONPATH=. python3 -m grunt_analysis.traversability <bag>
+
 # Render costmaps at specific times (in addition to fresh onsets)
 PYTHONPATH=. python3 -m grunt_analysis.costmap_render <bag> \
     --mission-yaml <m> --at 120 --at 254 --at 329
@@ -135,6 +139,7 @@ Output (default — written next to the bag, or to `--out <dir>`):
 | `onsets` | `onset_audit.md`, `planner_with_marks.svg` |
 | `costmap_render` | `actual_costmap_<tag>_<label>.png` × N |
 | `arcos` | `arcos_audit.md` |
+| `traversability` | `traversability_report.md`, `traversability_classes.png` |
 
 Override output dir with `--out /some/dir`. Pass `--site-yaml` to point
 at a different site (defaults to
@@ -186,7 +191,6 @@ To add a new sensor's metrics:
 
 | Sensor / capability | What we'd add |
 |---|---|
-| **Unitree L2 LiDAR** | Scan-rate health, point density vs range, scan match residual to current pose, ground-plane outlier fraction. |
 | **RTABMap** | Pose-graph optimization residuals, loop closure events, constraint quality, map-frame discontinuities at relocalization. |
 | **AprilTag indoor relocalization** | Tag detection rate, residual between tag-derived pose and EKF, gap before relocalization on first detection at startup. |
 | **Indoor SLAM transitions** | EKF→AMCL handoff jumps, map-relative crosstrack on saved maps. |
@@ -209,6 +213,9 @@ Each of these adds new metric functions; the runner composes them.
 ## Status
 
 - 2026-05-01: initial extract from chat-session sleuthing scripts.
+- 2026-05-20: `traversability` module — L2 ground/lane feasibility study
+  (per-cell smoothed ground surface, drivable/caution/obstacle
+  classification, B1 characterization + B2 classification + B3 verdict).
 - 2026-05-20: `arcos` module promoted from /tmp — ARCOS chassis stall
   audit (cmd-vs-chassis dropout episodes, firmware `motor_stall` flag
   correlation, battery + motor-state summary). `bag.py` gained
