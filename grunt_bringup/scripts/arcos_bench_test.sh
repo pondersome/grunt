@@ -35,8 +35,11 @@ TOPICS=(
   "$NS/battery_state"
 )
 
+# ROS setup scripts are not nounset-clean — relax -u just for sourcing.
+set +u
 source /opt/ros/jazzy/setup.bash
 source "$HOME/ros2_ws/install/setup.bash"
+set -u
 mkdir -p "$BAG_ROOT"
 
 P2OS_PID=""
