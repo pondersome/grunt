@@ -45,20 +45,33 @@ mkdir -p "$BAG_ROOT"
 P2OS_PID=""
 BAG_PID=""
 
+# Stop a child cleanly: SIGINT it (and its children — `ros2 run` wraps
+# the node in a launcher), poll for exit with a bounded timeout, then
+# escalate to SIGTERM and SIGKILL. Never blocks indefinitely.
+_stop() {
+  local label="$1" pid="$2" i
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || return 0
+  echo "[bench] stopping $label..."
+  pkill -INT -P "$pid" 2>/dev/null
+  kill -INT "$pid" 2>/dev/null
+  for i in $(seq 1 30); do                       # up to 15 s
+    kill -0 "$pid" 2>/dev/null || { echo "[bench] $label stopped."; return 0; }
+    sleep 0.5
+  done
+  echo "[bench] $label slow to stop — SIGTERM" >&2
+  pkill -TERM -P "$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null
+  sleep 3
+  kill -0 "$pid" 2>/dev/null || { echo "[bench] $label stopped."; return 0; }
+  echo "[bench] $label — SIGKILL" >&2
+  pkill -KILL -P "$pid" 2>/dev/null; kill -KILL "$pid" 2>/dev/null
+}
+
 cleanup() {
   echo
-  echo "[bench] stopping..."
-  if [[ -n "$BAG_PID" ]] && kill -0 "$BAG_PID" 2>/dev/null; then
-    kill -INT "$BAG_PID" 2>/dev/null
-    wait "$BAG_PID" 2>/dev/null
-    echo "[bench] bag closed: $BAG_DIR"
-  fi
-  if [[ -n "$P2OS_PID" ]] && kill -0 "$P2OS_PID" 2>/dev/null; then
-    kill -INT "$P2OS_PID" 2>/dev/null
-    wait "$P2OS_PID" 2>/dev/null
-    echo "[bench] p2os stopped"
-  fi
+  _stop "bag recorder" "$BAG_PID"      # bag first, so the mcap finalizes
+  _stop "p2os" "$P2OS_PID"
   echo
+  echo "[bench] bag: $BAG_DIR"
   echo "[bench] analyse with:"
   echo "  cd ~/ros2_ws/src/grunt/grunt_analysis"
   echo "  python3 -m grunt_analysis.arcos $BAG_DIR"
