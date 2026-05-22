@@ -107,17 +107,22 @@ def firmware_stall_episodes(stall):
     return eps
 
 
-def perwheel_audit(stall, wheelcmd, cmd):
+def perwheel_audit(stall, wheelcmd, cmd, mstate):
     """Per-wheel commanded-vs-measured velocity.
 
     Measured = motor_stall left_vel/right_vel (encoder, controller-
     independent). Commanded = wheel_cmd directly if present (the VEL2
     tank-drive bench test), else derived from cmd_vel (v_l/r = vx -/+
-    w*track/2). Each motor_stall sample is paired with the nearest
-    command; the weak drive channel shows the lower tracking ratio.
+    w*track/2).
 
-    Returns a dict (source, n, per-wheel + one-wheel-isolated stats) or
-    None when there is nothing to compare.
+    Only motors-enabled samples count — VEL2 moves nothing with the
+    motors off, so the Phase-A hand-spin check is excluded here (it is
+    read off motor_stall directly). Tracking is a *magnitude* ratio
+    sum|meas| / sum|cmd|, so forward+reverse runs do not cancel; a
+    separate dir-agreement fraction catches a wheel running backwards.
+    The weak drive channel shows the lower tracking ratio.
+
+    Returns a dict, or None when there is nothing to compare.
     """
     if not stall or stall[0][3] is None or stall[0][4] is None:
         return None      # pre-2026-05-21 bag: no per-wheel velocity
@@ -137,12 +142,25 @@ def perwheel_audit(stall, wheelcmd, cmd):
     else:
         return None
 
+    ms_t = [m[0] for m in mstate]
+
+    def motors_on(t):
+        if not mstate:
+            return True
+        i = bisect.bisect_right(ms_t, t) - 1
+        return i >= 0 and mstate[i][1] == 1
+
     pairs = []   # (cmd_l, cmd_r, meas_l, meas_r)
+    n_motors_off = 0
     for s in stall:
         c = _nearest(src_t, src, s[0])
-        if c is not None:
-            cl, cr = cmd_lr(c)
-            pairs.append((cl, cr, s[3], s[4]))
+        if c is None:
+            continue
+        if not motors_on(s[0]):
+            n_motors_off += 1
+            continue
+        cl, cr = cmd_lr(c)
+        pairs.append((cl, cr, s[3], s[4]))
     if not pairs:
         return None
 
@@ -151,24 +169,27 @@ def perwheel_audit(stall, wheelcmd, cmd):
         mv = [p for p in pp if abs(p[ci]) > WHEEL_MOVE]
         if not mv:
             return None
-        sc = sum(p[ci] for p in mv)
+        sac = sum(abs(p[ci]) for p in mv)
+        sam = sum(abs(p[mi]) for p in mv)
         return {'n': len(mv),
-                'mean_cmd': sc / len(mv),
-                'mean_meas': sum(p[mi] for p in mv) / len(mv),
-                'ratio': sum(p[mi] for p in mv) / sc
-                if abs(sc) > 1e-6 else float('nan')}
+                'mean_cmd': sac / len(mv),     # mean magnitude
+                'mean_meas': sam / len(mv),
+                'tracking': sam / sac if sac > 1e-6 else float('nan'),
+                'dir_ok': sum(1 for p in mv
+                              if (p[ci] >= 0) == (p[mi] >= 0)) / len(mv)}
 
     out = {'source': source, 'n': len(pairs),
+           'n_motors_off': n_motors_off,
            'left': wheel(0, 2), 'right': wheel(1, 3)}
     # one-wheel-isolated: only left commanded (cmd_r idle), and vice versa
     il = wheel(0, 2, lambda p: abs(p[1]) < WHEEL_MOVE)
     ir = wheel(1, 3, lambda p: abs(p[0]) < WHEEL_MOVE)
     if il:
-        leak = [p[3] for p in pairs
+        leak = [abs(p[3]) for p in pairs
                 if abs(p[0]) > WHEEL_MOVE and abs(p[1]) < WHEEL_MOVE]
         il['idle_meas'] = sum(leak) / len(leak) if leak else 0.0
     if ir:
-        leak = [p[2] for p in pairs
+        leak = [abs(p[2]) for p in pairs
                 if abs(p[1]) > WHEEL_MOVE and abs(p[0]) < WHEEL_MOVE]
         ir['idle_meas'] = sum(leak) / len(leak) if leak else 0.0
     out['iso_left'], out['iso_right'] = il, ir
@@ -280,7 +301,7 @@ def main(argv=None) -> int:
     L.append("")
 
     # per-wheel velocity audit (the bench test: commanded vs measured)
-    pw = perwheel_audit(stall, wheelcmd, cmd)
+    pw = perwheel_audit(stall, wheelcmd, cmd, mstate)
     L.append("## Per-wheel velocity audit")
     if pw is None:
         L.append("- no per-wheel data — needs /motor_stall carrying "
@@ -289,26 +310,32 @@ def main(argv=None) -> int:
     else:
         L.append(f"- command source: {pw['source']}")
         L.append(f"- measured: motor_stall left_vel/right_vel (encoder, "
-                 f"controller-independent); {pw['n']} paired samples")
+                 f"controller-independent); {pw['n']} motors-enabled "
+                 f"paired samples ({pw['n_motors_off']} motors-off "
+                 f"samples excluded)")
+        L.append("- tracking = sum|measured| / sum|commanded| over "
+                 "moving samples; dir = fraction with measured sign "
+                 "matching command")
         L.append("")
-        L.append("| wheel | n moving | mean cmd (m/s) | mean meas (m/s) "
-                 "| tracking |")
-        L.append("|---|---|---|---|---|")
+        L.append("| wheel | n moving | mean |cmd| | mean |meas| "
+                 "| tracking | dir |")
+        L.append("|---|---|---|---|---|---|")
         for w in ('left', 'right'):
             r = pw[w]
             if r:
-                rt = (f"{100 * r['ratio']:.0f}%"
-                      if r['ratio'] == r['ratio'] else "n/a")
-                L.append(f"| {w} | {r['n']} | {r['mean_cmd']:+.3f} | "
-                         f"{r['mean_meas']:+.3f} | {rt} |")
+                tk = (f"{100 * r['tracking']:.0f}%"
+                      if r['tracking'] == r['tracking'] else "n/a")
+                L.append(f"| {w} | {r['n']} | {r['mean_cmd']:.3f} | "
+                         f"{r['mean_meas']:.3f} | {tk} | "
+                         f"{100 * r['dir_ok']:.0f}% |")
             else:
-                L.append(f"| {w} | 0 | — | — | — |")
+                L.append(f"| {w} | 0 | — | — | — | — |")
         lr, rr = pw['left'], pw['right']
-        if lr and rr and lr['ratio'] == lr['ratio'] \
-                and rr['ratio'] == rr['ratio']:
-            gap = abs(lr['ratio'] - rr['ratio'])
-            weak = 'left' if lr['ratio'] < rr['ratio'] else 'right'
-            lo, hi = sorted((lr['ratio'], rr['ratio']))
+        if lr and rr and lr['tracking'] == lr['tracking'] \
+                and rr['tracking'] == rr['tracking']:
+            gap = abs(lr['tracking'] - rr['tracking'])
+            weak = 'left' if lr['tracking'] < rr['tracking'] else 'right'
+            lo, hi = sorted((lr['tracking'], rr['tracking']))
             L.append("")
             if gap > 0.10:
                 L.append(f"- **Asymmetry: the {weak} wheel tracks "
@@ -319,21 +346,28 @@ def main(argv=None) -> int:
             else:
                 L.append(f"- Wheels track within {100 * gap:.0f}% of each "
                          f"other — no per-wheel asymmetry in this bag.")
+        for w in ('left', 'right'):
+            r = pw[w]
+            if r and r['dir_ok'] < 0.9:
+                L.append(f"- **{w} wheel: measured sign disagrees with "
+                         f"command {100 * (1 - r['dir_ok']):.0f}% of the "
+                         f"time — possible reversed encoder/wiring or a "
+                         f"wheel not following the command.**")
         if pw['iso_left'] or pw['iso_right']:
             L.append("")
             L.append("### One-wheel-isolated segments (cleanest signal)")
             L.append("")
-            L.append("| driven wheel | n | driven cmd | driven meas | "
-                     "tracking | idle-wheel meas |")
+            L.append("| driven wheel | n | mean |cmd| | mean |meas| | "
+                     "tracking | idle-wheel |meas| |")
             L.append("|---|---|---|---|---|---|")
             for w in ('left', 'right'):
                 r = pw[f'iso_{w}']
                 if r:
-                    rt = (f"{100 * r['ratio']:.0f}%"
-                          if r['ratio'] == r['ratio'] else "n/a")
-                    L.append(f"| {w} | {r['n']} | {r['mean_cmd']:+.3f} | "
-                             f"{r['mean_meas']:+.3f} | {rt} | "
-                             f"{r.get('idle_meas', 0.0):+.3f} |")
+                    tk = (f"{100 * r['tracking']:.0f}%"
+                          if r['tracking'] == r['tracking'] else "n/a")
+                    L.append(f"| {w} | {r['n']} | {r['mean_cmd']:.3f} | "
+                             f"{r['mean_meas']:.3f} | {tk} | "
+                             f"{r.get('idle_meas', 0.0):.3f} |")
     L.append("")
 
     # cmd-vs-chassis stall episodes
