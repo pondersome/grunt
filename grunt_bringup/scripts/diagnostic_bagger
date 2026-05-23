@@ -53,6 +53,14 @@ TOPIC_TEMPLATES = [
     '/tf',
     '/tf_static',
 
+    # robot_state_publisher's URDF, TRANSIENT_LOCAL (latched). ros2 bag
+    # record captures the latched message on subscribe, so the URDF
+    # travels with the bag — Foxglove's 3D panel can then render the
+    # robot mesh via "URDF -> source: topic -> /<prefix>/robot_description".
+    # Without it, Foxglove only has TF axes (which still work if the
+    # display frame is set to grunt1/map or grunt1/odom).
+    '/{prefix}/robot_description',
+
     # Nav2 plans + costmap — all under /nav/ namespace
     '/{prefix}/nav/plan',                 # planner's published path
     '/{prefix}/nav/received_global_plan', # path RPP actually received
