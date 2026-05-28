@@ -43,6 +43,16 @@ TOPIC_TEMPLATES = [
                                           # consumed by ekf_global; lets us
                                           # verify which corrections actually
                                           # landed.
+    '/{prefix}/rtk/rtcm',                 # NTRIP-delivered RTCM correction
+                                          # packets. Bagging this distinguishes
+                                          # "F9P stuck in NONE" from "no RTCM
+                                          # arriving" — see the 2026-05-28
+                                          # return-mission post-mortem where we
+                                          # could only infer NTRIP loss from
+                                          # F9P symptom.
+    '/{prefix}/rtk/ntrip_server_hz',      # ntrip_client status string at 1Hz —
+                                          # carries source/caster state for
+                                          # post-hoc forensics.
     '/{prefix}/localization/status',
     '/{prefix}/odometry/local',
     '/{prefix}/odometry/global',
