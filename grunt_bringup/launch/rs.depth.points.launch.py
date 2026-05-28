@@ -89,7 +89,7 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'hdr_merge.enable',             'default': 'false', 'description': 'hdr_merge filter enablement flag'},
                            {'name': 'wait_for_device_timeout',      'default': '-1.', 'description': 'Timeout for waiting for device to connect (Seconds)'},
                            {'name': 'reconnect_timeout',            'default': '6.', 'description': 'Timeout(seconds) between consequtive reconnection attempts'},
-                           {'name': 'base_frame_id',                'default': 'base', 'description': 'Root frame of the sensors transform tree'},
+                           {'name': 'base_frame_id',                'default': 'link', 'description': 'Root frame of the sensors transform tree. Aligned with our URDF — the URDF parents the camera at <camera_name>_link (default cam_live_link), so the driver-side root frame must match that name. Upstream default is "base" which produces an unconnected cam_live_base frame and breaks TF lookups (cam_live_depth_optical_frame → /odom fails).'},
                            {'name': 'tf_prefix',                    'default': 'grunt1/arm1/', 'description': 'prefix to be prepended to all frame IDs'},
                           ]
 
