@@ -261,8 +261,22 @@ class LocalizationSupervisor(Node):
         if not self.datum_set:
             return
 
-        # Filter out garbage fixes that may sneak through after datum is set.
-        if not self._gps_usable() or (msg.latitude == 0.0 and msg.longitude == 0.0):
+        # Post-datum: the gate's job is done. The pre-datum strict quality
+        # check (gps_h_acc_cal_threshold_m, applied by the datum-setting
+        # cal logic) is what ensured a sound datum at the open transition.
+        # Once open, trust the firmware-derived covariance the F9P stamps
+        # into NavSatFix.position_covariance (DIAGONAL_KNOWN) — it tracks
+        # h_acc/v_acc exactly across RTK_FIXED → FLOAT → SPP and the EKF
+        # naturally down-weights low-quality observations. Applying the
+        # strict cal threshold continuously here drops usable SPP fixes
+        # (~0.5-1m σ) the EKF could fuse perfectly well and instead forces
+        # dead reckoning during carrier dropouts — see the 2026-05-28
+        # return-mission post-mortem.
+        #
+        # Only filter true receiver-cold-start garbage: (0,0) coords with
+        # no real lock. Any non-(0,0) NavSatFix carries firmware-quality
+        # covariance and is safe to forward.
+        if msg.latitude == 0.0 and msg.longitude == 0.0:
             return
 
         self.gated_fix_pub.publish(msg)
