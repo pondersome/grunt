@@ -32,8 +32,46 @@ set -o pipefail
 
 LOG_DIR="${LOG_DIR:-$HOME/bag_files/grunt}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/_usb_sentinel.log}"
+# NVMe device for SMART power-loss counter sampling. Auto-detect if
+# present; if absent the SMART block in each snapshot is just skipped.
+NVME_DEV="${NVME_DEV:-/dev/nvme0n1}"
 
 mkdir -p "${LOG_DIR}"
+
+# SMART counter capture: the NVMe SSD's `unsafe_shutdowns` attribute
+# is the single best signal for "the NUC lost power without OS
+# cooperation" — it increments only on hard power-off, not on clean
+# reboot. `power_cycles` is the total (clean + unsafe). Sampling on
+# every USB event lets us correlate "the USB just dropped" with
+# "did the NUC also briefly lose power" — the central question of
+# the chassis-B brown-out hypothesis (project_chassis_b_usb_drops).
+#
+# Requires `nvme-cli` (apt install nvme-cli) and root for the
+# /dev/nvmeXn1 device. We try non-interactive sudo; if that fails,
+# we emit a one-line note instead of the counters. To enable
+# unattended capture, add to /etc/sudoers.d/grunt-usb-sentinel:
+#
+#   karim ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log /dev/nvme0n1
+#
+# (without the trailing newline / comment characters; visudo -f to
+# verify syntax.)
+emit_smart_counters() {
+  if [ ! -e "${NVME_DEV}" ]; then
+    echo "(no ${NVME_DEV}; SMART counters skipped)"
+    return
+  fi
+  if ! command -v nvme >/dev/null 2>&1; then
+    echo "(nvme-cli not installed; apt install nvme-cli to enable)"
+    return
+  fi
+  local out
+  if out=$(sudo -n nvme smart-log "${NVME_DEV}" 2>/dev/null); then
+    echo "${out}" | grep -E "^(unsafe_shutdowns|power_cycles|power_on_hours|controller_busy_time)" \
+      || echo "(nvme smart-log produced no expected fields)"
+  else
+    echo "(sudo -n nvme smart-log failed; add NOPASSWD sudoers entry — see script comments)"
+  fi
+}
 
 # Match these kernel-log substrings. Deliberately broad — every USB
 # topology change is interesting; filtering is cheaper than missing
@@ -59,6 +97,9 @@ emit_snapshot() {
     echo "--- /dev/grunt_* (udev-rule symlinks) ---"
     ls -la /dev/grunt_* 2>/dev/null || echo "(none)"
     echo
+    echo "--- NVMe SMART counters (unsafe_shutdowns = NUC hard-power-off count) ---"
+    emit_smart_counters
+    echo
   } >> "${LOG_FILE}"
   # Force the kernel page cache out to disk so the record survives a
   # hard reboot. `sync` is global — a few-event-per-minute rate is
@@ -77,6 +118,9 @@ emit_snapshot() {
   echo
   echo "--- initial /dev/serial/by-id ---"
   ls -la /dev/serial/by-id 2>/dev/null || echo "(none)"
+  echo
+  echo "--- initial NVMe SMART counters ---"
+  emit_smart_counters
   echo
 } >> "${LOG_FILE}"
 sync
