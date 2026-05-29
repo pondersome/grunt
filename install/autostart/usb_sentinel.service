@@ -17,10 +17,13 @@
 # tasks #91 and #96): the sentinel observes the events; those fixes
 # would make the system robust to them.
 #
-# Install:
+# Install (from anywhere; use the absolute path):
 #   sudo cp /home/karim/ros2_ws/src/grunt/install/autostart/usb_sentinel.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now usb_sentinel.service
+#
+# (If your cwd is the workspace root ~/ros2_ws, the same source path
+# is src/grunt/install/autostart/usb_sentinel.service.)
 #
 # Watch the live log:
 #   tail -F ~/bag_files/grunt/_usb_sentinel.log
