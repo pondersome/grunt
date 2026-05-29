@@ -36,9 +36,31 @@
 
 set -e
 
+# --no-l2: bag everything else but omit L2 topics from both the
+# recording set and the pre-flight CRITICAL check. Use case: chassis-B
+# diagnostic runs where L2 is intentionally powered off (shared power
+# rail with the NUC is the leading suspect for the brown-out / USB-
+# drop fault). Without this flag the pre-flight refuses to start.
+NO_L2=0
+for arg in "$@"; do
+  case "${arg}" in
+    --no-l2) NO_L2=1 ;;
+  esac
+done
+# Strip --no-l2 from positional args so DESCRIPTOR below picks up the
+# real one regardless of arg order.
+ARGS=()
+for arg in "$@"; do
+  [ "${arg}" = "--no-l2" ] || ARGS+=("${arg}")
+done
+set -- "${ARGS[@]}"
+
 PREFIX=${PREFIX:-grunt1}
 BAG_ROOT=${BAG_ROOT:-$HOME/bag_files/grunt}
 DESCRIPTOR=${1:-calibration}
+if [ "${NO_L2}" = "1" ]; then
+  DESCRIPTOR="${DESCRIPTOR}_nol2"
+fi
 
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
 BAG_DIR="${BAG_ROOT}/${TIMESTAMP}_groundgrid_${DESCRIPTOR}"
@@ -57,12 +79,16 @@ BAG_DIR="${BAG_ROOT}/${TIMESTAMP}_groundgrid_${DESCRIPTOR}"
 #
 # Excluded: Nav2 / costmap / behavior — control stack is not engaged
 # during teleop capture, would bloat the bag.
-TOPICS=(
-  # L2 LiDAR — primary GroundGrid input
-  "/${PREFIX}/l2/points"
-  "/${PREFIX}/l2/points_filtered"
-  "/${PREFIX}/l2/imu"
-
+TOPICS=()
+if [ "${NO_L2}" = "0" ]; then
+  TOPICS+=(
+    # L2 LiDAR — primary GroundGrid input
+    "/${PREFIX}/l2/points"
+    "/${PREFIX}/l2/points_filtered"
+    "/${PREFIX}/l2/imu"
+  )
+fi
+TOPICS+=(
   # TF chain — required for gravity alignment of ground plane
   "/tf"
   "/tf_static"
@@ -139,11 +165,13 @@ echo
 # Sanity check: critical topics are live before recording
 echo "Pre-flight: checking topic availability..."
 CRITICAL=(
-  "/${PREFIX}/l2/points"
   "/${PREFIX}/arm1/cam_live/color/image_raw"
   "/${PREFIX}/arm1/cam_live/depth/image_rect_raw"
   "/${PREFIX}/rtk/fix"
 )
+if [ "${NO_L2}" = "0" ]; then
+  CRITICAL+=("/${PREFIX}/l2/points")
+fi
 MISSING=()
 LIVE_TOPICS=$(timeout 4 ros2 topic list 2>/dev/null || true)
 for t in "${CRITICAL[@]}"; do
@@ -169,6 +197,13 @@ cat > "${NOTES_FILE}" <<NOTES_HEADER
 # GroundGrid calibration bag — ${TIMESTAMP} — ${DESCRIPTOR}
 
 Bag dir: ${BAG_DIR}
+$([ "${NO_L2}" = "1" ] && echo "
+**L2 LiDAR was DISABLED for this run** (--no-l2). Diagnostic
+intent: isolate the chassis from L2 power-rail / EMI contribution
+to the chassis-B brown-out / USB-drop fault (project_chassis_b_usb_drops).
+This bag will not be useful for GroundGrid tuning; it is for
+fault-reproducibility-with-L2-removed only.
+")
 
 ## Drive plan checklist
 
