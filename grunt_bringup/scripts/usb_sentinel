@@ -74,9 +74,42 @@ emit_smart_counters() {
 }
 
 # Match these kernel-log substrings. Deliberately broad — every USB
-# topology change is interesting; filtering is cheaper than missing
-# events.
-MATCH='usb [0-9]+-[0-9.]+|ftdi_sio|cdc_acm|hid-generic|input: |xhci_hcd.*ERROR|USB disconnect|new.*device'
+# topology change is interesting and so is every wifi / PCIe / hardware
+# fault that might be the chassis-B "robot stopped responding + network
+# feels offline" failure mode. Filtering is cheaper than missing events.
+#
+# Categories:
+#   USB:    usb N-M, ftdi_sio, cdc_acm, hid-generic, input: , xhci_hcd ERROR
+#   Wifi:   iwlwifi, wlo[0-9]+ (Intel wifi driver + interface name), nl80211
+#   BT:     Bluetooth: hci, btusb (Intel AX201's BT side is on USB bus 3)
+#   PCIe:   PCIe Bus Error, AER (Advanced Error Reporting)
+#   Kernel: Machine Check Exception, MCE, watchdog.*timed out, hard/softlockup
+#           NETDEV WATCHDOG, kernel: Linux version (boot signature)
+MATCH='usb [0-9]+-[0-9.]+|ftdi_sio|cdc_acm|hid-generic|input: |xhci_hcd.*ERROR|USB disconnect|new.*device|iwlwifi|wlo[0-9]+|nl80211|Bluetooth: hci|btusb|PCIe Bus Error|AER:|Machine Check|\\bMCE\\b|watchdog.*timed out|hardlockup|softlockup|NETDEV WATCHDOG|kernel: Linux version'
+
+# Heartbeat interval (seconds). Default 60s is enough resolution to
+# pinpoint when the box was last alive but cheap on log volume (~1440
+# lines/day, ~150KB/month). Override with HEARTBEAT_SEC=30 for finer
+# granularity during a hunt.
+HEARTBEAT_SEC="${HEARTBEAT_SEC:-60}"
+
+# Heartbeat emitter — runs from a background subshell every
+# HEARTBEAT_SEC. Distinguishes "box was alive but quiet" from "box
+# died" when reviewing the log post-fault. Captures load, uptime,
+# and link state on wifi + wired so we can see exactly which path
+# went down and when.
+emit_heartbeat() {
+  local ts load up_secs up_h up_m wlo_state eth_state
+  ts=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+  load=$(awk '{print $1}' /proc/loadavg)
+  up_secs=$(awk '{print int($1)}' /proc/uptime)
+  up_h=$((up_secs / 3600))
+  up_m=$(((up_secs / 60) % 60))
+  wlo_state=$(cat /sys/class/net/wlo1/operstate 2>/dev/null || echo "?")
+  eth_state=$(cat /sys/class/net/enp1s0/operstate 2>/dev/null || echo "?")
+  echo "${ts}  HEARTBEAT  load=${load} up=${up_h}h${up_m}m wlo1=${wlo_state} enp1s0=${eth_state}" >> "${LOG_FILE}"
+  sync
+}
 
 emit_snapshot() {
   local trigger="$1"
@@ -124,6 +157,31 @@ emit_snapshot() {
   echo
 } >> "${LOG_FILE}"
 sync
+
+# Background heartbeat loop. Runs independently of the journalctl
+# follower so a kernel hang that freezes journald does NOT stop
+# heartbeats from landing (sync after each write means the last
+# heartbeat is on disk even if the loop dies between iterations).
+# When the kernel completely freezes the heartbeat stops too — that's
+# itself the signal: the gap size tells you how long the box was
+# really gone.
+(
+  while true; do
+    sleep "${HEARTBEAT_SEC}"
+    emit_heartbeat
+  done
+) &
+HEARTBEAT_PID=$!
+# Clean up the background loop when the sentinel exits for any reason
+# (Ctrl-C, SIGTERM from systemd, journalctl follower dying, etc.).
+# pkill -P kills the subshell's `sleep` child first so it can't linger
+# as an orphan after we kill the subshell itself.
+trap 'pkill -P ${HEARTBEAT_PID} 2>/dev/null; kill ${HEARTBEAT_PID} 2>/dev/null; true' EXIT INT TERM
+
+# Emit one heartbeat immediately so the log header is followed by a
+# first known-alive marker — useful for distinguishing "sentinel just
+# started and nothing happened yet" from "sentinel is dead."
+emit_heartbeat
 
 # Follow the kernel journal from now forward. --output=short-iso gives
 # a sortable timestamp. stdbuf -oL keeps grep's output line-buffered so
