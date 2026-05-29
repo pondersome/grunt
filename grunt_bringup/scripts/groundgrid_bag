@@ -108,9 +108,9 @@ TOPICS=(
 mkdir -p "${BAG_ROOT}"
 
 # Sanity check: disk space. At the recommended camera profile (640x480
-# @ 6 Hz color + depth, pointcloud disabled) plus L2 cloud, total bag
-# bandwidth is ~12 MB/s ≈ 720 MB/min. Refuse to start if < 5 GB free —
-# enough for a ~7 minute capture with headroom.
+# @ 5 Hz color + depth, pointcloud disabled) plus L2 cloud, total bag
+# bandwidth is ~10 MB/s ≈ 600 MB/min. Refuse to start if < 5 GB free —
+# enough for a ~8 minute capture with headroom.
 FREE_MB=$(df -Pm "${BAG_ROOT}" | awk 'NR==2 {print $4}')
 if [ "${FREE_MB}" -lt 5000 ]; then
   echo "ERROR: only ${FREE_MB} MB free at ${BAG_ROOT} — need at least 5000 MB."
@@ -118,7 +118,7 @@ if [ "${FREE_MB}" -lt 5000 ]; then
   echo "Free space and retry."
   exit 1
 fi
-echo "Disk OK: ${FREE_MB} MB free at ${BAG_ROOT} (~$((FREE_MB / 720)) min headroom)."
+echo "Disk OK: ${FREE_MB} MB free at ${BAG_ROOT} (~$((FREE_MB / 600)) min headroom)."
 
 # Sanity check: camera profile not at upstream-default rates. The
 # default rs.depth.points.launch.py (post 2026-05-28) drops to
@@ -127,8 +127,8 @@ echo "Disk OK: ${FREE_MB} MB free at ${BAG_ROOT} (~$((FREE_MB / 720)) min headro
 # overrides — warn the operator before we eat their disk.
 echo
 echo "If you launched the camera with overrides, confirm these are sane for bagging:"
-echo "  rgb_camera.color_profile      target: 640,480,6   (default in our launch)"
-echo "  depth_module.depth_profile    target: 640x480x6   (default in our launch)"
+echo "  rgb_camera.color_profile      target: 640,480,5   (default in our launch — 5 Hz is D4xx minimum)"
+echo "  depth_module.depth_profile    target: 640x480x5   (default in our launch — 5 Hz is D4xx minimum)"
 echo "  pointcloud.enable             target: false       (default in our launch)"
 echo
 echo "Override at launch time only if you need higher rates AND have the disk:"

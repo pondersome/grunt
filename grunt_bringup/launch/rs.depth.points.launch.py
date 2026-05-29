@@ -34,14 +34,14 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'log_level',                    'default': 'info', 'description': 'debug log level [DEBUG|INFO|WARN|ERROR|FATAL]'},
                            {'name': 'output',                       'default': 'screen', 'description': 'pipe node output [screen|log]'},
                            {'name': 'enable_color',                 'default': 'true', 'description': 'enable color stream'},
-                           {'name': 'rgb_camera.color_profile',     'default': '640,480,6', 'description': 'color stream profile. Default 640x480 @ 6 Hz produces ~5.5 MB/s — manageable bag bandwidth and plenty for visual annotation. Override to 0,0,0 for device default (typically 1280x720x30, ~83 MB/s) if you need higher frame rate for live work.'},
+                           {'name': 'rgb_camera.color_profile',     'default': '640,480,5', 'description': 'color stream profile. Default 640x480 @ 5 Hz produces ~4.6 MB/s — manageable bag bandwidth and plenty for visual annotation. 5 Hz is the D4xx-series minimum framerate; 6 Hz is rejected by firmware. Override to 0,0,0 for device default (typically 1280x720x30, ~83 MB/s) if you need higher frame rate for live work.'},
                            {'name': 'rgb_camera.color_format',      'default': 'RGB8', 'description': 'color stream format'},
                            {'name': 'rgb_camera.enable_auto_exposure', 'default': 'true', 'description': 'enable/disable auto exposure for color image'},
                            {'name': 'enable_depth',                 'default': 'true', 'description': 'enable depth stream'},
                            {'name': 'enable_infra',                 'default': 'false', 'description': 'enable infra0 stream'},
                            {'name': 'enable_infra1',                'default': 'false', 'description': 'enable infra1 stream'},
                            {'name': 'enable_infra2',                'default': 'false', 'description': 'enable infra2 stream'},
-                           {'name': 'depth_module.depth_profile',   'default': '640x480x6', 'description': 'depth stream profile. Default 640x480 @ 6 Hz produces ~3.7 MB/s. Override to 848x480x30 (upstream default) for full live performance.'},
+                           {'name': 'depth_module.depth_profile',   'default': '640x480x5', 'description': 'depth stream profile. Default 640x480 @ 5 Hz produces ~3.1 MB/s. 5 Hz is the D4xx minimum framerate (6 Hz is rejected). Override to 848x480x30 (upstream default) for full live performance.'},
                            {'name': 'depth_module.depth_format',    'default': 'Z16', 'description': 'depth stream format'},
                            {'name': 'depth_module.infra_profile',   'default': '0,0,0', 'description': 'infra streams (0/1/2) profile'},
                            {'name': 'depth_module.infra_format',    'default': 'RGB8', 'description': 'infra0 stream format'},
@@ -59,7 +59,7 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'depth_module.gain.2',          'default': '16', 'description': 'Depth module second gain value. Used for hdr_merge filter'},
                            {'name': 'enable_sync',                  'default': 'false', 'description': "'enable sync mode'"},
                            {'name': 'depth_module.inter_cam_sync_mode',               'default': "0", 'description': '[0-Default, 1-Master, 2-Slave]'},
-                           {'name': 'enable_rgbd',                  'default': 'true', 'description': "'enable rgbd topic'"},
+                           {'name': 'enable_rgbd',                  'default': 'false', 'description': "'enable rgbd topic'. Off by default: matches bagger (which records color + raw depth separately and skips aligned_depth_to_color). Enabling requires enable_sync:=true and align_depth.enable:=true."},
                            {'name': 'enable_gyro',                  'default': 'true', 'description': "'enable gyro stream'"},
                            {'name': 'enable_accel',                 'default': 'true', 'description': "'enable accel stream'"},
                            {'name': 'gyro_fps',                     'default': '0', 'description': "''"},
@@ -77,9 +77,9 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'pointcloud.stream_index_filter','default': '0', 'description': 'texture stream index for pointcloud'},
                            {'name': 'pointcloud.ordered_pc',        'default': 'false', 'description': ''},
                            {'name': 'pointcloud.allow_no_texture_points', 'default': 'false', 'description': "''"},
-                           {'name': 'align_depth.enable',           'default': 'true', 'description': 'enable align depth filter'},
+                           {'name': 'align_depth.enable',           'default': 'false', 'description': 'enable align depth filter. Off by default: bagger skips aligned_depth_to_color (recomputable offline from depth + extrinsics in /tf_static), and computing the alignment costs CPU we do not need.'},
                            {'name': 'colorizer.enable',             'default': 'true', 'description': 'enable colorizer filter'},
-                           {'name': 'decimation_filter.enable',     'default': 'true', 'description': 'enable_decimation_filter'},
+                           {'name': 'decimation_filter.enable',     'default': 'false', 'description': 'enable_decimation_filter. Off by default: the filter ran at magnitude 2 (halving 640x480 → 320x240) which silently downsized depth below the configured profile. Bag consumers want the configured resolution; enable explicitly for live-streaming use cases that need the bandwidth reduction.'},
                            {'name': 'rotation_filter.enable',       'default': 'false', 'description': 'enable rotation_filter'},
                            {'name': 'rotation_filter.rotation',     'default': '0.0',   'description': 'rotation value: 0.0, 90.0, -90.0, 180.0'},
                            {'name': 'spatial_filter.enable',        'default': 'false', 'description': 'enable_spatial_filter'},
@@ -87,6 +87,17 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'disparity_filter.enable',      'default': 'false', 'description': 'enable_disparity_filter'},
                            {'name': 'hole_filling_filter.enable',   'default': 'false', 'description': 'enable_hole_filling_filter'},
                            {'name': 'hdr_merge.enable',             'default': 'false', 'description': 'hdr_merge filter enablement flag'},
+                           # QoS — override the driver's SYSTEM_DEFAULT (which resolves to
+                           # RELIABLE + TRANSIENT_LOCAL — TRANSIENT_LOCAL on a streaming sensor
+                           # caches the last frame for late-joiners, and RELIABLE backpressures
+                           # the publisher when subscribers fall behind. Wrong for image data.
+                           # SENSOR_DATA = BEST_EFFORT + VOLATILE + small history. Standard for
+                           # camera/lidar topics. Override to SYSTEM_DEFAULT only if a downstream
+                           # consumer specifically requires the old behavior.
+                           {'name': 'color_qos',                    'default': 'SENSOR_DATA', 'description': 'QoS profile for color/image_raw — see comment above.'},
+                           {'name': 'color_info_qos',               'default': 'SENSOR_DATA', 'description': 'QoS profile for color/camera_info.'},
+                           {'name': 'depth_qos',                    'default': 'SENSOR_DATA', 'description': 'QoS profile for depth/image_rect_raw.'},
+                           {'name': 'depth_info_qos',               'default': 'SENSOR_DATA', 'description': 'QoS profile for depth/camera_info.'},
                            {'name': 'wait_for_device_timeout',      'default': '-1.', 'description': 'Timeout for waiting for device to connect (Seconds)'},
                            {'name': 'reconnect_timeout',            'default': '6.', 'description': 'Timeout(seconds) between consequtive reconnection attempts'},
                            {'name': 'base_frame_id',                'default': 'link', 'description': 'Root frame of the sensors transform tree. Aligned with our URDF — the URDF parents the camera at <camera_name>_link (default cam_live_link), so the driver-side root frame must match that name. Upstream default is "base" which produces an unconnected cam_live_base frame and breaks TF lookups (cam_live_depth_optical_frame → /odom fails).'},
