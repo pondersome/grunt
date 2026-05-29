@@ -34,6 +34,7 @@ install(PROGRAMS
   scripts/l2_self_filter
   scripts/l2_ground_filter
   scripts/costmap_snapshot
+  scripts/groundgrid_bag
   DESTINATION lib/${PROJECT_NAME}
 )
 

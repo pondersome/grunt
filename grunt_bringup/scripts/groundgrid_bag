@@ -1,0 +1,204 @@
+#!/bin/bash
+# GroundGrid calibration bag capture
+#
+# One-off bag recorder for GroundGrid development. Captures L2 cloud
+# + TF + odometry + IMU + RealSense color/depth/pointcloud + RTK,
+# under ~/bag_files/grunt/<timestamp>_groundgrid_<descriptor>/.
+#
+# Drives the GroundGrid sprint (task #95) — read the bag back with
+# `ros2 bag play --clock` to replay against a minimal stack
+# (l2_self_filter + GroundGrid + costmap_snapshot).
+#
+# Preconditions before running:
+#   1. Standard grunt stack is up (sudo systemctl start grunt)
+#   2. RealSense launched separately:
+#        ros2 launch grunt_bringup rs.depth.points.launch.py
+#   3. Camera TF chain verified (one of):
+#        ros2 run tf2_ros tf2_echo grunt1/odom grunt1/arm1/cam_live_depth_optical_frame
+#   4. Disk free: at least 5 GB for a ~10 minute composite drive bag
+#
+# Usage:
+#   groundgrid_bag                       → timestamped bag, generic name
+#   groundgrid_bag composite_drive       → named "composite_drive"
+#   groundgrid_bag flat_reference        → for short focused captures
+#
+# Stop the recording with Ctrl-C. Bag finalises cleanly.
+#
+# Notes file convention:
+#   Alongside the bag dir, the operator creates <bag_dir>.notes.md with
+#   bag-time-stamped entries describing what each section is. Example:
+#     t=15s: park on flat reference start
+#     t=45s: leaving flat, climbing slope
+#     t=120s: parked on slope, 30% grade
+#     ...
+#   The RGB stream lets you reconstruct timing post-hoc if you didn't
+#   take notes live.
+
+set -e
+
+PREFIX=${PREFIX:-grunt1}
+BAG_ROOT=${BAG_ROOT:-$HOME/bag_files/grunt}
+DESCRIPTOR=${1:-calibration}
+
+TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
+BAG_DIR="${BAG_ROOT}/${TIMESTAMP}_groundgrid_${DESCRIPTOR}"
+
+# Topic set rationale: L2 raw + filtered so we can re-tune the
+# self-filter from bag, full TF chain for ground-plane alignment,
+# odometry/IMU for pose + independent attitude reference, RealSense
+# RGB/depth/pointcloud for visual annotation + cross-validation,
+# RTK for site-coordinate anchoring of the annotation timeline.
+#
+# Drive-state context: cmd_vel (commanded), joy (operator intent),
+# motor_stall (per-wheel encoder velocities + firmware stall flags)
+# — the operator paces speed to terrain during teleop, so these
+# capture the implicit terrain classification AND verify chassis-B
+# drivetrain health during the drive.
+#
+# Excluded: Nav2 / costmap / behavior — control stack is not engaged
+# during teleop capture, would bloat the bag.
+TOPICS=(
+  # L2 LiDAR — primary GroundGrid input
+  "/${PREFIX}/l2/points"
+  "/${PREFIX}/l2/points_filtered"
+  "/${PREFIX}/l2/imu"
+
+  # TF chain — required for gravity alignment of ground plane
+  "/tf"
+  "/tf_static"
+
+  # Robot description — Foxglove renders the mesh during replay
+  "/${PREFIX}/robot_description"
+
+  # Pose + IMU — annotation timeline + independent attitude reference
+  "/${PREFIX}/odometry/global"
+  "/${PREFIX}/odometry/local"
+  "/${PREFIX}/pose"
+  "/${PREFIX}/bno055/imu"
+
+  # RTK — site-coordinate anchoring + RTCM health context
+  "/${PREFIX}/rtk/fix"
+  "/${PREFIX}/rtk/fix_gated"
+  "/${PREFIX}/rtk/navpvt"
+  "/${PREFIX}/rtk/rtcm"
+  "/${PREFIX}/localization/status"
+
+  # Drive-state — operator-paced teleop encodes terrain via speed
+  "/${PREFIX}/cmd_vel"
+  "/${PREFIX}/cmd_vel_joy"
+  "/${PREFIX}/joy"
+  "/${PREFIX}/motor_stall"
+  "/${PREFIX}/motor_state"
+  "/${PREFIX}/battery_state"
+
+  # RealSense (camera_namespace = /grunt1/arm1, name = cam_live).
+  # Bag color + raw depth + camera_info ONLY. We deliberately skip:
+  # - depth/color/points  (~196 MB/s at default rates — recomputable
+  #   offline from depth + camera_info)
+  # - aligned_depth_to_color  (~55 MB/s — recomputable from depth +
+  #   the inter-camera extrinsics in /tf_static)
+  # Disk-full incident 2026-05-28 was the lesson.
+  "/${PREFIX}/arm1/cam_live/color/image_raw"
+  "/${PREFIX}/arm1/cam_live/color/camera_info"
+  "/${PREFIX}/arm1/cam_live/depth/image_rect_raw"
+  "/${PREFIX}/arm1/cam_live/depth/camera_info"
+)
+
+# Sanity check: bag root exists
+mkdir -p "${BAG_ROOT}"
+
+# Sanity check: disk space. At the recommended camera profile (640x480
+# @ 6 Hz color + depth, pointcloud disabled) plus L2 cloud, total bag
+# bandwidth is ~12 MB/s ≈ 720 MB/min. Refuse to start if < 5 GB free —
+# enough for a ~7 minute capture with headroom.
+FREE_MB=$(df -Pm "${BAG_ROOT}" | awk 'NR==2 {print $4}')
+if [ "${FREE_MB}" -lt 5000 ]; then
+  echo "ERROR: only ${FREE_MB} MB free at ${BAG_ROOT} — need at least 5000 MB."
+  echo "Disk-full at the recorder is what triggered the 2026-05-28 bag abort."
+  echo "Free space and retry."
+  exit 1
+fi
+echo "Disk OK: ${FREE_MB} MB free at ${BAG_ROOT} (~$((FREE_MB / 720)) min headroom)."
+
+# Sanity check: camera profile not at upstream-default rates. The
+# default rs.depth.points.launch.py (post 2026-05-28) drops to
+# 640x480 @ 6 Hz; if the camera is still at the upstream 30 Hz
+# defaults — which happens if it was launched with explicit
+# overrides — warn the operator before we eat their disk.
+echo
+echo "If you launched the camera with overrides, confirm these are sane for bagging:"
+echo "  rgb_camera.color_profile      target: 640,480,6   (default in our launch)"
+echo "  depth_module.depth_profile    target: 640x480x6   (default in our launch)"
+echo "  pointcloud.enable             target: false       (default in our launch)"
+echo
+echo "Override at launch time only if you need higher rates AND have the disk:"
+echo "  ros2 launch grunt_bringup rs.depth.points.launch.py \\"
+echo "      rgb_camera.color_profile:=1280,720,15"
+echo
+
+# Sanity check: critical topics are live before recording
+echo "Pre-flight: checking topic availability..."
+CRITICAL=(
+  "/${PREFIX}/l2/points"
+  "/${PREFIX}/arm1/cam_live/color/image_raw"
+  "/${PREFIX}/arm1/cam_live/depth/image_rect_raw"
+  "/${PREFIX}/rtk/fix"
+)
+MISSING=()
+LIVE_TOPICS=$(timeout 4 ros2 topic list 2>/dev/null || true)
+for t in "${CRITICAL[@]}"; do
+  if ! echo "${LIVE_TOPICS}" | grep -qx "${t}"; then
+    MISSING+=("${t}")
+  fi
+done
+if [ ${#MISSING[@]} -gt 0 ]; then
+  echo "ERROR: critical topics missing — bag would be useless:"
+  for t in "${MISSING[@]}"; do echo "  ${t}"; done
+  echo
+  echo "Fix: ensure both the standard grunt stack AND the RealSense launch are up."
+  echo "  sudo systemctl start grunt"
+  echo "  ros2 launch grunt_bringup rs.depth.points.launch.py"
+  exit 1
+fi
+echo "Pre-flight OK: ${#TOPICS[@]} topics will be recorded."
+echo
+
+# Touch a notes file alongside the bag so it's obvious to fill in
+NOTES_FILE="${BAG_DIR}.notes.md"
+cat > "${NOTES_FILE}" <<NOTES_HEADER
+# GroundGrid calibration bag — ${TIMESTAMP} — ${DESCRIPTOR}
+
+Bag dir: ${BAG_DIR}
+
+## Drive plan checklist
+
+- [ ] Park on known-flat reference, 30 s
+- [ ] Drive over flat driveway baseline
+- [ ] Slow approach to right-side foliage
+- [ ] Through brushy section, both directions
+- [ ] Up the steep slope (30% grade)
+- [ ] Down the steep slope
+- [ ] Park on slope, 30 s (tilt reference)
+- [ ] Drive past any drop-off / step edge
+- [ ] Cross any gravel↔grass transition
+- [ ] Return to flat reference, 30 s stationary
+
+## Section log (bag-time-stamped)
+
+  t=  Xs: section description
+
+NOTES_HEADER
+echo "Notes file created: ${NOTES_FILE}"
+echo "  (fill in section log during or after the drive)"
+echo
+
+echo "Recording bag to: ${BAG_DIR}"
+echo "Stop with Ctrl-C when done."
+echo
+
+# Storage: mcap (matches existing bags). No compression for
+# simplicity — calibration bags are not size-critical.
+exec ros2 bag record \
+  --storage mcap \
+  -o "${BAG_DIR}" \
+  "${TOPICS[@]}"
