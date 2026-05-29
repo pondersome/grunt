@@ -171,9 +171,15 @@ class WaypointRecorder(Node):
         self.record_button_prev = False
         self.save_button_prev = False
 
-        # TF listener for indoor pose lookups.
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        # TF listener for indoor pose lookups. Deferred — TransformListener
+        # subscribes to /tf, which on Grunt runs hundreds of msgs/s
+        # (chassis joints, mast frames, L2, EKF outputs). Parsing every
+        # message in Python cost this node ~18% CPU sustained even when
+        # idle in outdoor mode (where TF is unused). We create the
+        # listener on the outdoor→indoor edge in _mode_cb and tear it
+        # down on the reverse edge.
+        self.tf_buffer = None
+        self.tf_listener = None
 
         self.create_subscription(Joy, 'joy', self._joy_cb, 10)
         self.create_subscription(NavSatFix, fix_topic, self._fix_cb, 10)
@@ -235,6 +241,30 @@ class WaypointRecorder(Node):
             self.get_logger().info(
                 f'nav mode: {self.current_mode} -> {msg.data}')
         self.current_mode = msg.data
+        self._update_tf_listener()
+
+    def _update_tf_listener(self):
+        """Create or destroy the TF listener to match current mode.
+
+        Indoor needs TF (base_link → pose_frame for _record_pose).
+        Outdoor and unknown do not. Subscribing to /tf is expensive on
+        this system, so we only pay the cost in the mode that needs it.
+        Runs on the executor thread alongside _joy_cb, so there's no
+        race between teardown here and a lookup in _record_pose.
+        """
+        needs_tf = (self.current_mode == 'indoor')
+        if needs_tf and self.tf_listener is None:
+            self.tf_buffer = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(
+                self.tf_buffer, self)
+            self.get_logger().info('TF listener attached for indoor mode')
+        elif not needs_tf and self.tf_listener is not None:
+            # unregister() destroys the /tf and /tf_static subscriptions
+            # on this node — the actual cost we want gone.
+            self.tf_listener.unregister()
+            self.tf_listener = None
+            self.tf_buffer = None
+            self.get_logger().info('TF listener released — not indoor mode')
 
     def _joy_cb(self, msg: Joy):
         record_pressed = (
