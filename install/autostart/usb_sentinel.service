@@ -1,0 +1,61 @@
+# usb_sentinel.service — kernel-USB-event logger for fault diagnosis
+#
+# Watches the kernel ring buffer for USB connect/disconnect events and
+# snapshots bus topology each time one fires. Writes append-only to
+# ~/bag_files/grunt/_usb_sentinel.log, sync'd after every event so the
+# record survives a hard reboot.
+#
+# Why this exists: chassis-B has a repeating fault where robot stops
+# responding and the network "feels offline." The 2026-05-28
+# composite_drive bag captured one — kernel log showed two USB drops
+# on bus 3 within a minute (joystick dongle, then ARCOS FTDI), both
+# correlated with chassis vibration / EMI. Diagnosing it required
+# trawling boot history; this sentinel keeps a dedicated, persistent,
+# always-on timeline so the next event is one `tail` away.
+#
+# Pairs with the still-pending p2os/joy USB-recovery work (backlog
+# tasks #91 and #96): the sentinel observes the events; those fixes
+# would make the system robust to them.
+#
+# Install:
+#   sudo cp /home/karim/ros2_ws/src/grunt/install/autostart/usb_sentinel.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now usb_sentinel.service
+#
+# Watch the live log:
+#   tail -F ~/bag_files/grunt/_usb_sentinel.log
+#
+# Inspect after a fault:
+#   less ~/bag_files/grunt/_usb_sentinel.log
+#   grep -B1 -A30 "USB disconnect" ~/bag_files/grunt/_usb_sentinel.log
+#
+# Stop / restart:
+#   sudo systemctl stop usb_sentinel
+#   sudo systemctl restart usb_sentinel
+
+[Unit]
+Description=USB topology sentinel for grunt fault diagnosis
+# Runs independently of grunt.service — it must keep watching even
+# if grunt itself is down (in fact, those are the periods when
+# we most want USB-drop data captured).
+After=systemd-journald.service
+
+[Service]
+Type=simple
+User=karim
+Group=karim
+Environment=HOME=/home/karim
+WorkingDirectory=/home/karim
+ExecStart=/home/karim/ros2_ws/install/grunt_bringup/lib/grunt_bringup/usb_sentinel
+
+# Cheap to restart; if the journalctl follower ever dies, we want
+# back up immediately so no events are missed.
+Restart=always
+RestartSec=2
+
+# Sentinel work is negligible (one snapshot per USB event), but
+# match grunt.service's policy to avoid surprising the scheduler.
+CPUAccounting=no
+
+[Install]
+WantedBy=multi-user.target

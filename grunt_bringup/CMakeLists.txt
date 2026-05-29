@@ -35,6 +35,7 @@ install(PROGRAMS
   scripts/l2_ground_filter
   scripts/costmap_snapshot
   scripts/groundgrid_bag
+  scripts/usb_sentinel
   DESTINATION lib/${PROJECT_NAME}
 )
 

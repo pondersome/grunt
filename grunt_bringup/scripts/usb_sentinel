@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# USB topology sentinel — watches the kernel log for USB connect/
+# disconnect events and snapshots bus topology + udev symlinks each
+# time one fires. Writes append-only to a persistent log file with
+# `sync` after each event so the record survives a hard reboot.
+#
+# Why: Grunt has had repeating "robot stops responding + network feels
+# offline" faults since the chassis-B transplant. The 2026-05-28
+# composite_drive bag captured one: kernel log showed two USB drops on
+# bus 3 within a minute — joystick dongle at 22:09:18 (re-enumerated,
+# joy_controller stuck on dead fd) and ARCOS FTDI at 22:10:18
+# (re-enumerated as ttyUSB3, p2os_driver stuck on /dev/grunt_p3at
+# pointing at ttyUSB0). Same shape as
+# project_chassis_vibration_electronics. Cleanly diagnosable from
+# `journalctl -b -N -k` after the fact, but only if you know to look
+# and the boot history hasn't rotated out — this sentinel keeps a
+# dedicated, persistent timeline so the next event is one `tail` away.
+#
+# Pure bash; no ROS dependency. Designed to run from a systemd user
+# unit (no root) — needs only journal-read permission, which the user
+# has by default on Ubuntu when in the `systemd-journal` group (the
+# `karim` user already is via the `adm` group).
+#
+# Output: $LOG_FILE (default ~/bag_files/grunt/_usb_sentinel.log).
+# Append-only, syncs after each event. Operator can tail/grep at any
+# time; the file is plain text.
+#
+# Stop with Ctrl-C / SIGTERM — the journalctl follower exits cleanly.
+
+set -u
+set -o pipefail
+
+LOG_DIR="${LOG_DIR:-$HOME/bag_files/grunt}"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/_usb_sentinel.log}"
+
+mkdir -p "${LOG_DIR}"
+
+# Match these kernel-log substrings. Deliberately broad — every USB
+# topology change is interesting; filtering is cheaper than missing
+# events.
+MATCH='usb [0-9]+-[0-9.]+|ftdi_sio|cdc_acm|hid-generic|input: |xhci_hcd.*ERROR|USB disconnect|new.*device'
+
+emit_snapshot() {
+  local trigger="$1"
+  {
+    echo "===================================================================="
+    echo "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)  TRIGGER"
+    echo "${trigger}"
+    echo
+    echo "--- lsusb -t ---"
+    lsusb -t 2>&1
+    echo
+    echo "--- /dev/serial/by-id ---"
+    ls -la /dev/serial/by-id 2>/dev/null || echo "(none)"
+    echo
+    echo "--- /dev/input ---"
+    ls -la /dev/input/js* /dev/input/event* 2>/dev/null || echo "(none)"
+    echo
+    echo "--- /dev/grunt_* (udev-rule symlinks) ---"
+    ls -la /dev/grunt_* 2>/dev/null || echo "(none)"
+    echo
+  } >> "${LOG_FILE}"
+  # Force the kernel page cache out to disk so the record survives a
+  # hard reboot. `sync` is global — a few-event-per-minute rate is
+  # nowhere near costly.
+  sync
+}
+
+# Header on each daemon start so we can correlate runs across reboots.
+{
+  echo "===================================================================="
+  echo "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)  SENTINEL START"
+  echo "host=$(hostname) pid=$$ uid=${UID}"
+  echo
+  echo "--- initial lsusb -t ---"
+  lsusb -t 2>&1
+  echo
+  echo "--- initial /dev/serial/by-id ---"
+  ls -la /dev/serial/by-id 2>/dev/null || echo "(none)"
+  echo
+} >> "${LOG_FILE}"
+sync
+
+# Follow the kernel journal from now forward. --output=short-iso gives
+# a sortable timestamp. stdbuf -oL keeps grep's output line-buffered so
+# matches reach the snapshot loop immediately.
+stdbuf -oL journalctl -k --follow --output=short-iso --no-pager \
+  | stdbuf -oL grep -E "${MATCH}" \
+  | while IFS= read -r line; do
+      emit_snapshot "${line}"
+    done
