@@ -1,0 +1,79 @@
+# vizanti.service — operator-facing web UI for grunt (mobile-friendly)
+#
+# Vizanti is the cell-phone-friendly 2D web visualizer + mission planner
+# the operator uses during outdoor field operation (Foxglove isn't great
+# on phones). Runs the RWS backend (C++ drop-in for rosbridge, lower
+# memory than rosbridge_server). Connects to the existing grunt ROS
+# stack via DDS — needs nothing from grunt, talks to whatever's
+# discoverable on the network.
+#
+# Independent of grunt.service: operator can systemctl start/stop
+# vizanti without touching the robot, and can systemctl enable vizanti
+# separately to control whether it auto-starts at boot. The two
+# services do NOT have an ordering or dependency relationship — vizanti
+# discovers grunt's topics whenever both are up.
+#
+# Web UI: http://<robot_ip>:5000   (from any device on the robot's network)
+# RWS WebSocket: ws://<robot_ip>:5001   (browser uses this internally)
+#
+# Install:
+#   sudo cp /home/karim/ros2_ws/src/grunt/install/autostart/vizanti.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl start vizanti.service           # start now
+#   sudo systemctl enable vizanti.service          # auto-start on boot (optional)
+#
+# Watch live output:
+#   journalctl -fu vizanti
+#
+# Stop / restart:
+#   sudo systemctl stop vizanti
+#   sudo systemctl restart vizanti
+
+[Unit]
+Description=Vizanti web visualizer + mission planner (RWS backend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=karim
+Group=karim
+Environment=HOME=/home/karim
+WorkingDirectory=/home/karim/ros2_ws
+
+# RWS needs the dynamic-cpp RMW for runtime type introspection. The
+# rest of the grunt stack runs on rmw_fastrtps_cpp; both variants are
+# built on the same FastDDS library and interop transparently over the
+# wire (this is per-process env, doesn't affect anything else).
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_dynamic_cpp
+
+# Optional operator overrides (e.g. RMW_IMPLEMENTATION, port, etc.)
+# Leading dash: missing file is fine, fall back to defaults above.
+EnvironmentFile=-/etc/default/vizanti
+
+# exec replaces the bash shell so systemd tracks the ros2 launch PID
+# directly. Inline sourcing because systemd Environment= doesn't run
+# shell expansions.
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/karim/ros2_ws/install/setup.bash && exec ros2 launch vizanti_server vizanti_rws.launch.py'
+
+# 10 s is plenty — vizanti has no long-running shutdown work (no
+# hardware to park, no nav lifecycle to deactivate). Just SIGTERM and
+# let the python+cpp processes exit cleanly.
+TimeoutStopSec=10
+
+# Match grunt.service's policy — disable per-cgroup CPU accounting so
+# the scheduler doesn't carve up CPU between vizanti and grunt cgroups
+# (would halve vizanti's share if grunt is also active under load).
+# See feedback_systemd_cpu_accounting_gotcha.
+CPUAccounting=no
+
+# Restart on crash; systemctl stop stays stopped.
+Restart=on-failure
+RestartSec=5
+
+# Cgroup-wide SIGTERM — every node's rclcpp signal handler runs.
+KillMode=control-group
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
