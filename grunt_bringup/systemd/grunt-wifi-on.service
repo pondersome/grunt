@@ -1,0 +1,14 @@
+[Unit]
+Description=Force WiFi radio on at boot (headless-robot safety net)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+# Wait for NM's D-Bus to be ready, then force the radio on regardless of saved state.
+ExecStart=/usr/bin/nm-online -q -t 30
+ExecStart=/usr/bin/nmcli radio wifi on
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -19,6 +19,12 @@ install(DIRECTORY
 
 )
 
+install(DIRECTORY
+   systemd
+   DESTINATION share/${PROJECT_NAME}
+
+)
+
 install(PROGRAMS
   scripts/localization_supervisor
   scripts/joy_estop
