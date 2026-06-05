@@ -14,14 +14,41 @@ leaves the headless robot unreachable — recovery otherwise requires opening th
 chassis and attaching a monitor + keyboard. This is a soft NM state, not an
 rfkill hardware block.
 
-The unit is a oneshot ordered `After=NetworkManager.service`; it waits for NM via
-`nm-online` then runs `nmcli radio wifi on` (idempotent).
+The unit is a oneshot ordered `After=NetworkManager.service`; it waits for NM
+startup via `nm-online -s` (NB: `-s` waits for NM to be ready for D-Bus, **not**
+for an active connection — without it the wait blocks the full timeout when wifi
+is off, the exact case we must recover from, and a non-zero exit would skip the
+radio-on), then runs `nmcli radio wifi on` (idempotent).
 
 ### Install
 
     sudo bash install-grunt-wifi-on.sh
 
 Run from your own shell — `sudo` needs a real TTY for the password prompt.
+
+### Verifying
+
+WiFi is the robot's only regular access path, so any test that turns wifi off
+risks stranding it if recovery fails. Two ways to test:
+
+- **Reboot test (the only honest test of boot ordering):** do this *only* with a
+  keyboard + monitor attached, so a failure costs nothing. `nmcli radio wifi off`,
+  `sudo reboot`, then confirm `nmcli radio` shows `WIFI: enabled` and
+  `systemctl status grunt-wifi-on.service` is `active (exited)`.
+- **Remote no-reboot smoke-test:** `sudo bash wifi_selftest.sh`. Turns wifi off
+  but schedules an *independent* systemd-timer backstop that unconditionally
+  re-enables wifi after 120s, so a still-broken service can't strand the robot.
+  Tests the command path only, not boot ordering.
+
+**Verified 2026-06-04 (runtime/command path):** ran `wifi_selftest.sh` against a
+genuine wifi-off state. Journal: wifi off at 22:34:23, `grunt-wifi-on.service`
+restarted and Finished in the same second at 22:34:43 re-enabling wifi (the
+same-second finish confirms `nm-online -s` returned immediately rather than
+blocking 30s — the old `-t 30`-without-`-s` bug would have shown a 30s gap); the
+120s backstop didn't fire until 22:36:24, long after wifi was already back, so it
+was a no-op. **Boot ordering (the reboot path) is not yet verified** — sound by
+construction (`After=NetworkManager.service` + `nm-online -s`), pending one
+monitor-attached reboot.
 
 ### Trade-off
 
