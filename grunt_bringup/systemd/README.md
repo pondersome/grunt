@@ -46,9 +46,16 @@ restarted and Finished in the same second at 22:34:43 re-enabling wifi (the
 same-second finish confirms `nm-online -s` returned immediately rather than
 blocking 30s — the old `-t 30`-without-`-s` bug would have shown a 30s gap); the
 120s backstop didn't fire until 22:36:24, long after wifi was already back, so it
-was a no-op. **Boot ordering (the reboot path) is not yet verified** — sound by
-construction (`After=NetworkManager.service` + `nm-online -s`), pending one
-monitor-attached reboot.
+was a no-op.
+
+**Verified 2026-06-04 (boot ordering):** `nmcli radio wifi off` + reboot
+(monitor-attached). After boot the unit ran 22:57:36 Starting → 22:57:42
+Finished — a 6s gap showing `nm-online -s` waiting for NM startup (vs the
+same-second warm-restart finish above), well inside the 30s timeout — then
+`nmcli radio wifi on` exited `status=0/SUCCESS` and `nmcli radio` showed
+`WIFI: enabled`. WiFi was disabled before reboot and restored unattended. **Both
+paths (runtime/GUI-toggle and boot) are now verified against the real failure
+state.**
 
 ### Trade-off
 
