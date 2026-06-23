@@ -165,6 +165,7 @@ def generate_launch_description():
         DeclareLaunchArgument('DescribeChassisOnly', default_value='0', description='Publish urdf for chassis'), # choose this to publish chassis description
         DeclareLaunchArgument('DescribeWithArm', default_value='1', description='Publish Chassis+Arm and Start Arm'), #  or this to publish chassis + arm and start arm 
         DeclareLaunchArgument('Lidar', default_value='0', description='Enable RPLidar'),
+        DeclareLaunchArgument('L2', default_value='1', description='Enable Unitree L2 4D LiDAR'),
         DeclareLaunchArgument('Arm', default_value='0', description='Start the RoArm'),
         DeclareLaunchArgument('ArmGUI', default_value='0', description='Start joint_state_publisher_gui for arm control'),
         DeclareLaunchArgument('ArmPreset', default_value='1', description='Start arm preset publisher for named positions'),
@@ -479,6 +480,26 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('RTK'))
     )
 
+    # Unitree L2 4D LiDAR — mast-mounted, forward-facing.
+    # parent_group already PushRosNamespace(prefix); pass push_prefix=False
+    # so the child doesn't double-push it. prefix is still passed for
+    # frame_id composition (e.g. "<prefix>/mast/l2").
+    gp_l2 = GroupAction(
+        actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource([
+                    FindPackageShare('grunt_bringup'), '/launch', '/grunt_l2.launch.py'
+                ]),
+                launch_arguments={
+                    'prefix': LaunchConfiguration('prefix'),
+                    'group': 'l2',
+                    'push_prefix': 'false',
+                }.items()
+            )
+        ],
+        condition=IfCondition(LaunchConfiguration('L2'))
+    )
+
     # ISR Wi-Fi monitoring. The isr_wifi launch itself is hardware-agnostic;
     # we pass wlo1 (or whatever the robot's primary adapter is) here. The
     # child launch uses the absolute-path PushRosNamespace idiom so it
@@ -543,6 +564,7 @@ def generate_launch_description():
         gp_system_metrics,
         gp_wifi,
         gp_lidar,
+        gp_l2,
         gp_joy_tele,
         gp_key_tele,
         gp_motors_on
