@@ -100,13 +100,17 @@
     </collision>
   </link>
 
-  <!-- Unitree L2 4D LiDAR — mounting frame.
-       This URDF link carries the L2's physical mounting position + rotation.
-       The driver (markgol's l2lidar_node) publishes one more child below this:
-       $(arg prefix)l2 (the cloud frame), as an identity transform relative
-       to this mount frame. We can't avoid that extra hop without patching the
-       node — its publishStaticTransform() always emits robot_id → frame_id. -->
-  <link name="$(arg prefix)l2_mount">
+  <!-- Unitree L2 4D LiDAR — primary reference frame.
+       Per Unitree's spec, the L2's point-cloud coordinate origin is the
+       geometric center of its bottom mounting surface, so this URDF link
+       is both the mounting reference AND the cloud frame. Under V0.5 of
+       markgol's l2lidar_node, the driver publishes only one child below
+       this link (the IMU frame, at the documented intrinsic offset); the
+       old `l2_mount → l2` identity-TF workaround is gone.
+       Frame name is `l2` (not the upstream-default `l2lidar_link`) for
+       downstream-consumer continuity — existing bags, rviz/Foxglove
+       layouts, and Nav2 layer configs all reference `<prefix>/mast/l2`. -->
+  <link name="$(arg prefix)l2">
     <inertial>
       <mass value="0.195"/>
       <origin xyz="0 0 0.02"/>
@@ -161,10 +165,10 @@
        Note: there's a ~few-degree CCW (viewed from behind) yaw error from
        hand-drilled mounting holes; will be eliminated by a CNC'd plate.
        Ignored here. -->
-  <joint name="$(arg prefix)l2_mount_joint" type="fixed">
+  <joint name="$(arg prefix)l2_joint" type="fixed">
     <origin xyz="0.025 0 0.34" rpy="${pi} ${-pi/2} 0"/>
     <parent link="$(arg prefix)base_link"/>
-    <child link="$(arg prefix)l2_mount"/>
+    <child link="$(arg prefix)l2"/>
   </joint>
 
 </robot>
