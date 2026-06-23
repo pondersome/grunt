@@ -121,7 +121,7 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <mesh filename="package://grunt_description/meshes/unitreeL2.stl"/>
+        <mesh filename="package://l2lidar_node/meshes/l2_lidar.stl"/>
       </geometry>
       <material name="$(arg prefix)black"/>
     </visual>
