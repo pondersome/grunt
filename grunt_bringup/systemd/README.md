@@ -3,6 +3,49 @@
 System-level units for the Grunt robot (barney NUC). These are **not** ROS
 nodes — they are host systemd services installed outside the ROS workspace.
 
+## grunt-zt-linklog.service
+
+ZeroTier-over-cellular **link logger** for a longitudinal correlation study —
+not a boot service. Drives `scripts/zt_linklog.py` to append one CSV row per
+LEAF peer every 30 s to `/home/karim/zt_linklog.csv`.
+
+**Why:** to test, across many hotspot cycles, two claims that a single snapshot
+can't prove — (1) that punch-through (direct paths) is genuinely better and
+consistent, and (2) that bad ZeroTier latency is *always* concurrent with bad
+underlying transport latency (i.e. the cellular link, not ZeroTier, is at fault).
+
+Each cycle fires three independent latency probes at the same instant plus
+ZeroTier's own per-peer view:
+- `t_gw` — ping the default-route gateway (tether first hop, e.g. `192.168.43.1`):
+  isolates the robot↔phone radio.
+- `t_net` — ping a public IPv6 host (Cloudflare): **the control** — bypasses
+  ZeroTier, so it measures pure transport.
+- `t_ovl` — ping a peer overlay IP (only with `--overlay-target`): app-level.
+- per LEAF peer: `zt_lat_ms`, `path_fam` (v4/v6), `state` (direct/relay via
+  preferred-path freshness), plus cycle `n_leaf`/`n_relay`.
+
+**Q2** is answered by comparing `zt_lat_ms`/`t_ovl_ms` against `t_net_ms` at the
+same `ts_utc`: both bad together ⇒ link-limited; ZT bad while `t_net` fine ⇒ a
+real ZT/punch-through problem. **Q1** by the `state`/`path_fam` columns over time.
+Filter sessions with `net_ctx` (the `/64` prefix distinguishes home vs hotspot).
+
+The CSV **appends across runs/reboots** (header written once). Every row carries
+a `run_id` (the process-start timestamp) so runs can be told apart / grouped; a
+time gap in `ts_utc` also marks a stop/start. If the schema ever changes, an
+existing CSV with the old header is rotated to `<file>.bak` rather than corrupted.
+
+### Install / use
+
+    sudo bash install-grunt-zt-linklog.sh        # installs unit, does not start it
+    sudo systemctl start  grunt-zt-linklog        # begin logging (while on hotspot)
+    sudo systemctl stop   grunt-zt-linklog        # stop
+    journalctl -u grunt-zt-linklog -f             # watch
+
+Runs as root so `zerotier-cli` works without sudo. The installer deliberately
+does **not** enable it at boot; `sudo systemctl enable grunt-zt-linklog` only if
+a multi-day study should survive reboots. To also ping a peer overlay address,
+add `--overlay-target 10.147.20.X` to `ExecStart` in the unit.
+
 ## grunt-wifi-on.service
 
 Forces the WiFi radio on at every boot.

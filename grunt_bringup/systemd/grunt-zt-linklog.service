@@ -1,0 +1,18 @@
+[Unit]
+Description=Grunt ZeroTier-over-cellular link logger (diagnostic correlation study)
+After=zerotier-one.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root (default) so zerotier-cli works without sudo.
+# Append --overlay-target 10.147.20.x to also ping a peer's overlay address.
+ExecStart=/usr/bin/python3 /home/karim/ros2_ws/src/grunt/grunt_bringup/scripts/zt_linklog.py --interval 30 --out /home/karim/zt_linklog.csv
+Restart=on-failure
+RestartSec=5
+
+[Install]
+# The installer does NOT enable this. Start/stop by hand while testing:
+#   sudo systemctl start grunt-zt-linklog      sudo systemctl stop grunt-zt-linklog
+# Only `enable` it if you want a multi-day study to survive reboots.
+WantedBy=multi-user.target
