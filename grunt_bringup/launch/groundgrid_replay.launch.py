@@ -20,9 +20,11 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    # Seed config: KITTI defaults. Phase B tunes against L2 bags.
+    # L2-tuned config — phase B starting point. See header comments
+    # in the yaml for the rationale on each non-default pick.
     config_file = os.path.join(
-        get_package_share_directory('groundgrid'), 'param', 'kitti.yaml'
+        get_package_share_directory('grunt_bringup'),
+        'config', 'groundgrid_l2.yaml',
     )
 
     pointcloud_topic = DeclareLaunchArgument(

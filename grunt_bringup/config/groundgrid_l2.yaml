@@ -1,0 +1,75 @@
+# GroundGrid params tuned for the Unitree L2 4D LiDAR on Grunt.
+#
+# Starting point for task #95 phase B tuning. Cross-check classifications
+# against grunt_analysis.traversability output on the same bag
+# (memory/project_l2_traversability_study.md has operator-validated ground
+# truth annotations from 2026-05-20_17-49-13).
+#
+# L2 characteristics (vs. KITTI/HeLiPR seeds):
+#   - Forward-facing dome scanner (not 360° spinner), 192-beam "4D"
+#   - ~11k points per cloud (vs ~120k KITTI), 5 Hz
+#   - Vertical FOV ~52°, mounted on grunt's mast at ~1.0 m
+#   - Per-cloud point density falls off sharply past 30 m; cluster is
+#     concentrated 3-20 m where grunt actually operates
+#   - L2 ground-noise floor ~100 mm at grazing range (per traversability study)
+#
+# Hardware budget:
+#   - N100 NUC, 4 Atom cores — drop max_threads to 3 (leave headroom)
+
+groundgrid_node:
+  ros__parameters:
+    # ── universal across upstream seeds; leave alone ─────────────────
+    groundgrid/point_count_cell_variance_thres: 10
+    groundgrid/groundpatch_detection_minimum_thres: 0.01
+    groundgrid/outlier_tolerance: 0.1
+    groundgrid/min_outlier_detection_ground_confidence: 1.25
+    groundgrid/distance_factor: 0.0001
+    groundgrid/min_distance_factor: 0.0005
+    groundgrid/occupied_cells_decrease_factor: 5.0
+    groundgrid/occupied_cells_point_count_factor: 20.0
+
+    # ── L2-specific picks ────────────────────────────────────────────
+
+    # max_ring — the algorithm iterates rings during ground detection.
+    # L2 isn't a fixed-ring sensor (4D), so set generously to avoid
+    # dropping data. Ouster's 2048 is a safe ceiling.
+    groundgrid/max_ring: 2048
+
+    # horizontal_point_ang_dist — KITTI/Ouster baseline 0.0035 rad
+    # (~0.2°). L2's dome puts denser horizontal points near boresight
+    # than at edges; 0.0035 is a reasonable single value. Revisit
+    # after empirical density inspection.
+    groundgrid/horizontal_point_ang_dist: 0.0035
+
+    # min_dist_squared — exclude returns within sqrt(this) meters.
+    # Velodyne uses 9 (3 m), KITTI 12 (3.5 m), Ouster 144 (12 m).
+    # l2_self_filter already drops self-returns; pick a small exclusion
+    # to suppress noise immediately under the mast. 4.0 = 2 m radius.
+    groundgrid/min_dist_squared: 4.0
+
+    # patch_size_change_distance — where adaptive patches transition
+    # from small (near) to large (far). Grunt's working zone is 5-20 m,
+    # so put the knee at 15 m so far cells get the larger patches
+    # they need for sparse-point ground estimation.
+    groundgrid/patch_size_change_distance: 15.0
+
+    # min_ground_patch_detection_point_count_thres — min density for
+    # a patch to count as ground. Lower = more permissive, helps with
+    # L2's sparser far-range. Avia/Velodyne use 0.125; we match.
+    groundgrid/min_ground_patch_detection_point_count_thres: 0.125
+
+    # min_point_height_thres — above this height (m) the point is not
+    # considered candidate ground. 0.30 m matches most seeds; grunt's
+    # sloped terrain doesn't argue for a different value at start.
+    groundgrid/min_point_height_thres: 0.30
+
+    # min_point_height_obstacle_thres — above this height, point is
+    # flagged as obstacle. L2 noise floor is ~100 mm at grazing, so we
+    # bump from upstream's 0.10 to 0.15 to give a noise margin and
+    # prevent the slope itself from generating obstacle marks at
+    # range. Will tune against the 2026-05-28 bag.
+    groundgrid/min_point_height_obstacle_thres: 0.15
+
+    # max_threads — N100 has 4 cores. Reserve 1 for the rest of the
+    # stack (costmap layers, BT, system_metrics). Drop from 8 to 3.
+    groundgrid/max_threads: 3
